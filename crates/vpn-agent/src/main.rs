@@ -75,9 +75,21 @@ fn main() -> Result<()> {
             }
 
             let name = sanitize_name(&imported.config.name);
-            vpn_control::connect(&transport, &imported.config, &name)?;
+            let outcome = vpn_control::connect_logged(&transport, &imported.config, &name)?;
             drop(imported); // discard the plaintext PSK once charon has it
-            println!("Tunnel '{name}' initiated.");
+
+            // Live handshake transcript from charon's log bus.
+            for line in &outcome.log {
+                eprintln!("  [{}] {}", line.group, line.msg);
+            }
+            if outcome.connected {
+                println!("Tunnel '{name}' initiated.");
+            } else {
+                anyhow::bail!(
+                    "handshake failed: {}",
+                    outcome.error.as_deref().unwrap_or("unknown reason")
+                );
+            }
         }
         Command::Status => {
             let sas = vpn_control::status(&transport)?;
