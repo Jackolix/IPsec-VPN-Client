@@ -1,0 +1,12 @@
+[package]
+name = "vpn-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Phase 0 CLI: import NCP profiles and generate strongSwan configs"
+
+[dependencies]
+vpn-core = { path = "../vpn-core" }
+ncp-profile = { path = "../ncp-profile" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
