@@ -1,0 +1,21 @@
+[package]
+name = "vpn-desktop"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Tauri desktop GUI for the IPsec VPN client"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+vpn-core = { path = "../vpn-core" }
+ncp-profile = { path = "../ncp-profile" }
+vpn-control = { path = "../vpn-control" }
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = "1"
+
+[features]
+# Prevents a console window from also opening on Windows release builds.
+default = []
