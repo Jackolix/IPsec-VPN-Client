@@ -1,0 +1,9 @@
+[package]
+name = "vici"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Minimal client for strongSwan's vici control protocol (message codec + request/event framing)"
+
+[dependencies]
+thiserror.workspace = true

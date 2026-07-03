@@ -1,0 +1,7 @@
+# Keep the build context small and secret-free.
+target/
+out/
+.git/
+# Never let a real profile (live PSK) enter the image build context.
+*.ini
+**/*.ini

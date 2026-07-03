@@ -36,8 +36,15 @@ Windows).
   from a strongSwan Docker container against the local test firewall
   (192.168.100.10). Exit criteria: CLI generates the config and the container
   establishes IKE + CHILD SAs.
-- **Phase 1**: Linux service wrapping strongSwan via vici; CLI
-  import/connect/disconnect/status; PSK into OS keychain.
+- **Phase 1 (done 2026-07-03)**: hand-rolled `vici` crate (message codec +
+  packet framing + blocking request/event client) and a `vpn-agent` that
+  imports a profile and drives charon over vici with
+  `connect`/`status`/`disconnect`. Verified against the LANCOM: SA up,
+  virtual IP assigned, ESP counters move, clean teardown. The PSK is pushed
+  via `load-shared` in memory — no swanctl.conf secret on disk.
+  **Still open for Phase 1.5**: move PSK storage to the OS keychain (`keyring`
+  crate) on the real desktop OS; add `control-log` event streaming so
+  connect shows live handshake progress; auto-reconnect/DPD config.
 - **Phase 2**: Tauri GUI (profile list, connect toggle, status, log viewer,
   import-with-confirmation flow).
 - **Phase 3**: macOS — start with `NEVPNProtocolIKEv2`; fall back to embedded

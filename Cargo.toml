@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/vpn-core",
     "crates/ncp-profile",
+    "crates/vici",
+    "crates/vpn-agent",
     "crates/vpn-cli",
 ]
 
