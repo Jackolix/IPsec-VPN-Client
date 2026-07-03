@@ -73,6 +73,8 @@ pub struct ProfileSummary {
     pub virtual_ip_requested: bool,
     pub warnings: Vec<WarnItem>,
     pub locked: bool,
+    /// Whether the PSK for this profile is saved in the OS keychain.
+    pub stored: bool,
 }
 
 /// A gateway that is a bare private IP is treated as a lab/test target; an
@@ -128,6 +130,7 @@ fn summarize(
         virtual_ip_requested: config.request_virtual_ip,
         warnings: warnings.iter().map(|w| to_warn_item(&w.to_string())).collect(),
         locked,
+        stored: crate::creds::has(id),
     }
 }
 
@@ -183,8 +186,26 @@ pub fn connect(
         }
         _ => {}
     }
+    // Prefer a PSK saved in the OS keychain over the one parsed from the
+    // (plaintext-on-disk) .ini, so saved credentials are what actually
+    // authenticate the tunnel.
+    if let Some(psk) = crate::creds::load(&id)? {
+        imported.config.auth = vpn_core::AuthMethod::PresharedKey(psk);
+    }
     let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
     vpn_control::connect_logged(&state.transport, &imported.config, &name).map_err(|e| e.to_string())
+}
+
+/// Copy a profile's PSK from its `.ini` into the OS keychain.
+pub fn save_credentials(state: &AppState, id: String) -> std::result::Result<(), String> {
+    let imported = load(&profile_path(state, &id))?;
+    let vpn_core::AuthMethod::PresharedKey(psk) = &imported.config.auth;
+    crate::creds::store(&id, psk)
+}
+
+/// Remove a profile's saved PSK from the OS keychain.
+pub fn forget_credentials(_state: &AppState, id: String) -> std::result::Result<(), String> {
+    crate::creds::delete(&id)
 }
 
 pub fn disconnect(state: &AppState, name: String) -> std::result::Result<(), String> {
