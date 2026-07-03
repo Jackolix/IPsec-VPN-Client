@@ -201,3 +201,35 @@ pub struct ConnectionConfig {
     /// IPComp compression.
     pub compression: bool,
 }
+
+impl ConnectionConfig {
+    /// IKE (phase 1) proposal string, e.g. `aes256-sha256-prfsha256-modp3072`.
+    /// Shared by the swanctl renderer and the vici bridge.
+    pub fn ike_proposal(&self) -> String {
+        format!(
+            "{}-{}-{}-{}",
+            self.ike_enc.swanctl_name(),
+            self.ike_integ.swanctl_name(),
+            self.ike_prf.swanctl_name(),
+            self.ike_dh.swanctl_name()
+        )
+    }
+
+    /// ESP (phase 2) proposal string, e.g. `aes256-sha256-modp3072` (the DH
+    /// suffix is present only when PFS is enabled).
+    pub fn esp_proposal(&self) -> String {
+        match self.pfs {
+            Some(g) => format!(
+                "{}-{}-{}",
+                self.esp_enc.swanctl_name(),
+                self.esp_integ.swanctl_name(),
+                g.swanctl_name()
+            ),
+            None => format!(
+                "{}-{}",
+                self.esp_enc.swanctl_name(),
+                self.esp_integ.swanctl_name()
+            ),
+        }
+    }
+}
