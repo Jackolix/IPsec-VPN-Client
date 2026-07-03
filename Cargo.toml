@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vpn-core",
+    "crates/ncp-profile",
+    "crates/vpn-cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+thiserror = "2"

@@ -1,0 +1,9 @@
+# NCP profile files contain live pre-shared keys in plaintext. NEVER commit them.
+*.ini
+!crates/*/tests/fixtures/*.redacted.ini
+
+# Generated connection configs contain the PSK.
+/out/
+*.swanctl.conf
+
+/target/
