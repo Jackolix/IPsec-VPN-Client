@@ -2,7 +2,9 @@
 
 Desktop IPsec (IKEv2) VPN client wrapping strongSwan. Imports NCP-style
 `.ini` profiles. See `ipsec-vpn-client-plan.md` for the full build plan;
-this repo is currently at **Phase 0** (Linux-container proof of concept).
+this repo is at **Phase 1** — a Rust agent drives charon over the vici
+control protocol (connect / status / disconnect), verified end-to-end
+against a LANCOM vRouter.
 
 ## Security rules (read first)
 
@@ -21,25 +23,32 @@ this repo is currently at **Phase 0** (Linux-container proof of concept).
 |---|---|
 | `crates/vpn-core` | Internal config model (importer-independent) + `swanctl.conf` rendering. `Secret` type redacts itself in all Debug/Display output. |
 | `crates/ncp-profile` | NCP ini parser + the documented numeric code tables (`src/codes.rs`, each mapping carries a confidence level) + importer that warns on every unconfirmed mapping. |
-| `crates/vpn-cli` | Phase 0 CLI: `show` (redacted interpretation) and `generate` (writes swanctl.conf). |
-| `docker/initiator` | Alpine strongSwan container that loads a generated config and initiates the tunnel — the "Linux client" while developing on Windows. |
+| `crates/vici` | Hand-rolled client for strongSwan's vici control protocol: a cross-platform message codec plus packet framing and a blocking request/event client (Unix-socket transport). |
+| `crates/vpn-agent` | Phase 1 Linux agent: imports a profile and drives charon over vici (`connect` / `status` / `disconnect`). The PSK is pushed via `load-shared` in memory — no swanctl.conf with the secret is written to disk. |
+| `crates/vpn-cli` | Phase 0 CLI: `show` (redacted interpretation) and `generate` (writes swanctl.conf). Kept for inspection/debugging. |
+| `docker/agent` | Multi-stage image: compiles `vpn-agent` for Linux and runs it beside charon — the "Linux client" while developing on Windows. |
+| `docker/initiator` | Legacy Phase 0 container that shells out to `swanctl`; superseded by `docker/agent`. |
 
-## Phase 0 quickstart
+## Phase 1 quickstart
 
 ```powershell
-# 1. Inspect how a profile is interpreted (secret stays redacted):
-cargo run -p vpn-cli -- show .\ACME_SITE_01.ini
+# Inspect how a profile is interpreted (secret stays redacted):
+cargo run -p vpn-cli -- show .\TEST-1.ini
 
-# 2. Bring up a tunnel against the test responder (requires Docker Desktop):
-.\scripts\connect-docker.ps1 -Profile .\ACME_SITE_01.ini -Gateway 192.168.100.10
+# Build the agent image and bring up the tunnel over vici (needs Docker Desktop):
+.\scripts\connect-docker.ps1 -Profile .\TEST-1.ini -Gateway 192.168.100.10
 
-# Tests:
+# While it runs, from another shell:
+docker exec vpn-agent vpn-agent status
+docker exec vpn-agent vpn-agent disconnect --name vRouter-TEST-1
+
+# Tests (run on any platform; the vici codec is cross-platform):
 cargo test --workspace
 ```
 
-The responder side (test firewall) must accept: IKEv2, PSK, identity
-`acme_site_01`, IKE `aes256-sha256-prfsha256-modp3072`,
-ESP `aes256-sha256` with PFS group 15 (modp3072), and assign a virtual IP.
+The responder side (test gateway) must accept: IKEv2, PSK, the profile's
+identity, IKE `aes256-sha256-prfsha256-modp3072`, ESP `aes256-sha256` with
+PFS group 15 (modp3072), and assign a virtual IP.
 
 ## Code-mapping caveat
 

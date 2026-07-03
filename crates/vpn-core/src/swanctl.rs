@@ -51,26 +51,8 @@ pub fn render(config: &ConnectionConfig, secrets: SecretRendering) -> String {
     let name = sanitize_name(&config.name);
     let mut out = String::new();
 
-    let ike_proposal = format!(
-        "{}-{}-{}-{}",
-        config.ike_enc.swanctl_name(),
-        config.ike_integ.swanctl_name(),
-        config.ike_prf.swanctl_name(),
-        config.ike_dh.swanctl_name()
-    );
-    let esp_proposal = match config.pfs {
-        Some(g) => format!(
-            "{}-{}-{}",
-            config.esp_enc.swanctl_name(),
-            config.esp_integ.swanctl_name(),
-            g.swanctl_name()
-        ),
-        None => format!(
-            "{}-{}",
-            config.esp_enc.swanctl_name(),
-            config.esp_integ.swanctl_name()
-        ),
-    };
+    let ike_proposal = config.ike_proposal();
+    let esp_proposal = config.esp_proposal();
     let remote_ts = config
         .remote_subnets
         .iter()
