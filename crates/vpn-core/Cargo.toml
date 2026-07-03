@@ -1,0 +1,9 @@
+[package]
+name = "vpn-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Internal VPN connection config model and strongSwan swanctl.conf generation"
+
+[dependencies]
+thiserror.workspace = true
