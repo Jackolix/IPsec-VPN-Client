@@ -45,8 +45,15 @@ Windows).
   **Still open for Phase 1.5**: move PSK storage to the OS keychain (`keyring`
   crate) on the real desktop OS; add `control-log` event streaming so
   connect shows live handshake progress; auto-reconnect/DPD config.
-- **Phase 2**: Tauri GUI (profile list, connect toggle, status, log viewer,
-  import-with-confirmation flow).
+- **Phase 2 (done 2026-07-03)**: Tauri v2 desktop app (`crates/vpn-desktop`).
+  Rust backend interprets profiles natively (works on Windows) and drives
+  charon via the shared `vpn-control` crate; the web UI drives it through
+  `invoke`. Profile list, connect/disconnect, live status tiles + throughput
+  sparkline, import-trust warnings, charon log console. Verified: the desktop
+  backend brings up and reports the LANCOM tunnel from a native Windows build
+  over a TCP vici socket (`docker/vici-tcp`, published on 127.0.0.1:45022).
+  Still open: `control-log` event streaming for live handshake lines in the
+  GUI; a gateway-override dialog for locked/production profiles; keychain.
 - **Phase 3**: macOS — start with `NEVPNProtocolIKEv2`; fall back to embedded
   strongSwan Network Extension only on cipher/feature gaps. Apple Developer
   account + Network Extension entitlement lead time.

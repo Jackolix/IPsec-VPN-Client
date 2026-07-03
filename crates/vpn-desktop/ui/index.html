@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>IPsec VPN Client</title>
+<style>
+  :root {
+    --bg: #0b121b; --window: #0e1620; --surface: #16202e; --surface-2: #1b2838;
+    --line: #26374b; --line-soft: #1e2c3c; --text: #e6edf3; --muted: #8695ab; --faint: #5a6a80;
+    --accent: #4a9eff; --accent-soft: rgba(74,158,255,.14); --accent-line: rgba(74,158,255,.42);
+    --ok: #46c266; --ok-soft: rgba(70,194,102,.14); --warn: #d9a531; --warn-soft: rgba(217,165,49,.14);
+    --crit: #f0603a; --crit-soft: rgba(240,96,58,.14);
+    --mono: "Cascadia Code","Cascadia Mono",ui-monospace,"SF Mono","JetBrains Mono",Consolas,"Liberation Mono",monospace;
+    --sans: ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --fs-xs: 10.5px; --fs-sm: 12px; --fs-base: 13px; --fs-md: 14.5px; --fs-lg: 18px; --fs-xl: 24px; --r: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background:
+      radial-gradient(1100px 700px at 78% -10%, #142132 0%, rgba(20,33,50,0) 60%),
+      radial-gradient(900px 600px at 0% 110%, #131d2b 0%, rgba(19,29,43,0) 55%), var(--bg);
+    color: var(--text); font-family: var(--sans); font-size: var(--fs-base); line-height: 1.5;
+    -webkit-font-smoothing: antialiased; overflow: hidden;
+  }
+  .mono { font-family: var(--mono); }
+  .app { height: 100vh; display: flex; flex-direction: column; }
+
+  .titlebar {
+    display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 16px;
+    background: linear-gradient(180deg,#16212f,#121b27); border-bottom: 1px solid var(--line-soft); flex: 0 0 auto;
+  }
+  .brand { display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: var(--fs-sm); letter-spacing: .04em; }
+  .brand .glyph { width: 20px; height: 20px; display: grid; place-items: center; color: var(--accent); }
+  .brand b { font-weight: 600; } .brand span { color: var(--faint); }
+  .titlebar .spacer { flex: 1; }
+  .global-status {
+    display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs);
+    letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+    padding: 5px 11px 5px 9px; border: 1px solid var(--line); border-radius: 999px; background: rgba(0,0,0,.18);
+  }
+  .led { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
+  .led.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+  .led.warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+  .led.pulse { animation: pulse 1.3s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.35;} }
+
+  .body { flex: 1; display: grid; grid-template-columns: 264px 1fr; min-height: 0; }
+  .sidebar { border-right: 1px solid var(--line-soft); background: linear-gradient(180deg,#101a26,#0d1520); display: flex; flex-direction: column; min-height: 0; }
+  .side-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 16px 9px; }
+  .side-head h2 { margin: 0; font-family: var(--mono); font-weight: 600; font-size: var(--fs-xs); letter-spacing: .14em; text-transform: uppercase; color: var(--faint); }
+  .btn-import { font-family: var(--mono); font-size: var(--fs-xs); color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: 7px; padding: 4px 9px; cursor: pointer; }
+  .btn-import:hover { background: rgba(74,158,255,.22); }
+  .profiles { list-style: none; margin: 0; padding: 6px 10px; overflow-y: auto; flex: 1; }
+  .profile { display: block; width: 100%; text-align: left; background: transparent; border: 1px solid transparent; border-radius: var(--r); padding: 11px 12px; margin-bottom: 4px; cursor: pointer; color: inherit; font: inherit; transition: background .12s, border-color .12s; }
+  .profile:hover { background: rgba(255,255,255,.03); }
+  .profile.active { background: var(--surface); border-color: var(--line); }
+  .profile-top { display: flex; align-items: center; gap: 8px; }
+  .profile-name { font-family: var(--mono); font-size: var(--fs-base); font-weight: 600; }
+  .profile-gw { font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag { margin-left: auto; font-family: var(--mono); font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase; padding: 2px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); flex: 0 0 auto; }
+  .tag.prod { color: var(--warn); border-color: rgba(217,165,49,.4); background: var(--warn-soft); }
+  .tag.test { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+  .side-foot { padding: 11px 16px; border-top: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); display: flex; align-items: center; gap: 7px; }
+
+  .main { min-height: 0; display: flex; flex-direction: column; }
+  .main-scroll { overflow-y: auto; padding: 20px 22px 22px; display: flex; flex-direction: column; gap: 16px; }
+  .detail-head { display: flex; align-items: flex-start; gap: 16px; }
+  .detail-head .title h1 { margin: 0; font-family: var(--mono); font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.01em; text-wrap: balance; }
+  .gw-line { display: flex; align-items: center; gap: 8px; margin-top: 5px; color: var(--muted); font-family: var(--mono); font-size: var(--fs-sm); }
+  .gw-line .arrow { color: var(--faint); }
+  .detail-head .spacer { flex: 1; }
+  .status-pill { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 6px 13px; background: rgba(0,0,0,.2); white-space: nowrap; }
+  .status-pill.established { color: var(--ok); border-color: rgba(70,194,102,.42); background: var(--ok-soft); }
+  .status-pill.connecting { color: var(--warn); border-color: rgba(217,165,49,.42); background: var(--warn-soft); }
+  .btn { font-family: var(--mono); font-size: var(--fs-base); font-weight: 600; letter-spacing: .02em; cursor: pointer; border-radius: 9px; padding: 10px 20px; border: 1px solid transparent; white-space: nowrap; transition: background .13s, border-color .13s, opacity .13s; }
+  .btn-primary { background: var(--accent); color: #06121f; }
+  .btn-primary:hover { background: #62adff; }
+  .btn-ghost { background: transparent; color: var(--text); border-color: var(--line); }
+  .btn-ghost:hover { border-color: var(--muted); background: rgba(255,255,255,.03); }
+  .btn-warn { background: var(--warn-soft); color: var(--warn); border-color: rgba(217,165,49,.42); }
+  .btn:disabled { cursor: not-allowed; opacity: .5; }
+  .btn:focus-visible, .profile:focus-visible, .btn-import:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--r); padding: 13px 14px; min-width: 0; }
+  .tile .k { font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--faint); }
+  .tile .v { font-family: var(--mono); font-size: var(--fs-lg); margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .tile .v.dim { color: var(--faint); }
+  .tile .sub { font-family: var(--mono); font-size: var(--fs-xs); color: var(--muted); margin-top: 2px; }
+  #spark { width: 100%; height: 34px; display: block; margin-top: 4px; }
+
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--r); display: flex; flex-direction: column; min-width: 0; }
+  .card > h3 { margin: 0; padding: 12px 15px; border-bottom: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-xs); font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  .card > h3 .count { margin-left: auto; color: var(--faint); font-weight: 400; }
+  .kv { padding: 6px 15px 13px; }
+  .kv-row { display: flex; align-items: baseline; gap: 12px; padding: 6px 0; border-bottom: 1px dashed var(--line-soft); }
+  .kv-row:last-child { border-bottom: 0; }
+  .kv-row .kk { font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .06em; text-transform: uppercase; color: var(--faint); width: 108px; flex: 0 0 auto; }
+  .kv-row .vv { font-family: var(--mono); font-size: var(--fs-sm); color: var(--text); word-break: break-all; }
+  .vv .badge { font-size: 9.5px; letter-spacing: .05em; text-transform: uppercase; padding: 1px 6px; border-radius: 5px; margin-left: 8px; vertical-align: middle; border: 1px solid rgba(70,194,102,.4); color: var(--ok); background: var(--ok-soft); }
+  .redacted { color: var(--faint); letter-spacing: .12em; }
+  .warns { padding: 8px 13px 13px; display: flex; flex-direction: column; gap: 7px; }
+  .warn-row { display: flex; gap: 10px; padding: 9px 11px; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--line-soft); }
+  .warn-row .wled { width: 7px; height: 7px; border-radius: 50%; margin-top: 5px; flex: 0 0 auto; background: var(--faint); }
+  .warn-row.medium .wled, .warn-row.low .wled { background: var(--warn); }
+  .warn-row .wt { font-family: var(--mono); font-size: var(--fs-sm); color: var(--text); }
+  .warn-row .wn { font-size: var(--fs-xs); color: var(--muted); margin-top: 2px; line-height: 1.45; }
+  .warns .allclear { display: flex; gap: 9px; align-items: center; color: var(--ok); font-family: var(--mono); font-size: var(--fs-sm); padding: 6px 2px; }
+
+  .console { background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--r); display: flex; flex-direction: column; overflow: hidden; }
+  .console-head { display: flex; align-items: center; gap: 10px; padding: 10px 15px; border-bottom: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  .console-head .spacer { flex: 1; }
+  .console-head button { font-family: var(--mono); font-size: var(--fs-xs); color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+  .console-head button:hover { color: var(--text); border-color: var(--muted); }
+  .log { margin: 0; padding: 11px 15px; height: 168px; overflow-y: auto; font-family: var(--mono); font-size: var(--fs-sm); line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+  .log-line { display: flex; gap: 10px; }
+  .log-line .ts { color: var(--faint); flex: 0 0 auto; }
+  .log-line .sys { flex: 0 0 42px; }
+  .log-line .sys.IKE { color: var(--accent); } .log-line .sys.CFG { color: #9a86e0; }
+  .log-line .sys.KNL { color: var(--warn); } .log-line .sys.NET { color: var(--ok); }
+  .log-line .msg { color: var(--muted); }
+  .log-line.good .msg { color: var(--ok); } .log-line.bad .msg { color: var(--crit); }
+  .log-empty { color: var(--faint); }
+
+  .notice { display: none; align-items: center; gap: 10px; padding: 11px 14px; border-radius: var(--r); background: var(--warn-soft); border: 1px solid rgba(217,165,49,.4); color: #e7c579; font-size: var(--fs-sm); }
+  .notice.show { display: flex; }
+  .notice.ok { background: var(--ok-soft); border-color: rgba(70,194,102,.4); color: #a9e2ba; }
+  .notice.bad { background: var(--crit-soft); border-color: rgba(240,96,58,.4); color: #f0a996; }
+  .notice b { font-family: var(--mono); }
+
+  .overlay { position: fixed; inset: 0; background: rgba(6,10,16,.72); display: none; align-items: center; justify-content: center; padding: 24px; z-index: 50; }
+  .overlay.show { display: flex; }
+  .modal { width: min(560px,100%); background: var(--window); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 30px 80px -20px rgba(0,0,0,.8); }
+  .modal h3 { margin: 0; padding: 16px 18px; border-bottom: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-md); }
+  .modal .mbody { padding: 16px 18px; font-size: var(--fs-sm); color: var(--muted); }
+  .modal .mbody code { font-family: var(--mono); color: var(--accent); background: var(--accent-soft); padding: 1px 5px; border-radius: 4px; }
+  .modal .mfoot { display: flex; gap: 10px; justify-content: flex-end; padding: 16px 18px; border-top: 1px solid var(--line-soft); }
+
+  @media (max-width: 820px) {
+    .body { grid-template-columns: 1fr; }
+    .sidebar { border-right: 0; border-bottom: 1px solid var(--line-soft); max-height: 180px; }
+    .tiles { grid-template-columns: repeat(2,1fr); }
+    .cards { grid-template-columns: 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce) { .led.pulse { animation: none; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="titlebar">
+    <div class="brand">
+      <span class="glyph" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.5 8 8 11 4.5-3 8-6 8-11V5l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg></span>
+      <b>IPsec&nbsp;VPN</b><span>· NCP profile client</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="global-status"><span id="glob-led" class="led"></span><span id="glob-text">disconnected</span></div>
+  </div>
+
+  <div class="body">
+    <aside class="sidebar">
+      <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import .ini</button></div>
+      <ul class="profiles" id="profile-list"></ul>
+      <div class="side-foot"><span id="foot-led" class="led"></span><span id="foot-text">connecting to vici…</span></div>
+    </aside>
+
+    <section class="main">
+      <div class="main-scroll">
+        <div class="detail-head">
+          <div class="title">
+            <h1 id="d-name" class="mono">—</h1>
+            <div class="gw-line"><span id="d-localid">—</span><span class="arrow">→</span><span id="d-gw">—</span></div>
+          </div>
+          <div class="spacer"></div>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <span id="pill" class="status-pill"><span id="pill-led" class="led"></span><span id="pill-text">disconnected</span></span>
+            <button id="action" class="btn btn-primary">Connect</button>
+          </div>
+        </div>
+
+        <div id="notice" class="notice" role="status"></div>
+
+        <div class="tiles">
+          <div class="tile"><div class="k">Virtual IP</div><div id="t-vip" class="v dim">—</div><div class="sub" id="t-vip-sub">assigned by gateway</div></div>
+          <div class="tile"><div class="k">Uptime</div><div id="t-up" class="v dim">—</div><div class="sub">since handshake</div></div>
+          <div class="tile"><div class="k">Transfer</div><div id="t-xfer" class="v dim">—</div><div class="sub" id="t-xfer-sub">in · out</div></div>
+          <div class="tile"><div class="k">Throughput</div><canvas id="spark" aria-hidden="true"></canvas><div class="sub" id="t-rate">idle</div></div>
+        </div>
+
+        <div class="cards">
+          <div class="card"><h3>Negotiated security <span id="sec-badge" class="count"></span></h3><div class="kv" id="sec-kv"></div></div>
+          <div class="card"><h3>Import trust <span id="warn-count" class="count"></span></h3><div class="warns" id="warns"></div></div>
+        </div>
+
+        <div class="console">
+          <div class="console-head"><span>charon log</span><span class="spacer"></span><button id="clear-log">Clear</button></div>
+          <div class="log" id="log" role="log" aria-live="polite"><div class="log-empty">No events yet — connect to begin the IKE_SA handshake.</div></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <h3 id="modal-title" class="mono">Import NCP profile</h3>
+    <div class="mbody">
+      Drop a <b>.ini</b> profile into the profiles directory and it appears here automatically. The desktop app scans
+      <code id="modal-dir">the profiles folder</code> and interprets each file on the fly — the pre-shared key is read into
+      memory only when you connect, never copied to disk.
+    </div>
+    <div class="mfoot"><button class="btn btn-ghost" id="modal-cancel">Close</button><button class="btn btn-primary" id="modal-refresh">Rescan now</button></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var TAURI = (window.__TAURI__ && window.__TAURI__.core) ? window.__TAURI__.core : null;
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function sanitize(n) { var o = (n || "").replace(/[^A-Za-z0-9_-]/g, "_"); return o.length ? o : "conn"; }
+
+  // Demo data used only when the page is opened outside the Tauri shell.
+  var DEMO = [
+    { id: "test1", name: "vRouter-TEST-1", kind: "test", gateway: "192.168.100.10", locked: false,
+      localId: "test-1@test.local", remote: "10.0.0.0/24", vip: "10.0.0.15",
+      ike: "aes256-sha256-prfsha256-modp3072", esp: "aes256-sha256", pfs: "modp3072", confirmed: true,
+      warns: [
+        { lvl: "medium", t: "IkeIdType=3 interpreted as USER_FQDN", n: "unconfirmed mapping — verify on first connect" },
+        { lvl: "ignored", t: "ConnMedia=21", n: "not interpreted yet — ignored" },
+        { lvl: "ignored", t: "SeamRoaming=1", n: "not interpreted yet — ignored" }
+      ] },
+    { id: "efa", name: "EFA_MDT_42", kind: "prod", gateway: "ITS5597555LCM010.itm-sourcing.net", locked: true,
+      localId: "efa_mdt_42", remote: "10.102.15.0/24", vip: "—",
+      ike: "aes256-sha256-prfsha256-modp3072", esp: "aes256-sha256", pfs: "modp3072", confirmed: true,
+      warns: [{ lvl: "medium", t: "IkeIdType=3 interpreted as USER_FQDN", n: "unconfirmed mapping — verify on first connect" }] }
+  ];
+
+  var profiles = [];
+  var state = {};          // id -> 'disconnected' | 'connecting' | 'established'
+  var current = null;
+  var pollTimer = null, upTimer = null, connectAt = 0, prevTotal = 0;
+  var samples = [];
+  var seqTimers = [];
+
+  /* ---------- backend adapter ---------- */
+  function mapSummary(s) {
+    return {
+      id: s.id, name: s.name, gateway: s.gateway,
+      kind: s.kind === "prod" ? "prod" : "test",
+      localId: s.local_id || "—",
+      remote: (s.remote && s.remote.length) ? s.remote.join(", ") : "—",
+      vip: "—",
+      ike: s.ike, esp: s.esp, pfs: s.pfs || null,
+      confirmed: s.kind !== "prod",
+      locked: s.locked,
+      warns: (s.warnings || []).map(function (w) { return { lvl: w.level, t: w.text, n: w.note }; })
+    };
+  }
+
+  async function fetchProfiles() {
+    if (TAURI) {
+      try { return (await TAURI.invoke("list_profiles")).map(mapSummary); }
+      catch (e) { console.error(e); return []; }
+    }
+    return DEMO.map(function (d) { return Object.assign({}, d); });
+  }
+
+  /* ---------- rendering ---------- */
+  function renderList() {
+    var ul = $("profile-list"); ul.innerHTML = "";
+    if (!profiles.length) {
+      var empty = document.createElement("li");
+      empty.style.cssText = "color:var(--faint);font-family:var(--mono);font-size:var(--fs-xs);padding:10px 12px;";
+      empty.textContent = "No profiles found. Drop a .ini into the profiles folder.";
+      ul.appendChild(empty); return;
+    }
+    profiles.forEach(function (p) {
+      var li = document.createElement("li");
+      var b = document.createElement("button");
+      b.className = "profile" + (current && p.id === current.id ? " active" : "");
+      b.setAttribute("aria-pressed", current && p.id === current.id ? "true" : "false");
+      var st = state[p.id];
+      var led = st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
+      b.innerHTML = '<div class="profile-top"><span class="' + led + '"></span>' +
+        '<span class="profile-name"></span>' +
+        '<span class="tag ' + (p.kind === "prod" ? "prod" : "test") + '">' + (p.kind === "prod" ? "prod" : "lab") + '</span></div>' +
+        '<div class="profile-gw"></div>';
+      b.querySelector(".profile-name").textContent = p.name;
+      b.querySelector(".profile-gw").textContent = p.gateway;
+      b.addEventListener("click", function () { current = p; renderAll(); });
+      li.appendChild(b); ul.appendChild(li);
+    });
+  }
+
+  function renderSecurity() {
+    var p = current;
+    var confirmed = p.confirmed ? ' <span class="badge">confirmed</span>' : "";
+    var rows = [
+      ["IKE proposal", esc(p.ike) + confirmed],
+      ["ESP proposal", esc(p.esp)],
+      ["PFS group", p.pfs ? esc(p.pfs) : "none"],
+      ["Auth", '<span class="redacted">psk ••••••••••••</span>'],
+      ["Local ID", esc(p.localId)],
+      ["Remote subnet", esc(p.remote)]
+    ];
+    $("sec-kv").innerHTML = rows.map(function (r) {
+      return '<div class="kv-row"><span class="kk">' + r[0] + '</span><span class="vv">' + r[1] + '</span></div>';
+    }).join("");
+  }
+
+  function renderWarns() {
+    var p = current;
+    $("warn-count").textContent = p.warns.length ? (p.warns.length + " flagged") : "";
+    var el = $("warns");
+    if (!p.warns.length) {
+      el.innerHTML = '<div class="allclear"><span class="led ok" style="box-shadow:none"></span>All codes confirmed — nothing to review.</div>';
+      return;
+    }
+    el.innerHTML = p.warns.map(function (w) {
+      var row = '<div class="warn-row ' + (w.lvl || "ignored") + '"><span class="wled"></span><div><div class="wt"></div>';
+      if (w.n) { row += '<div class="wn"></div>'; }
+      return row + "</div></div>";
+    }).join("");
+    var rows = el.querySelectorAll(".warn-row");
+    p.warns.forEach(function (w, i) {
+      rows[i].querySelector(".wt").textContent = w.t;
+      if (w.n) { rows[i].querySelector(".wn").textContent = w.n; }
+    });
+  }
+
+  function setPill() {
+    var st = state[current.id];
+    $("pill").className = "status-pill" + (st === "disconnected" ? "" : " " + st);
+    $("pill-led").className = "led" + (st === "established" ? " ok" : st === "connecting" ? " warn pulse" : "");
+    $("pill-text").textContent = st === "established" ? "established" : st;
+    var anyUp = Object.keys(state).some(function (k) { return state[k] === "established"; });
+    var anyConn = Object.keys(state).some(function (k) { return state[k] === "connecting"; });
+    $("glob-led").className = "led" + (anyUp ? " ok" : anyConn ? " warn pulse" : "");
+    $("glob-text").textContent = anyUp ? "tunnel up" : anyConn ? "negotiating" : "disconnected";
+  }
+
+  function setAction() {
+    var st = state[current.id], btn = $("action");
+    btn.disabled = false;
+    if (current.locked && st === "disconnected") { btn.className = "btn btn-warn"; btn.textContent = "Locked"; return; }
+    if (st === "disconnected") { btn.className = "btn btn-primary"; btn.textContent = "Connect"; }
+    else if (st === "connecting") { btn.className = "btn btn-ghost"; btn.textContent = "Cancel"; }
+    else { btn.className = "btn btn-ghost"; btn.textContent = "Disconnect"; }
+  }
+
+  function renderTiles() {
+    var st = state[current.id];
+    if (st !== "established") {
+      setTile("t-vip", "—", true); $("t-vip-sub").textContent = "assigned by gateway";
+      setTile("t-up", "—", true); setTile("t-xfer", "—", true);
+      $("t-xfer-sub").textContent = "in · out"; $("t-rate").textContent = "idle";
+    } else {
+      setTile("t-vip", current.vip || "—", false);
+    }
+    drawSpark();
+  }
+  function setTile(id, val, dim) { var el = $(id); el.textContent = val; el.className = "v" + (dim ? " dim" : ""); }
+
+  function renderAll() {
+    if (!current) { return; }
+    $("d-name").textContent = current.name;
+    $("d-localid").textContent = current.localId;
+    $("d-gw").textContent = current.gateway;
+    hideNotice();
+    renderList(); renderSecurity(); renderWarns(); setPill(); setAction(); renderTiles();
+  }
+
+  function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+  /* ---------- notice ---------- */
+  function showNotice(html, kind) { var n = $("notice"); n.className = "notice show" + (kind ? " " + kind : ""); n.innerHTML = html; }
+  function hideNotice() { $("notice").className = "notice"; }
+
+  /* ---------- log ---------- */
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  function stamp() { var d = new Date(); return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()); }
+  function clearLog() { $("log").innerHTML = '<div class="log-empty">No events yet — connect to begin the IKE_SA handshake.</div>'; }
+  function log(sys, msg, cls) {
+    var l = $("log"); var e = l.querySelector(".log-empty"); if (e) { e.remove(); }
+    var row = document.createElement("div");
+    row.className = "log-line" + (cls ? " " + cls : "");
+    row.innerHTML = '<span class="ts">' + stamp() + '</span><span class="sys ' + sys + '">' + sys + '</span><span class="msg"></span>';
+    row.querySelector(".msg").textContent = msg;
+    l.appendChild(row); l.scrollTop = l.scrollHeight;
+  }
+
+  /* ---------- sparkline ---------- */
+  function drawSpark() {
+    var c = $("spark"); if (!c) { return; }
+    var dpr = window.devicePixelRatio || 1, w = c.clientWidth || 200, h = 34;
+    c.width = w * dpr; c.height = h * dpr;
+    var ctx = c.getContext("2d"); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, w, h);
+    if (samples.length < 2) { return; }
+    var max = Math.max.apply(null, samples) || 1, stepX = w / (samples.length - 1);
+    var yOf = function (v) { return h - 3 - (v / max) * (h - 8); };
+    ctx.beginPath(); ctx.moveTo(0, h);
+    samples.forEach(function (v, i) { ctx.lineTo(i * stepX, yOf(v)); });
+    ctx.lineTo((samples.length - 1) * stepX, h); ctx.closePath();
+    var g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, "rgba(74,158,255,.28)"); g.addColorStop(1, "rgba(74,158,255,0)");
+    ctx.fillStyle = g; ctx.fill();
+    ctx.beginPath();
+    samples.forEach(function (v, i) { var x = i * stepX, y = yOf(v); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.strokeStyle = "#4a9eff"; ctx.lineWidth = 1.5; ctx.stroke();
+    var lx = (samples.length - 1) * stepX, ly = yOf(samples[samples.length - 1]);
+    ctx.beginPath(); ctx.arc(lx, ly, 2.4, 0, Math.PI * 2); ctx.fillStyle = "#8fc2ff"; ctx.fill();
+  }
+  function fmtBytes(n) { if (n < 1024) { return n + " B"; } if (n < 1048576) { return (n / 1024).toFixed(1) + " KiB"; } return (n / 1048576).toFixed(2) + " MiB"; }
+  function fmtDur(ms) { var s = Math.floor(ms / 1000), m = Math.floor(s / 60); s %= 60; return pad(m) + ":" + pad(s); }
+
+  /* ---------- lifecycle: real (Tauri) ---------- */
+  async function realConnect(p) {
+    log("KNL", "load-conn + load-shared via vici (PSK held in memory)");
+    log("IKE", "initiating IKE_SA " + p.name + " to " + p.gateway);
+    try {
+      await TAURI.invoke("connect", { id: p.id, gatewayOverride: null });
+    } catch (e) {
+      state[p.id] = "disconnected"; setPill(); setAction(); renderList();
+      log("IKE", String(e), "bad");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+      return;
+    }
+    log("IKE", "authentication with pre-shared key successful", "good");
+    log("IKE", "IKE_SA established — CHILD_SA installed", "good");
+    state[p.id] = "established"; connectAt = Date.now(); prevTotal = 0; samples = [];
+    setPill(); setAction(); renderList();
+    startPolling();
+  }
+
+  function startPolling() {
+    stopPolling();
+    upTimer = setInterval(function () {
+      if (state[current.id] === "established") { setTile("t-up", fmtDur(Date.now() - connectAt), false); }
+    }, 1000);
+    pollTimer = setInterval(pollOnce, 1600);
+    pollOnce();
+  }
+  function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } if (upTimer) { clearInterval(upTimer); upTimer = null; } }
+
+  async function pollOnce() {
+    if (!TAURI) { return; }
+    var sas;
+    try { sas = await TAURI.invoke("status"); } catch (e) { return; }
+    var nm = sanitize(current.name);
+    var sa = null;
+    sas.forEach(function (s) { if (s.name === nm) { sa = s; } });
+    if (!sa) { return; }
+    var vip = (sa.virtual_ips && sa.virtual_ips[0]) || "—";
+    current.vip = vip; setTile("t-vip", vip, false);
+    $("t-vip-sub").textContent = sa.local_host + " ↔ " + sa.remote_host;
+    var bin = 0, bout = 0;
+    (sa.children || []).forEach(function (c) { bin += c.bytes_in; bout += c.bytes_out; });
+    var total = bin + bout;
+    setTile("t-xfer", fmtBytes(total), false);
+    $("t-xfer-sub").textContent = "in " + fmtBytes(bin) + " · out " + fmtBytes(bout);
+    var delta = Math.max(0, total - prevTotal); prevTotal = total;
+    samples.push(delta); if (samples.length > 40) { samples.shift(); }
+    $("t-rate").textContent = fmtBytes(delta) + "/s";
+    drawSpark();
+  }
+
+  async function realDisconnect(p) {
+    log("IKE", "terminating IKE_SA " + p.name);
+    try { await TAURI.invoke("disconnect", { name: sanitize(p.name) }); }
+    catch (e) { log("IKE", String(e), "bad"); }
+    stopPolling();
+    state[p.id] = "disconnected";
+    setPill(); setAction(); renderList(); renderTiles();
+    log("NET", "virtual IP released, CHILD_SA removed");
+  }
+
+  /* ---------- lifecycle: demo (no backend) ---------- */
+  var HS = [
+    ["IKE", function (p) { return "initiating IKE_SA " + p.name + " to " + p.gateway; }],
+    ["IKE", function () { return "generating IKE_SA_INIT request [ SA KE No N(NATD_S_IP) ]"; }],
+    ["IKE", function () { return "parsed IKE_SA_INIT response [ SA KE No CERTREQ ]"; }],
+    ["IKE", function (p) { return "authentication of '" + p.localId + "' with pre-shared key"; }, "good"],
+    ["NET", function (p) { return "installing new virtual IP " + p.vip; }, "good"],
+    ["IKE", function (p) { return "IKE_SA established; CHILD_SA TS " + p.vip + "/32 === " + p.remote; }, "good"]
+  ];
+  function demoConnect(p) {
+    var i = 0;
+    (function step() {
+      if (state[p.id] !== "connecting") { return; }
+      if (i >= HS.length) { demoFinish(p); return; }
+      var h = HS[i++]; log(h[0], h[1](p), h[2]);
+      seqTimers.push(setTimeout(step, reduce ? 0 : 200 + Math.random() * 200));
+    })();
+  }
+  function demoFinish(p) {
+    state[p.id] = "established"; connectAt = Date.now(); samples = [];
+    setPill(); setAction(); renderList(); current.vip = p.vip; setTile("t-vip", p.vip, false);
+    upTimer = setInterval(function () { if (state[p.id] === "established") { setTile("t-up", fmtDur(Date.now() - connectAt), false); } }, 1000);
+    var inB = 0, outB = 0;
+    pollTimer = setInterval(function () {
+      if (state[p.id] !== "established") { return; }
+      var din = (Math.random() * 2600 + 200) | 0, dout = (Math.random() * 1400 + 120) | 0;
+      inB += din; outB += dout; samples.push(din + dout); if (samples.length > 40) { samples.shift(); }
+      setTile("t-xfer", fmtBytes(inB + outB), false);
+      $("t-xfer-sub").textContent = "in " + fmtBytes(inB) + " · out " + fmtBytes(outB);
+      $("t-rate").textContent = fmtBytes(din + dout) + "/s"; drawSpark();
+    }, reduce ? 1200 : 650);
+  }
+  function demoDisconnect(p) {
+    stopPolling(); log("IKE", "deleting IKE_SA " + p.name); log("NET", "virtual IP released");
+    state[p.id] = "disconnected"; setPill(); setAction(); renderList(); renderTiles();
+  }
+
+  /* ---------- action button ---------- */
+  function onAction() {
+    var st = state[current.id];
+    if (current.locked && st === "disconnected") {
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div><b>' + esc(current.gateway) + '</b> is a production gateway. Connecting requires an explicit gateway override — point it at a lab responder first.</div>', "");
+      return;
+    }
+    if (st === "disconnected") {
+      state[current.id] = "connecting"; setPill(); setAction(); renderList();
+      if (TAURI) { realConnect(current); } else { demoConnect(current); }
+    } else if (st === "connecting") {
+      seqTimers.forEach(clearTimeout); seqTimers = [];
+      state[current.id] = "disconnected"; log("KNL", "initiation cancelled"); setPill(); setAction(); renderList();
+    } else {
+      if (TAURI) { realDisconnect(current); } else { demoDisconnect(current); }
+    }
+  }
+
+  /* ---------- boot ---------- */
+  async function refresh() {
+    var next = await fetchProfiles();
+    var byId = {}; next.forEach(function (p) { byId[p.id] = p; if (!(p.id in state)) { state[p.id] = "disconnected"; } });
+    profiles = next;
+    if (!current || !byId[current.id]) { current = profiles[0] || null; }
+    else { current = byId[current.id]; }
+    if (current) { renderAll(); } else { renderList(); }
+  }
+
+  $("action").addEventListener("click", onAction);
+  $("clear-log").addEventListener("click", clearLog);
+  $("import-btn").addEventListener("click", function () { $("overlay").classList.add("show"); });
+  $("modal-cancel").addEventListener("click", function () { $("overlay").classList.remove("show"); });
+  $("modal-refresh").addEventListener("click", function () { $("overlay").classList.remove("show"); refresh(); });
+  $("overlay").addEventListener("click", function (e) { if (e.target === $("overlay")) { $("overlay").classList.remove("show"); } });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { $("overlay").classList.remove("show"); } });
+  window.addEventListener("resize", drawSpark);
+
+  $("foot-led").className = "led" + (TAURI ? " ok" : "");
+  $("foot-text").textContent = TAURI ? "charon · vici" : "preview (no backend)";
+
+  refresh();
+})();
+</script>
+</body>
+</html>

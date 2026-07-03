@@ -4,8 +4,10 @@ members = [
     "crates/vpn-core",
     "crates/ncp-profile",
     "crates/vici",
+    "crates/vpn-control",
     "crates/vpn-agent",
     "crates/vpn-cli",
+    "crates/vpn-desktop",
 ]
 
 [workspace.package]
@@ -14,3 +16,4 @@ license = "MIT"
 
 [workspace.dependencies]
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }

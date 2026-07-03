@@ -1,5 +1,4 @@
-//! Translate the internal [`ConnectionConfig`] into vici messages, and
-//! render `list-sa` events back into a status summary.
+//! Translate the internal [`ConnectionConfig`] into vici messages.
 //!
 //! This mirrors the swanctl.conf structure but hands everything to charon
 //! over the control socket — crucially, the PSK travels via `load-shared`
@@ -63,42 +62,6 @@ pub fn load_shared_message(config: &ConnectionConfig, name: &str) -> Message {
         .list("owners", [owner])
 }
 
-/// Render the `list-sa` events from a `list-sas` stream into a readable
-/// status summary.
-pub fn format_sas(events: &[Message]) -> String {
-    if events.is_empty() {
-        return "No active IKE SAs.".to_string();
-    }
-    let mut out = String::new();
-    for event in events {
-        for (ike_name, ike) in event.sections() {
-            let state = ike.get_str("state").unwrap_or_default();
-            let local = ike.get_str("local-host").unwrap_or_default();
-            let remote = ike.get_str("remote-host").unwrap_or_default();
-            out.push_str(&format!("IKE_SA {ike_name}: {state}  {local} -> {remote}\n"));
-
-            let vips = ike.get_list("local-vips").unwrap_or_default();
-            if !vips.is_empty() {
-                out.push_str(&format!("  virtual IP: {}\n", vips.join(", ")));
-            }
-
-            if let Some(children) = ike.get_section("child-sas") {
-                for (child_name, child) in children.sections() {
-                    let cstate = child.get_str("state").unwrap_or_default();
-                    let bin = child.get_str("bytes-in").unwrap_or_default();
-                    let bout = child.get_str("bytes-out").unwrap_or_default();
-                    let lts = child.get_list("local-ts").unwrap_or_default().join(",");
-                    let rts = child.get_list("remote-ts").unwrap_or_default().join(",");
-                    out.push_str(&format!(
-                        "  CHILD_SA {child_name}: {cstate}  {lts} === {rts}  in={bin}B out={bout}B\n"
-                    ));
-                }
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,10 +98,6 @@ mod tests {
         assert_eq!(
             conn.get_list("proposals"),
             Some(vec!["aes256-sha256-prfsha256-modp3072".to_string()])
-        );
-        assert_eq!(
-            conn.get_list("remote_addrs"),
-            Some(vec!["192.168.100.10".to_string()])
         );
         assert_eq!(
             conn.get_section("local").unwrap().get_str("id").as_deref(),

@@ -8,6 +8,6 @@ description = "Phase 1 agent: import an NCP profile and drive charon over vici (
 [dependencies]
 vpn-core = { path = "../vpn-core" }
 ncp-profile = { path = "../ncp-profile" }
-vici = { path = "../vici" }
+vpn-control = { path = "../vpn-control" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

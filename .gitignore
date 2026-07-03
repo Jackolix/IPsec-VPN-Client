@@ -7,3 +7,6 @@
 *.swanctl.conf
 
 /target/
+
+# Tauri build-time generated schemas.
+crates/vpn-desktop/gen/

@@ -5,21 +5,24 @@
 //!   vpn-agent status
 //!   vpn-agent disconnect --name NAME
 //!
-//! The PSK is handed to charon via `load-shared` in memory; no swanctl.conf
-//! containing the secret is written to disk.
+//! The connection flows live in the shared `vpn-control` crate. The PSK is
+//! handed to charon via `load-shared` in memory; no swanctl.conf containing
+//! the secret is written to disk.
 
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-
-#[cfg_attr(not(unix), allow(dead_code))]
-mod bridge;
+use vpn_control::{status::render_text, Transport};
 
 #[derive(Parser)]
 #[command(name = "vpn-agent", about = "Import NCP profiles and drive charon over vici")]
 struct Cli {
-    /// Path to charon's vici socket.
-    #[arg(long, default_value = vici::DEFAULT_SOCKET)]
+    /// Path to charon's vici Unix socket.
+    #[arg(long, default_value = "/var/run/charon.vici")]
     socket: String,
+    /// Use a TCP vici socket (`host:port`) instead of the Unix socket.
+    #[arg(long)]
+    tcp: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -44,33 +47,21 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    run(cli)
-}
-
-#[cfg(unix)]
-fn run(cli: Cli) -> anyhow::Result<()> {
-    use anyhow::{bail, Context};
-    use ncp_profile::import_profile;
-    use vici::Message;
-    use vpn_core::swanctl::sanitize_name;
-
-    fn check(resp: &Message, ctx: &str) -> anyhow::Result<()> {
-        match resp.get_str("success").as_deref() {
-            Some("yes") => Ok(()),
-            _ => bail!(
-                "{ctx} failed: {}",
-                resp.get_str("errmsg").unwrap_or_else(|| "unknown error".to_string())
-            ),
-        }
-    }
+    let transport = match &cli.tcp {
+        Some(addr) => Transport::Tcp(addr.clone()),
+        None => Transport::Unix(cli.socket.clone()),
+    };
 
     match cli.command {
         Command::Connect {
             profile,
             gateway_override,
         } => {
+            use ncp_profile::import_profile;
+            use vpn_core::swanctl::sanitize_name;
+
             let text = std::fs::read_to_string(&profile)
                 .with_context(|| format!("cannot read {}", profile.display()))?;
             let mut imported = import_profile(&text)
@@ -84,48 +75,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
 
             let name = sanitize_name(&imported.config.name);
-            let mut client = vici::connect_unix(&cli.socket)
-                .with_context(|| format!("cannot connect to vici at {}", cli.socket))?;
-
-            let resp = client.request("load-conn", bridge::load_conn_message(&imported.config, &name))?;
-            check(&resp, "load-conn")?;
-
-            let resp =
-                client.request("load-shared", bridge::load_shared_message(&imported.config, &name))?;
-            check(&resp, "load-shared")?;
-
-            // The PSK is now in charon; drop our plaintext copy.
-            drop(imported);
-
-            let resp = client.request(
-                "initiate",
-                Message::new().str("child", &name[..]).str("ike", &name[..]),
-            )?;
-            check(&resp, "initiate")?;
+            vpn_control::connect(&transport, &imported.config, &name)?;
+            drop(imported); // discard the plaintext PSK once charon has it
             println!("Tunnel '{name}' initiated.");
         }
         Command::Status => {
-            let mut client = vici::connect_unix(&cli.socket)
-                .with_context(|| format!("cannot connect to vici at {}", cli.socket))?;
-            let (events, _resp) =
-                client.stream_request("list-sas", "list-sa", Message::new())?;
-            print!("{}", bridge::format_sas(&events));
+            let sas = vpn_control::status(&transport)?;
+            print!("{}", render_text(&sas));
         }
         Command::Disconnect { name } => {
-            let mut client = vici::connect_unix(&cli.socket)
-                .with_context(|| format!("cannot connect to vici at {}", cli.socket))?;
-            let resp = client.request("terminate", Message::new().str("ike", &name[..]))?;
-            check(&resp, "terminate")?;
+            vpn_control::disconnect(&transport, &name)?;
             println!("Tunnel '{name}' terminated.");
         }
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn run(_cli: Cli) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "vpn-agent talks to charon over a Unix socket and must run on Linux \
-         (inside the strongSwan container during development)."
-    )
 }
