@@ -43,8 +43,8 @@ Windows).
   virtual IP assigned, ESP counters move, clean teardown. The PSK is pushed
   via `load-shared` in memory — no swanctl.conf secret on disk.
   **Still open for Phase 1.5**: move PSK storage to the OS keychain (`keyring`
-  crate) on the real desktop OS; add `control-log` event streaming so
-  connect shows live handshake progress; auto-reconnect/DPD config.
+  crate) on the real desktop OS; auto-reconnect/DPD config. (Live handshake
+  progress via the `log` event landed in Phase 2.)
 - **Phase 2 (done 2026-07-03)**: Tauri v2 desktop app (`crates/vpn-desktop`).
   Rust backend interprets profiles natively (works on Windows) and drives
   charon via the shared `vpn-control` crate; the web UI drives it through
@@ -52,8 +52,13 @@ Windows).
   sparkline, import-trust warnings, charon log console. Verified: the desktop
   backend brings up and reports the LANCOM tunnel from a native Windows build
   over a TCP vici socket (`docker/vici-tcp`, published on 127.0.0.1:45022).
-  Still open: `control-log` event streaming for live handshake lines in the
-  GUI; a gateway-override dialog for locked/production profiles; keychain.
+  **Live handshake log done**: connect registers for charon's `log` event
+  around `initiate` and returns the captured transcript (`vpn-control`'s
+  `connect_logged` → `ConnectOutcome`), so the GUI console shows the real
+  `IKE_SA_INIT` / auth / `CHILD_SA` lines (and the failure reason on a
+  declined handshake) instead of canned text; the CLI prints them too.
+  Still open: a gateway-override dialog for locked/production profiles;
+  keychain for the PSK.
 - **Phase 3**: macOS — start with `NEVPNProtocolIKEv2`; fall back to embedded
   strongSwan Network Extension only on cipher/feature gaps. Apple Developer
   account + Network Extension entitlement lead time.

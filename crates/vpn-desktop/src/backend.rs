@@ -170,7 +170,7 @@ pub fn connect(
     state: &AppState,
     id: String,
     gateway_override: Option<String>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<vpn_control::ConnectOutcome, String> {
     let mut imported = load(&profile_path(state, &id))?;
     let (_, locked) = classify(&imported.config.gateway);
     match &gateway_override {
@@ -184,8 +184,7 @@ pub fn connect(
         _ => {}
     }
     let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
-    vpn_control::connect(&state.transport, &imported.config, &name).map_err(|e| e.to_string())?;
-    Ok(())
+    vpn_control::connect_logged(&state.transport, &imported.config, &name).map_err(|e| e.to_string())
 }
 
 pub fn disconnect(state: &AppState, name: String) -> std::result::Result<(), String> {
