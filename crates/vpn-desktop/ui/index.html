@@ -419,19 +419,39 @@
   function fmtDur(ms) { var s = Math.floor(ms / 1000), m = Math.floor(s / 60); s %= 60; return pad(m) + ":" + pad(s); }
 
   /* ---------- lifecycle: real (Tauri) ---------- */
+  // charon attaches no severity to log lines, so classify by wording: green
+  // for handshake milestones, red for the failure reasons worth spotting.
+  function logSeverity(msg) {
+    if (/established|success|installed|active|assigned|received/i.test(msg)) { return "good"; }
+    if (/fail|error|unable|no matching|invalid|giving up|retransmit|no config|deleting|not found|refused/i.test(msg)) { return "bad"; }
+    return null;
+  }
+  function renderHandshake(lines) {
+    (lines || []).forEach(function (l) {
+      var sys = (l.group || "IKE").toUpperCase();
+      log(sys, l.msg, logSeverity(l.msg));
+    });
+  }
   async function realConnect(p) {
     log("KNL", "load-conn + load-shared via vici (PSK held in memory)");
     log("IKE", "initiating IKE_SA " + p.name + " to " + p.gateway);
+    var out;
     try {
-      await TAURI.invoke("connect", { id: p.id, gatewayOverride: null });
+      out = await TAURI.invoke("connect", { id: p.id, gatewayOverride: null });
     } catch (e) {
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       log("IKE", String(e), "bad");
       showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
       return;
     }
-    log("IKE", "authentication with pre-shared key successful", "good");
-    log("IKE", "IKE_SA established — CHILD_SA installed", "good");
+    renderHandshake(out && out.log);
+    if (!out || !out.connected) {
+      var reason = (out && out.error) || "the handshake did not complete";
+      state[p.id] = "disconnected"; setPill(); setAction(); renderList();
+      log("IKE", reason, "bad");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(reason) + "</div>", "bad");
+      return;
+    }
     state[p.id] = "established"; connectAt = Date.now(); prevTotal = 0; samples = [];
     setPill(); setAction(); renderList();
     startPolling();

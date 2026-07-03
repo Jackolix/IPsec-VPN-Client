@@ -9,7 +9,7 @@
 mod backend;
 
 use backend::{AppState, ProfileSummary};
-use vpn_control::IkeSa;
+use vpn_control::{ConnectOutcome, IkeSa};
 
 #[tauri::command]
 async fn list_profiles(state: tauri::State<'_, AppState>) -> Result<Vec<ProfileSummary>, String> {
@@ -24,7 +24,7 @@ async fn connect(
     state: tauri::State<'_, AppState>,
     id: String,
     gateway_override: Option<String>,
-) -> Result<(), String> {
+) -> Result<ConnectOutcome, String> {
     let s = state.inner().clone();
     match tauri::async_runtime::spawn_blocking(move || backend::connect(&s, id, gateway_override))
         .await
