@@ -7,6 +7,7 @@
 //! verify the backend without opening a window).
 
 mod backend;
+mod creds;
 
 use backend::{AppState, ProfileSummary};
 use vpn_control::{ConnectOutcome, IkeSa};
@@ -52,6 +53,24 @@ async fn status(state: tauri::State<'_, AppState>) -> Result<Vec<IkeSa>, String>
     }
 }
 
+#[tauri::command]
+async fn save_credentials(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::save_credentials(&s, id)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn forget_credentials(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::forget_credentials(&s, id)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn selftest() {
     let state = AppState::from_env();
     let profiles = backend::list_profiles(&state);
@@ -65,10 +84,52 @@ fn selftest() {
     }
 }
 
+/// Headless verification harness: drives the exact same `backend` path the
+/// Tauri commands use, so the connect/keychain/override flows can be exercised
+/// (and CI-checked) without opening a window. Not part of the shipped UX.
+fn dev(args: &[String]) {
+    let state = AppState::from_env();
+    let result: std::result::Result<String, String> = match args.first().map(String::as_str) {
+        Some("connect") => {
+            let id = args.get(1).cloned().unwrap_or_default();
+            let gw = args.get(2).cloned();
+            backend::connect(&state, id, gw)
+                .map(|o| serde_json::to_string(&o).expect("serialize outcome"))
+        }
+        Some("disconnect") => backend::disconnect(&state, args.get(1).cloned().unwrap_or_default())
+            .map(|_| "disconnected".to_string()),
+        Some("save-creds") => {
+            backend::save_credentials(&state, args.get(1).cloned().unwrap_or_default())
+                .map(|_| "saved".to_string())
+        }
+        Some("forget-creds") => {
+            backend::forget_credentials(&state, args.get(1).cloned().unwrap_or_default())
+                .map(|_| "forgotten".to_string())
+        }
+        // Store an explicit PSK for a profile id — lets a test prove the
+        // keychain PSK (not the .ini's) is what authenticates the tunnel.
+        Some("set-creds") => {
+            let id = args.get(1).cloned().unwrap_or_default();
+            let value = args.get(2).cloned().unwrap_or_default();
+            creds::store(&id, &vpn_core::Secret::new(value)).map(|_| "set".to_string())
+        }
+        other => Err(format!("unknown dev command: {other:?}")),
+    };
+    match result {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
-    if std::env::args().any(|a| a == "--selftest") {
-        selftest();
-        return;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some("--selftest") => return selftest(),
+        Some("--dev") => return dev(&argv[1..]),
+        _ => {}
     }
 
     tauri::Builder::default()
@@ -77,7 +138,9 @@ fn main() {
             list_profiles,
             connect,
             disconnect,
-            status
+            status,
+            save_credentials,
+            forget_credentials
         ])
         .run(tauri::generate_context!())
         .expect("error while running the IPsec VPN Client");

@@ -146,6 +146,21 @@
     .cards { grid-template-columns: 1fr; }
   }
   @media (prefers-reduced-motion: reduce) { .led.pulse { animation: none; } }
+
+  /* credentials strip */
+  .creds-bar { display: none; }
+  .creds-bar.show { display: flex; align-items: center; gap: 10px; margin: 0 0 14px; padding: 8px 12px; border: 1px solid var(--line-soft); border-radius: var(--r); background: var(--surface); }
+  .creds-bar.on { border-color: var(--ok-soft); background: linear-gradient(var(--surface),var(--surface)) padding-box, rgba(70,194,102,.05); }
+  .creds-bar .ci { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .04em; color: var(--muted); }
+  .creds-bar button { margin-left: auto; }
+  .btn-sm { padding: 5px 12px; font-size: var(--fs-xs); border-radius: 7px; }
+
+  /* gateway-override modal field */
+  .gw-field { display: block; margin-top: 16px; }
+  .gw-field > span { display: block; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin-bottom: 7px; }
+  .gw-input { width: 100%; box-sizing: border-box; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font-family: var(--mono); font-size: var(--fs-md); letter-spacing: .02em; }
+  .gw-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .gw-err { min-height: 15px; margin-top: 9px; color: var(--crit); font-family: var(--mono); font-size: var(--fs-xs); }
 </style>
 </head>
 <body>
@@ -181,6 +196,7 @@
         </div>
 
         <div id="notice" class="notice" role="status"></div>
+        <div id="creds-bar" class="creds-bar"></div>
 
         <div class="tiles">
           <div class="tile"><div class="k">Virtual IP</div><div id="t-vip" class="v dim">—</div><div class="sub" id="t-vip-sub">assigned by gateway</div></div>
@@ -215,6 +231,22 @@
   </div>
 </div>
 
+<div class="overlay" id="ov-gw">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="gw-title">
+    <h3 id="gw-title" class="mono">Gateway override</h3>
+    <div class="mbody">
+      <b id="gw-profile" class="mono">This profile</b> targets a production gateway
+      (<code id="gw-prod">—</code>). The production gateway is never contacted — enter the
+      address of a lab responder to connect to instead.
+      <label class="gw-field"><span>Lab responder (IPv4)</span>
+        <input id="gw-input" class="gw-input" type="text" inputmode="decimal" placeholder="192.168.100.10" autocomplete="off" spellcheck="false" />
+      </label>
+      <div id="gw-err" class="gw-err" role="alert"></div>
+    </div>
+    <div class="mfoot"><button class="btn btn-ghost" id="gw-cancel">Cancel</button><button class="btn btn-primary" id="gw-connect">Connect to lab</button></div>
+  </div>
+</div>
+
 <script>
 (function () {
   "use strict";
@@ -223,6 +255,11 @@
   var $ = function (id) { return document.getElementById(id); };
 
   function sanitize(n) { var o = (n || "").replace(/[^A-Za-z0-9_-]/g, "_"); return o.length ? o : "conn"; }
+
+  // Name the OS credential store per platform, for user-facing copy.
+  var KEYSTORE = /Windows/.test(navigator.userAgent) ? "Windows Credential Manager"
+    : /Mac/.test(navigator.userAgent) ? "the macOS Keychain"
+    : "the OS keychain";
 
   // Demo data used only when the page is opened outside the Tauri shell.
   var DEMO = [
@@ -258,6 +295,7 @@
       ike: s.ike, esp: s.esp, pfs: s.pfs || null,
       confirmed: s.kind !== "prod",
       locked: s.locked,
+      stored: !!s.stored,
       warns: (s.warnings || []).map(function (w) { return { lvl: w.level, t: w.text, n: w.note }; })
     };
   }
@@ -347,7 +385,7 @@
   function setAction() {
     var st = state[current.id], btn = $("action");
     btn.disabled = false;
-    if (current.locked && st === "disconnected") { btn.className = "btn btn-warn"; btn.textContent = "Locked"; return; }
+    if (current.locked && st === "disconnected") { btn.className = "btn btn-warn"; btn.textContent = "Override…"; return; }
     if (st === "disconnected") { btn.className = "btn btn-primary"; btn.textContent = "Connect"; }
     else if (st === "connecting") { btn.className = "btn btn-ghost"; btn.textContent = "Cancel"; }
     else { btn.className = "btn btn-ghost"; btn.textContent = "Disconnect"; }
@@ -372,7 +410,61 @@
     $("d-localid").textContent = current.localId;
     $("d-gw").textContent = current.gateway;
     hideNotice();
-    renderList(); renderSecurity(); renderWarns(); setPill(); setAction(); renderTiles();
+    renderList(); renderSecurity(); renderWarns(); setPill(); setAction(); renderTiles(); renderCreds();
+  }
+
+  /* ---------- credentials (OS keychain) ---------- */
+  function renderCreds() {
+    var bar = $("creds-bar");
+    if (!TAURI) { bar.className = "creds-bar"; bar.innerHTML = ""; return; }
+    var p = current;
+    bar.className = "creds-bar show" + (p.stored ? " on" : "");
+    if (p.stored) {
+      bar.innerHTML = '<span class="ci"><span class="led ok" style="box-shadow:none"></span>PSK saved in ' + esc(KEYSTORE) + '</span>' +
+        '<button class="btn btn-ghost btn-sm" id="creds-forget">Forget</button>';
+      $("creds-forget").addEventListener("click", onForgetCreds);
+    } else {
+      bar.innerHTML = '<span class="ci"><span class="led" style="box-shadow:none"></span>PSK is read from the profile file on connect</span>' +
+        '<button class="btn btn-ghost btn-sm" id="creds-save">Save to ' + esc(KEYSTORE) + '</button>';
+      $("creds-save").addEventListener("click", onSaveCreds);
+    }
+  }
+  async function onSaveCreds() {
+    var p = current;
+    try {
+      await TAURI.invoke("save_credentials", { id: p.id });
+      p.stored = true; renderCreds();
+      log("KNL", "PSK saved to " + KEYSTORE + " — used in place of the profile file", "good");
+    } catch (e) {
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+    }
+  }
+  async function onForgetCreds() {
+    var p = current;
+    try {
+      await TAURI.invoke("forget_credentials", { id: p.id });
+      p.stored = false; renderCreds();
+      log("KNL", "PSK removed from " + KEYSTORE);
+    } catch (e) {
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+    }
+  }
+
+  /* ---------- gateway-override dialog ---------- */
+  function openGatewayDialog() {
+    $("gw-profile").textContent = current.name;
+    $("gw-prod").textContent = current.gateway;
+    $("gw-input").value = ""; $("gw-err").textContent = "";
+    $("ov-gw").classList.add("show");
+    setTimeout(function () { $("gw-input").focus(); }, 30);
+  }
+  function submitGateway() {
+    var v = $("gw-input").value.trim();
+    var ok = /^(\d{1,3})(\.\d{1,3}){3}$/.test(v) && v.split(".").every(function (o) { return +o <= 255; });
+    if (!ok) { $("gw-err").textContent = "Enter a valid IPv4 address, e.g. 192.168.100.10"; return; }
+    $("ov-gw").classList.remove("show");
+    state[current.id] = "connecting"; setPill(); setAction(); renderList();
+    realConnect(current, v);
   }
 
   function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
@@ -432,12 +524,14 @@
       log(sys, l.msg, logSeverity(l.msg));
     });
   }
-  async function realConnect(p) {
-    log("KNL", "load-conn + load-shared via vici (PSK held in memory)");
-    log("IKE", "initiating IKE_SA " + p.name + " to " + p.gateway);
+  async function realConnect(p, gatewayOverride) {
+    var target = gatewayOverride || p.gateway;
+    if (gatewayOverride) { log("KNL", "gateway override → " + gatewayOverride + " (production " + p.gateway + " not contacted)", "good"); }
+    log("KNL", "load-conn + load-shared via vici (" + (p.stored ? "PSK from " + KEYSTORE : "PSK held in memory") + ")");
+    log("IKE", "initiating IKE_SA " + p.name + " to " + target);
     var out;
     try {
-      out = await TAURI.invoke("connect", { id: p.id, gatewayOverride: null });
+      out = await TAURI.invoke("connect", { id: p.id, gatewayOverride: gatewayOverride || null });
     } catch (e) {
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       log("IKE", String(e), "bad");
@@ -540,7 +634,8 @@
   function onAction() {
     var st = state[current.id];
     if (current.locked && st === "disconnected") {
-      showNotice('<span class="led warn" style="box-shadow:none"></span><div><b>' + esc(current.gateway) + '</b> is a production gateway. Connecting requires an explicit gateway override — point it at a lab responder first.</div>', "");
+      if (TAURI) { openGatewayDialog(); }
+      else { showNotice('<span class="led warn" style="box-shadow:none"></span><div><b>' + esc(current.gateway) + '</b> is a production gateway. Connecting requires an explicit gateway override — point it at a lab responder first.</div>', ""); }
       return;
     }
     if (st === "disconnected") {
@@ -570,7 +665,11 @@
   $("modal-cancel").addEventListener("click", function () { $("overlay").classList.remove("show"); });
   $("modal-refresh").addEventListener("click", function () { $("overlay").classList.remove("show"); refresh(); });
   $("overlay").addEventListener("click", function (e) { if (e.target === $("overlay")) { $("overlay").classList.remove("show"); } });
-  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { $("overlay").classList.remove("show"); } });
+  $("gw-cancel").addEventListener("click", function () { $("ov-gw").classList.remove("show"); });
+  $("gw-connect").addEventListener("click", submitGateway);
+  $("ov-gw").addEventListener("click", function (e) { if (e.target === $("ov-gw")) { $("ov-gw").classList.remove("show"); } });
+  $("gw-input").addEventListener("keydown", function (e) { if (e.key === "Enter") { submitGateway(); } });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { $("overlay").classList.remove("show"); $("ov-gw").classList.remove("show"); } });
   window.addEventListener("resize", drawSpark);
 
   $("foot-led").className = "led" + (TAURI ? " ok" : "");
