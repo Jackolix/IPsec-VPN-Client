@@ -57,8 +57,19 @@ Windows).
   `connect_logged` → `ConnectOutcome`), so the GUI console shows the real
   `IKE_SA_INIT` / auth / `CHILD_SA` lines (and the failure reason on a
   declined handshake) instead of canned text; the CLI prints them too.
-  Still open: a gateway-override dialog for locked/production profiles;
-  keychain for the PSK.
+  **Phase 2.5 done 2026-07-03**: gateway-override dialog (locked/production
+  profiles prompt for a lab responder IP before connecting; the production
+  gateway is never contacted) and PSK storage in the OS keychain (Windows
+  Credential Manager / macOS Keychain / Secret Service via the `keyring`
+  crate, in `vpn-desktop/src/creds.rs`). A saved PSK takes precedence over
+  the plaintext `.ini` on connect. Verified live: a wrong keychain PSK makes
+  auth fail (proving the keychain key is used), forgetting it falls back to
+  the `.ini` and the tunnel comes up; a locked profile connects only via an
+  explicit override and the production FQDN never reaches the log. Headless
+  `vpn-desktop --dev <connect|disconnect|save-creds|forget-creds|set-creds>`
+  drives the same backend path for verification.
+  Still open: strongSwan on the eventual Linux/macOS desktop needs the
+  matching `keyring` backend at runtime (Secret Service daemon on Linux).
 - **Phase 3**: macOS — start with `NEVPNProtocolIKEv2`; fall back to embedded
   strongSwan Network Extension only on cipher/feature gaps. Apple Developer
   account + Network Extension entitlement lead time.
