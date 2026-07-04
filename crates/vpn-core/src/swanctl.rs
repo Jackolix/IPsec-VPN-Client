@@ -70,8 +70,8 @@ pub fn render(config: &ConnectionConfig, secrets: SecretRendering) -> String {
     writeln!(out, "        proposals = {ike_proposal}").unwrap();
     writeln!(out, "        local {{").unwrap();
     writeln!(out, "            auth = psk").unwrap();
-    if let Some(id) = &config.local_id {
-        writeln!(out, "            id = {}", quote(id)).unwrap();
+    if let Some(id) = config.local_id_wire() {
+        writeln!(out, "            id = {}", quote(&id)).unwrap();
     }
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        remote {{").unwrap();
@@ -100,8 +100,8 @@ pub fn render(config: &ConnectionConfig, secrets: SecretRendering) -> String {
     };
     writeln!(out, "secrets {{").unwrap();
     writeln!(out, "    ike-{name} {{").unwrap();
-    if let Some(id) = &config.local_id {
-        writeln!(out, "        id = {}", quote(id)).unwrap();
+    if let Some(id) = config.local_id_wire() {
+        writeln!(out, "        id = {}", quote(&id)).unwrap();
     }
     writeln!(out, "        secret = {secret_value}").unwrap();
     writeln!(out, "    }}").unwrap();

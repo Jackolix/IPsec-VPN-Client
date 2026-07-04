@@ -14,7 +14,7 @@ use vpn_core::{AuthMethod, ConnectionConfig};
 /// secret material.
 pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
     let mut local = Message::new().str("auth", "psk");
-    if let Some(id) = &config.local_id {
+    if let Some(id) = config.local_id_wire() {
         local = local.str("id", id);
     }
     let remote = Message::new().str("auth", "psk");
@@ -61,8 +61,7 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
 pub fn load_shared_message(config: &ConnectionConfig, name: &str) -> Message {
     let AuthMethod::PresharedKey(psk) = &config.auth;
     let owner = config
-        .local_id
-        .clone()
+        .local_id_wire()
         .unwrap_or_else(|| "%any".to_string());
     Message::new()
         .str("id", format!("ike-{name}"))
@@ -82,6 +81,7 @@ mod tests {
             name: "vRouter-TEST-1".to_string(),
             gateway: "192.168.100.10".to_string(),
             local_id: Some("test-1@test.local".to_string()),
+            local_id_type: None,
             auth: AuthMethod::PresharedKey(Secret::new("s3cr3t".to_string())),
             ike_enc: EncAlg::Aes256,
             ike_integ: IntegAlg::Sha256,

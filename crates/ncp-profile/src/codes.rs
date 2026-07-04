@@ -121,7 +121,9 @@ pub fn dh_group(code: u32) -> Option<Mapped<DhGroup>> {
 
 /// `IkeIdType` — local IKE identity type, apparently the IANA IKEv2 ID type
 /// registry (1 = IPV4_ADDR, 2 = FQDN, 3 = RFC822/USER_FQDN, 11 = KEY_ID).
-/// For swanctl we only need the string itself, so this is informational.
+/// This is *not* just informational: we emit a strongSwan-typed identity from
+/// it (e.g. `rfc822:` for type 3) so charon presents the exact type the peer
+/// expects instead of inferring it from the string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IkeIdType {
     Ipv4Addr,

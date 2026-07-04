@@ -16,8 +16,10 @@
 //! rule.
 
 use std::net::Ipv4Addr;
+#[cfg(any(windows, target_os = "linux"))]
 use std::path::PathBuf;
 
+#[cfg(windows)]
 fn record_path(conn: &str) -> PathBuf {
     let safe: String = conn
         .chars()
@@ -28,6 +30,7 @@ fn record_path(conn: &str) -> PathBuf {
 
 /// The NRPT namespace for a profile: the domain suffix (`.corp.example`) for
 /// split-DNS, or `.` (all names) when the profile names no domain.
+#[cfg(windows)]
 fn namespace(domain: Option<&str>) -> String {
     match domain {
         Some(d) if !d.trim().is_empty() => format!(".{}", d.trim().trim_start_matches('.')),
@@ -145,13 +148,116 @@ pub fn revert(conn: &str) -> Result<(), String> {
     r
 }
 
-// ---- non-Windows stubs ----------------------------------------------------
-#[cfg(not(windows))]
+// ---- Linux (systemd-resolved) ---------------------------------------------
+// On Linux we route DNS through systemd-resolved with `resolvectl`, which is
+// clean and fully revertible (`resolvectl revert <link>`). DNS servers are set
+// on a link (the default-route interface unless `VPN_DNS_LINK` overrides) with
+// a *routing domain*: `~<domain>` sends only that suffix to the VPN resolvers
+// (split-DNS), `~.` sends everything. We remember the link per connection so a
+// disconnect reverts exactly it.
+//
+// Note: setting link DNS needs privilege; in a desktop session systemd-resolved
+// authorises it via polkit (which may prompt). A future Linux privileged helper
+// (the analogue of the Windows broker) would remove that prompt. If the gateway
+// pushes DNS (our IKE_AUTH requests CP DNS) and charon's `resolve` plugin is
+// loaded, that path also works without this — this covers the profile's own
+// DNS.
+#[cfg(target_os = "linux")]
+fn link_record_path(conn: &str) -> PathBuf {
+    let safe: String = conn
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    std::env::temp_dir().join(format!("vpn-dns-{safe}.link"))
+}
+
+/// The link to set VPN DNS on: `VPN_DNS_LINK` if set, else the interface of the
+/// current default route.
+#[cfg(target_os = "linux")]
+fn dns_link() -> Result<String, String> {
+    if let Ok(l) = std::env::var("VPN_DNS_LINK") {
+        if !l.trim().is_empty() {
+            return Ok(l.trim().to_string());
+        }
+    }
+    let out = std::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .map_err(|e| format!("cannot run ip route: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "default via X dev eth0 proto ... " -> take the token after "dev".
+    let mut it = text.split_whitespace();
+    while let Some(tok) = it.next() {
+        if tok == "dev" {
+            if let Some(dev) = it.next() {
+                return Ok(dev.to_string());
+            }
+        }
+    }
+    Err("no default-route interface found (set VPN_DNS_LINK)".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn resolvectl(args: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new("resolvectl")
+        .args(args)
+        .output()
+        .map_err(|e| format!("cannot run resolvectl: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    Err(if err.trim().is_empty() {
+        format!("resolvectl {args:?} failed ({})", out.status)
+    } else {
+        err.trim().to_string()
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn apply(conn: &str, servers: &[Ipv4Addr], domain: Option<&str>) -> Result<String, String> {
+    if servers.is_empty() {
+        return Ok(String::new());
+    }
+    let link = dns_link()?;
+    let mut dns_args = vec!["dns", &link];
+    let server_strs: Vec<String> = servers.iter().map(|s| s.to_string()).collect();
+    dns_args.extend(server_strs.iter().map(String::as_str));
+    resolvectl(&dns_args)?;
+
+    let routing_domain = match domain {
+        Some(d) if !d.trim().is_empty() => format!("~{}", d.trim().trim_start_matches('.')),
+        _ => "~.".to_string(),
+    };
+    resolvectl(&["domain", &link, &routing_domain])?;
+
+    let _ = std::fs::write(link_record_path(conn), &link);
+    let servers_txt = server_strs.join(", ");
+    Ok(if routing_domain == "~." {
+        format!("DNS routed over the tunnel via {servers_txt} on {link} (all names)")
+    } else {
+        format!("split-DNS: *.{} resolves via {servers_txt} on {link}", routing_domain.trim_start_matches("~"))
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn revert(conn: &str) -> Result<(), String> {
+    let path = link_record_path(conn);
+    let Ok(link) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let r = resolvectl(&["revert", link.trim()]);
+    let _ = std::fs::remove_file(&path);
+    r
+}
+
+// ---- Other platforms (macOS is build-only for now) ------------------------
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn apply(_conn: &str, _servers: &[Ipv4Addr], _domain: Option<&str>) -> Result<String, String> {
     Ok(String::new())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn revert(_conn: &str) -> Result<(), String> {
     Ok(())
 }

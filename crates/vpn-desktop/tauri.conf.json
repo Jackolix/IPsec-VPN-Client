@@ -14,8 +14,8 @@
         "title": "IPsec VPN Client",
         "width": 1180,
         "height": 840,
-        "minWidth": 900,
-        "minHeight": 640,
+        "minWidth": 380,
+        "minHeight": 520,
         "resizable": true,
         "theme": "Dark"
       }
