@@ -118,6 +118,11 @@ Windows).
   into the profiles folder and refresh). Default profiles folder is a stable
   per-user dir (`%APPDATA%\ipsec-vpn\profiles`), overridable with
   `VPN_PROFILE_DIR`.
+- **Gateway-override / production-lock removed (2026-07-04)**: at the owner's
+  request the desktop no longer locks FQDN/production profiles or forces a
+  lab-responder override — Connect dials the profile's own gateway. The
+  `vpn-agent` CLI keeps an optional `--gateway-override` for testing. (The
+  earlier Phase 2.5 lock/override notes are historical.)
 - Still open: a *signed* installer (avoids SmartScreen); verify virtual-IP /
   DNS on a clean PC with no spare adapter; a service-mode daemon to avoid the
   per-connect UAC prompts (DNS + daemon each need elevation today).

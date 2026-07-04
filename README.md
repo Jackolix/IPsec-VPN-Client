@@ -15,8 +15,11 @@ vRouter, including from a native Windows build over a TCP vici socket.
   (`crates/ncp-profile/tests/fixtures/*.redacted.ini`).
 - Generated `*.swanctl.conf` files (in `out/`) contain the PSK too and are
   gitignored as well.
-- Never connect to a profile's production gateway without authorization.
-  The tooling forces an explicit `--gateway-override` / `-Gateway` choice.
+- **Connect dials the gateway named in the profile.** The desktop app connects
+  straight to it — there's no lab-only lock. The `vpn-agent` CLI keeps an
+  optional `--gateway-override HOST` to aim a profile at a different responder
+  for testing. During development, only the authorized LANCOM lab target
+  (`192.168.100.10`) was ever contacted.
 
 ## Layout
 
@@ -26,7 +29,7 @@ vRouter, including from a native Windows build over a TCP vici socket.
 | `crates/ncp-profile` | NCP ini parser + the documented numeric code tables (`src/codes.rs`, each mapping carries a confidence level) + importer that warns on every unconfirmed mapping. |
 | `crates/vici` | Hand-rolled client for strongSwan's vici control protocol: a cross-platform message codec plus packet framing and a blocking request/event client (Unix and TCP transports). |
 | `crates/vpn-control` | Shared connection logic used by both the CLI and the GUI: the config→vici bridge, `list-sa` status parsing, and the connect/status/disconnect flows over a `Transport` (Unix socket or TCP). `connect_logged` registers for charon's `log` event around `initiate` and returns the captured handshake transcript. |
-| `crates/vpn-desktop` | Tauri desktop app. Rust backend interprets profiles natively and calls `vpn-control`; the web UI (`ui/`) drives it via `invoke`. Gateway-override dialog for locked/production profiles; PSK saved in the OS keychain (`src/creds.rs`, `keyring` crate) takes precedence over the plaintext `.ini`. Run headlessly with `--selftest`; drive the backend flows with `--dev <cmd>`. |
+| `crates/vpn-desktop` | Tauri desktop app. Rust backend interprets profiles natively and calls `vpn-control`; the web UI (`ui/`) drives it via `invoke`. Native file-picker + drag-drop import, system tray, DNS-over-tunnel (NRPT), PSK in the OS keychain (`src/creds.rs`, `keyring`) taking precedence over the plaintext `.ini`. Run headlessly with `--selftest`; drive the backend flows with `--dev <cmd>`. |
 | `crates/vpn-agent` | CLI agent over `vpn-control`: imports a profile and drives charon (`connect` / `status` / `disconnect`). The PSK is pushed via `load-shared` in memory — no swanctl.conf with the secret is written to disk. |
 | `crates/vpn-cli` | Phase 0 CLI: `show` (redacted interpretation) and `generate` (writes swanctl.conf). Kept for inspection/debugging. |
 | `docker/vici-tcp` | Dev backend: charon with its vici socket published on `127.0.0.1:45022` so a host desktop build can drive it. |
@@ -46,7 +49,7 @@ vRouter, including from a native Windows build over a TCP vici socket.
 $env:VPN_PROFILE_DIR = "$PWD"; .\target\debug\vpn-desktop.exe --selftest
 
 # CLI equivalents over the same TCP vici backend:
-cargo run -p vpn-agent -- --tcp 127.0.0.1:45022 connect --profile .\TEST-1.ini --gateway-override 192.168.100.10
+cargo run -p vpn-agent -- --tcp 127.0.0.1:45022 connect --profile .\TEST-1.ini
 cargo run -p vpn-agent -- --tcp 127.0.0.1:45022 status
 cargo run -p vpn-agent -- --tcp 127.0.0.1:45022 disconnect --name vRouter-TEST-1
 
@@ -76,7 +79,7 @@ DH group 15 / modp3072).
 # 2b. …or drive it from the CLI. Launch the daemon ELEVATED (WFP needs
 #     Administrator; vici on 127.0.0.1:4502) and drive it unelevated:
 .\scripts\run-charon-windows.ps1        # accepts -Install / -Uninstall for a service
-cargo run -p vpn-agent -- --tcp 127.0.0.1:4502 connect --profile .\TEST-1.ini --gateway-override 192.168.100.10
+cargo run -p vpn-agent -- --tcp 127.0.0.1:4502 connect --profile .\TEST-1.ini
 cargo run -p vpn-agent -- --tcp 127.0.0.1:4502 status
 ```
 
