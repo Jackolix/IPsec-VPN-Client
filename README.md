@@ -30,6 +30,7 @@ vRouter, including from a native Windows build over a TCP vici socket.
 | `crates/vpn-agent` | CLI agent over `vpn-control`: imports a profile and drives charon (`connect` / `status` / `disconnect`). The PSK is pushed via `load-shared` in memory — no swanctl.conf with the secret is written to disk. |
 | `crates/vpn-cli` | Phase 0 CLI: `show` (redacted interpretation) and `generate` (writes swanctl.conf). Kept for inspection/debugging. |
 | `docker/vici-tcp` | Dev backend: charon with its vici socket published on `127.0.0.1:45022` so a host desktop build can drive it. |
+| `docker/strongswan-windows` | MinGW cross-build of strongSwan's **native** Windows daemon `charon-svc.exe` (kernel-wfp / kernel-iph / socket-win / vici, monolithic, OpenSSL). The tunnel terminates on the Windows host via the Windows Filtering Platform - no container. Built + exported by `scripts/build-strongswan-windows.ps1`, launched (elevated) by `scripts/run-charon-windows.ps1`; vici on `127.0.0.1:4502`. |
 | `docker/agent` | Multi-stage image running `vpn-agent` beside charon (Linux client during development). |
 | `docker/initiator` | Legacy Phase 0 container that shells out to `swanctl`. |
 
@@ -55,6 +56,28 @@ cargo run -p vpn-cli -- show .\TEST-1.ini
 # Tests (run on any platform; the vici/control logic is cross-platform):
 cargo test --workspace
 ```
+
+### Native Windows tunnel (no container)
+
+The tunnel can terminate on the Windows host itself, via strongSwan's native
+`charon-svc.exe` on the Windows Filtering Platform. This is needed because
+Windows' built-in IKEv2 client can't negotiate the profile's suite (PSK auth +
+DH group 15 / modp3072).
+
+```powershell
+# 1. Cross-build charon-svc.exe + plugins (Docker + MinGW) and export to out\:
+.\scripts\build-strongswan-windows.ps1
+
+# 2. Launch the daemon ELEVATED (WFP needs Administrator). vici on 127.0.0.1:4502:
+.\scripts\run-charon-windows.ps1        # accepts -Install / -Uninstall for a service
+
+# 3. Drive it from a normal (non-elevated) shell - loopback vici needs no elevation:
+cargo run -p vpn-agent -- --tcp 127.0.0.1:4502 connect --profile .\TEST-1.ini --gateway-override 192.168.100.10
+cargo run -p vpn-agent -- --tcp 127.0.0.1:4502 status
+```
+
+Verified against the LANCOM: IKEv2/PSK/modp3072 negotiated, virtual IP and
+route installed on a host adapter (WFP + IP Helper), ESP data plane live.
 
 If the app icons are ever regenerated: `powershell.exe -File scripts\gen-icons.ps1`.
 
