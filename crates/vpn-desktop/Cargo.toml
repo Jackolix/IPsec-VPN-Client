@@ -12,7 +12,7 @@ tauri-build = { version = "2", features = [] }
 vpn-core = { path = "../vpn-core" }
 ncp-profile = { path = "../ncp-profile" }
 vpn-control = { path = "../vpn-control" }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 serde = { workspace = true }
 serde_json = "1"
 

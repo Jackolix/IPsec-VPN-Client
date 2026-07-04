@@ -97,6 +97,7 @@ mod tests {
             request_virtual_ip: true,
             compression: false,
             dpd: vpn_core::DpdConfig::default(),
+            dns: vpn_core::DnsConfig::default(),
         }
     }
 

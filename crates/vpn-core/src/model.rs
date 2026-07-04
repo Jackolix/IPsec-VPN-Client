@@ -202,6 +202,27 @@ pub struct ConnectionConfig {
     pub compression: bool,
     /// Dead-Peer-Detection / auto-reconnect behaviour.
     pub dpd: DpdConfig,
+    /// DNS to use while the tunnel is up.
+    pub dns: DnsConfig,
+}
+
+/// DNS behaviour for a connection.
+///
+/// `servers` are the resolvers reachable over the tunnel. If `domain` is set,
+/// only names under it are resolved via those servers (split-DNS, implemented
+/// on Windows with an NRPT rule); otherwise the servers become the interface's
+/// resolvers for the duration of the tunnel.
+#[derive(Debug, Clone, Default)]
+pub struct DnsConfig {
+    pub servers: Vec<std::net::Ipv4Addr>,
+    pub domain: Option<String>,
+}
+
+impl DnsConfig {
+    /// Nothing to configure (no servers parsed from the profile).
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
 }
 
 /// Dead-Peer-Detection and auto-reconnect policy.
