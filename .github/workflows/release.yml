@@ -1,0 +1,97 @@
+name: release
+
+# Build all shippable Windows binaries on a version tag (e.g. v0.1.0) and
+# attach them to a GitHub Release. The native strongSwan daemon must be
+# cross-built on Linux (Docker + MinGW), so it is produced in a separate job
+# and handed to the Windows job, which bundles it into the desktop installer.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}   # allow manual runs (no release is created then)
+
+permissions:
+  contents: write          # needed to create the Release and upload assets
+
+jobs:
+  # ---- 1. cross-build charon-svc.exe + DLLs on Linux -------------------------
+  daemon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cross-build strongSwan for Windows (MinGW)
+        run: |
+          docker build -t ss-win -f docker/strongswan-windows/Dockerfile .
+          cid=$(docker create ss-win)
+          mkdir -p out/strongswan-windows
+          docker cp "$cid:/dist/." out/strongswan-windows/
+          docker rm "$cid"
+          echo "== exported artifacts =="
+          ls -la out/strongswan-windows
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strongswan-windows
+          path: out/strongswan-windows
+          if-no-files-found: error
+
+  # ---- 2. build the Rust CLIs + the desktop installer on Windows -------------
+  windows:
+    needs: daemon
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pull the daemon artifacts into the location the Tauri bundler and the
+      # app's dev fallback both expect.
+      - uses: actions/download-artifact@v4
+        with:
+          name: strongswan-windows
+          path: out/strongswan-windows
+
+      - name: Sanity-check the daemon artifacts are present
+        shell: pwsh
+        run: Get-ChildItem out\strongswan-windows
+
+      - name: Run tests
+        run: cargo test --workspace --release
+
+      - name: Build CLI binaries
+        run: cargo build --release -p vpn-agent -p vpn-cli
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Build desktop app + installer (bundles charon-svc)
+        working-directory: crates/vpn-desktop
+        run: cargo tauri build
+
+      - name: Collect release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-assets | Out-Null
+          Copy-Item target\release\vpn-agent.exe dist-assets\ -ErrorAction SilentlyContinue
+          Copy-Item target\release\vpn-cli.exe   dist-assets\ -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse target\release\bundle -Include *.exe,*.msi |
+            ForEach-Object { Copy-Item $_.FullName dist-assets\ }
+          Write-Host "== assets =="
+          Get-ChildItem dist-assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: dist-assets/*
+
+      # Only attach to a Release when this run was triggered by a tag push.
+      - name: Publish Release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

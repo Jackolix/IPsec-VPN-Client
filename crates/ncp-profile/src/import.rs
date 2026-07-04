@@ -388,6 +388,9 @@ pub fn import_profile(input: &str) -> Result<ImportedProfile, ImportError> {
             remote_subnets,
             request_virtual_ip,
             compression,
+            // DPD/auto-reconnect isn't expressed in the fields we parse from
+            // the NCP profile yet; use the always-on VPN default.
+            dpd: vpn_core::DpdConfig::default(),
         },
         warnings: ctx.warnings,
     })
