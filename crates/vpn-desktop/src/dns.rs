@@ -8,9 +8,12 @@
 //! (only that suffix resolves via the VPN servers); without one it's a catch-all
 //! (`.`) so every query goes to the VPN servers while connected.
 //!
-//! NRPT changes need Administrator, so this runs through an elevated PowerShell
-//! (a UAC prompt); the namespace we created is recorded to a temp file so
-//! disconnect can remove exactly that rule.
+//! NRPT changes need Administrator. When the privileged broker service is
+//! installed it does this for us over its named pipe — no UAC prompt. Only when
+//! the broker isn't present (a dev build, or before the service is installed) do
+//! we fall back to an elevated PowerShell (a UAC prompt); the namespace we
+//! created is then recorded to a temp file so disconnect can remove exactly that
+//! rule.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -81,6 +84,20 @@ pub fn apply(conn: &str, servers: &[Ipv4Addr], domain: Option<&str>) -> Result<S
     if servers.is_empty() {
         return Ok(String::new());
     }
+    // Preferred path: hand it to the broker service (runs as SYSTEM, no UAC).
+    // A reachable broker is authoritative — surface its result either way. Only
+    // fall back to the elevated PowerShell path when the broker isn't installed.
+    let req = vpn_broker::protocol::Request::ApplyDns {
+        conn: conn.to_string(),
+        servers: servers.iter().map(|s| s.to_string()).collect(),
+        domain: domain.map(str::to_string),
+    };
+    match vpn_broker::client::request(&req) {
+        Ok(r) if r.ok => return Ok(r.msg),
+        Ok(r) => return Err(r.msg),
+        Err(_) => {} // broker not installed — fall back to UAC below
+    }
+
     let ns = namespace(domain);
     let list = servers.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
     // Replace any stale rule for this namespace, then add ours.
@@ -105,6 +122,14 @@ pub fn apply(conn: &str, servers: &[Ipv4Addr], domain: Option<&str>) -> Result<S
 /// recorded (a profile with no DNS, or already reverted).
 #[cfg(windows)]
 pub fn revert(conn: &str) -> Result<(), String> {
+    // Preferred path: the broker (which owns its own record of what it applied).
+    let req = vpn_broker::protocol::Request::RevertDns { conn: conn.to_string() };
+    match vpn_broker::client::request(&req) {
+        Ok(r) if r.ok => return Ok(()),
+        Ok(r) => return Err(r.msg),
+        Err(_) => {} // broker not installed — fall back to the temp-file record
+    }
+
     let path = record_path(conn);
     let Ok(ns) = std::fs::read_to_string(&path) else {
         return Ok(());

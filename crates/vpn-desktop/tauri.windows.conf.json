@@ -2,7 +2,13 @@
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
     "resources": {
-      "../../out/strongswan-windows/*": "charon/"
+      "../../out/strongswan-windows/*": "charon/",
+      "../../out/broker/*": "./"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./installer-hooks.nsh"
+      }
     }
   }
 }

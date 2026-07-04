@@ -30,6 +30,7 @@ vRouter, including from a native Windows build over a TCP vici socket.
 | `crates/vici` | Hand-rolled client for strongSwan's vici control protocol: a cross-platform message codec plus packet framing and a blocking request/event client (Unix and TCP transports). |
 | `crates/vpn-control` | Shared connection logic used by both the CLI and the GUI: the config→vici bridge, `list-sa` status parsing, and the connect/status/disconnect flows over a `Transport` (Unix socket or TCP). `connect_logged` registers for charon's `log` event around `initiate` and returns the captured handshake transcript. |
 | `crates/vpn-desktop` | Tauri desktop app. Rust backend interprets profiles natively and calls `vpn-control`; the web UI (`ui/`) drives it via `invoke`. Native file-picker + drag-drop import, system tray, DNS-over-tunnel (NRPT), PSK in the OS keychain (`src/creds.rs`, `keyring`) taking precedence over the plaintext `.ini`. Run headlessly with `--selftest`; drive the backend flows with `--dev <cmd>`. |
+| `crates/vpn-broker` | Privileged LocalSystem Windows **service** that removes the per-connect UAC prompts: it supervises `charon-svc.exe` and applies/reverts the NRPT DNS rule for the unelevated GUI over an ACL'd named pipe (`src/ipc.rs`). The shared `protocol` + a pipe `client` are a thin lib the desktop links against. Registered by the installer; the GUI falls back to the elevated path when it isn't installed. |
 | `crates/vpn-agent` | CLI agent over `vpn-control`: imports a profile and drives charon (`connect` / `status` / `disconnect`). The PSK is pushed via `load-shared` in memory — no swanctl.conf with the secret is written to disk. |
 | `crates/vpn-cli` | Phase 0 CLI: `show` (redacted interpretation) and `generate` (writes swanctl.conf). Kept for inspection/debugging. |
 | `docker/vici-tcp` | Dev backend: charon with its vici socket published on `127.0.0.1:45022` so a host desktop build can drive it. |
@@ -99,13 +100,18 @@ If the app icons are ever regenerated: `powershell.exe -File scripts\gen-icons.p
 
 Push a `v*` tag and `.github/workflows/release.yml` builds everything and
 attaches it to a GitHub Release: a Windows **installer** (NSIS `*-setup.exe`
-and an MSI) that bundles the app **and** `charon-svc.exe` + its DLLs (installed
-to `<app>\charon\`), plus the standalone `vpn-agent.exe` / `vpn-cli.exe`. No
-TAP/WinTUN driver is installed — IPsec runs in-kernel via WFP, and the
-gateway-assigned virtual IP is placed on an existing interface. The installer
-is **unsigned** (SmartScreen will warn) until a code-signing cert is added.
-DPD/auto-reconnect is on by default (probe every 30s; charon re-establishes the
-tunnel after a dead peer or link flap).
+and an MSI) that bundles the app, `charon-svc.exe` + its DLLs (installed to
+`<app>\charon\`) **and** the privileged broker (`vpn-broker.exe`), plus the
+standalone `vpn-agent.exe` / `vpn-cli.exe`. The NSIS installer registers the
+broker as an auto-start LocalSystem service (and removes it on uninstall), so
+**connecting never raises a UAC prompt** — the broker starts charon and applies
+DNS on the app's behalf over an ACL'd named pipe. (The MSI doesn't run that hook;
+MSI users run `vpn-broker install` once by hand.) No TAP/WinTUN driver is
+installed — IPsec runs in-kernel via WFP, and the gateway-assigned virtual IP is
+placed on an existing interface. The installer is **unsigned** (SmartScreen will
+warn) until a code-signing cert is added. DPD/auto-reconnect is on by default
+(probe every 30s; charon re-establishes the tunnel after a dead peer or link
+flap).
 
 The responder side (test gateway) must accept: IKEv2, PSK, the profile's
 identity, IKE `aes256-sha256-prfsha256-modp3072`, ESP `aes256-sha256` with

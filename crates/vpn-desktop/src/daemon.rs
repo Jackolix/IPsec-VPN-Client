@@ -73,6 +73,18 @@ pub fn start(addr: &str) -> Result<(), String> {
     if is_running(addr) {
         return Ok(());
     }
+    // If the broker service is installed it owns charon's lifecycle — don't
+    // elevate-spawn a second copy. Just wait for the broker to bring it up.
+    if vpn_broker::client::available() {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while Instant::now() < deadline {
+            if is_running(addr) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        return Err("the VPN broker service is running but charon isn't responding".to_string());
+    }
     let exe = charon_exe()?;
     let dir: &Path = exe.parent().ok_or("charon-svc.exe has no parent directory")?;
     let exe_ps = exe.to_string_lossy().replace('\'', "''");
@@ -111,6 +123,11 @@ pub fn start(addr: &str) -> Result<(), String> {
 pub fn stop(addr: &str) -> Result<(), String> {
     if !is_running(addr) {
         return Ok(());
+    }
+    // charon under the broker service is stopped by stopping that service, not
+    // by killing the process out from under it.
+    if vpn_broker::client::available() {
+        return Err("charon is managed by the VPN broker service; stop that service to stop it".to_string());
     }
     let inner = "Start-Process -FilePath 'taskkill' -Verb RunAs \
                  -ArgumentList @('/F','/IM','charon-svc.exe')";
