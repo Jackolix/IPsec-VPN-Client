@@ -8,6 +8,7 @@
 
 mod backend;
 mod creds;
+mod daemon;
 
 use backend::{AppState, ProfileSummary};
 use vpn_control::{ConnectOutcome, IkeSa};
@@ -48,6 +49,32 @@ async fn disconnect(state: tauri::State<'_, AppState>, name: String) -> Result<(
 async fn status(state: tauri::State<'_, AppState>) -> Result<Vec<IkeSa>, String> {
     let s = state.inner().clone();
     match tauri::async_runtime::spawn_blocking(move || backend::status(&s)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn daemon_running(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let s = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || Ok(backend::daemon_running(&s)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn start_daemon(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::daemon_start(&s)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn stop_daemon(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::daemon_stop(&s)).await {
         Ok(result) => result,
         Err(e) => Err(e.to_string()),
     }
@@ -98,6 +125,13 @@ fn dev(args: &[String]) {
         }
         Some("disconnect") => backend::disconnect(&state, args.get(1).cloned().unwrap_or_default())
             .map(|_| "disconnected".to_string()),
+        Some("daemon-status") => Ok(if backend::daemon_running(&state) {
+            "running".to_string()
+        } else {
+            "stopped".to_string()
+        }),
+        Some("daemon-start") => backend::daemon_start(&state).map(|_| "started".to_string()),
+        Some("daemon-stop") => backend::daemon_stop(&state).map(|_| "stopped".to_string()),
         Some("save-creds") => {
             backend::save_credentials(&state, args.get(1).cloned().unwrap_or_default())
                 .map(|_| "saved".to_string())
@@ -139,6 +173,9 @@ fn main() {
             connect,
             disconnect,
             status,
+            daemon_running,
+            start_daemon,
+            stop_daemon,
             save_credentials,
             forget_credentials
         ])

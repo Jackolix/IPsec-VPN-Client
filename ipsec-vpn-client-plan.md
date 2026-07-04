@@ -84,8 +84,12 @@ Windows).
   existing `Transport::Tcp` path drives it unchanged. Verified live against the
   LANCOM: IKEv2/PSK/modp3072 negotiated, virtual IP + route installed on a host
   adapter via WFP/IP-Helper (not a container), ESP data plane moved (out
-  counter). Still open: wire the Tauri app to spawn/stop charon-svc elevated
-  (UAC UX) instead of a manual launch, and a signed installer.
+  counter). The Tauri app now spawns/stops charon-svc itself over UAC
+  (`vpn-desktop/src/daemon.rs` + `start_daemon`/`stop_daemon` commands; the
+  sidebar Start/Stop button and a connect auto-start the backend), driving it
+  over loopback vici while the GUI stays unelevated; `run-desktop-native.ps1`
+  launches the app in native mode. Still open: a signed installer, and bundling
+  the daemon artifacts with the app so it doesn't rely on the repo layout.
 - **Phase 5**: hardening — DPD/reconnect, network roaming, split vs full
   tunnel, log redaction layer, auto-update, signing/notarization, interop
   matrix.
