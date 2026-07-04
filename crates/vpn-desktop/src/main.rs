@@ -9,6 +9,7 @@
 mod backend;
 mod creds;
 mod daemon;
+mod dns;
 
 use backend::{AppState, ProfileSummary};
 use vpn_control::{ConnectOutcome, IkeSa};
@@ -179,6 +180,65 @@ fn main() {
             save_credentials,
             forget_credentials
         ])
+        .setup(|app| {
+            tray::build(app.handle())?;
+            Ok(())
+        })
+        // Closing the window hides it to the tray instead of quitting, so the
+        // tunnel (and the app that drives it) keeps running in the background.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running the IPsec VPN Client");
+}
+
+/// System-tray icon + menu, so the app keeps running (and the tunnel stays up)
+/// when the window is closed.
+mod tray {
+    use tauri::{
+        menu::{Menu, MenuItem},
+        tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+        AppHandle, Manager,
+    };
+
+    fn reveal(app: &AppHandle) {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+        }
+    }
+
+    pub fn build(app: &AppHandle) -> tauri::Result<()> {
+        let show = MenuItem::with_id(app, "show", "Show window", true, None::<&str>)?;
+        let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+        let menu = Menu::with_items(app, &[&show, &quit])?;
+
+        TrayIconBuilder::with_id("main-tray")
+            .icon(app.default_window_icon().expect("bundled window icon").clone())
+            .tooltip("IPsec VPN Client")
+            .menu(&menu)
+            .show_menu_on_left_click(false)
+            .on_menu_event(|app, event| match event.id.as_ref() {
+                "show" => reveal(app),
+                "quit" => app.exit(0),
+                _ => {}
+            })
+            .on_tray_icon_event(|tray, event| {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    reveal(tray.app_handle());
+                }
+            })
+            .build(app)?;
+        Ok(())
+    }
 }
