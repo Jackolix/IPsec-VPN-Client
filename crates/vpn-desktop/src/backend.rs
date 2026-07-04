@@ -43,12 +43,38 @@ fn default_transport() -> Transport {
     {
         Transport::Unix("/var/run/charon.vici".to_string())
     }
-    // On Windows/macOS dev the tunnel runs in a container whose charon vici
-    // socket is exposed over TCP; this is the default the run script sets up.
+    // On Windows the app can spawn the native charon-svc daemon itself, which
+    // listens on charon-svc's default vici port; that's the default target.
+    // (The Linux dev container publishes vici on 45022 and sets VPN_VICI_TCP to
+    // override this.)
     #[cfg(not(unix))]
     {
-        Transport::Tcp("127.0.0.1:45022".to_string())
+        Transport::Tcp(crate::daemon::NATIVE_VICI_ADDR.to_string())
     }
+}
+
+/// The vici endpoint the app talks to — used both to drive charon and to know
+/// where the native daemon should come up.
+fn vici_addr(state: &AppState) -> String {
+    match &state.transport {
+        Transport::Tcp(a) => a.clone(),
+        _ => crate::daemon::NATIVE_VICI_ADDR.to_string(),
+    }
+}
+
+/// Is the tunnel backend (native charon-svc, or the dev container) reachable?
+pub fn daemon_running(state: &AppState) -> bool {
+    crate::daemon::is_running(&vici_addr(state))
+}
+
+/// Start the native Windows daemon (raises a UAC prompt). No-op if already up.
+pub fn daemon_start(state: &AppState) -> std::result::Result<(), String> {
+    crate::daemon::start(&vici_addr(state))
+}
+
+/// Stop the native Windows daemon (raises a UAC prompt).
+pub fn daemon_stop(state: &AppState) -> std::result::Result<(), String> {
+    crate::daemon::stop(&vici_addr(state))
 }
 
 #[derive(Debug, Serialize)]
