@@ -26,9 +26,10 @@ if (-not (Test-Path "out\strongswan-windows\charon-svc.exe")) {
 }
 
 # No VPN_VICI_TCP => the app defaults to the native daemon (127.0.0.1:4502).
+# The app finds charon-svc.exe under out\strongswan-windows automatically (dev
+# layout); a bundled build ships it as an app resource instead.
 Remove-Item Env:\VPN_VICI_TCP -ErrorAction SilentlyContinue
-$env:VPN_PROFILE_DIR   = $ProfileDir
-$env:VPN_CHARON_SCRIPT = (Join-Path $root "scripts\run-charon-windows.ps1")
+$env:VPN_PROFILE_DIR = $ProfileDir
 
 Write-Host "Launching desktop app (native backend; profiles: $ProfileDir)"
 Write-Host "Use the sidebar Start button (or just Connect) to bring up charon-svc."

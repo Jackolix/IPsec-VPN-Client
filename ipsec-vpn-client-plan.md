@@ -88,8 +88,13 @@ Windows).
   (`vpn-desktop/src/daemon.rs` + `start_daemon`/`stop_daemon` commands; the
   sidebar Start/Stop button and a connect auto-start the backend), driving it
   over loopback vici while the GUI stays unelevated; `run-desktop-native.ps1`
-  launches the app in native mode. Still open: a signed installer, and bundling
-  the daemon artifacts with the app so it doesn't rely on the repo layout.
+  launches the app in native mode. `charon-svc.exe` + its DLLs ship as bundled
+  app resources (`tauri.conf.json` `bundle.resources` -> `charon/`), so the app
+  elevates the bundled `charon-svc.exe` directly (no config file needed - it
+  runs on defaults) and is self-contained; `daemon.rs` resolves it from the
+  bundle next to the exe, falling back to `out/strongswan-windows` for dev.
+  Build the daemon (`build-strongswan-windows.ps1`) before `tauri build`. Still
+  open: a signed installer.
 - **Phase 5**: hardening — DPD/reconnect, network roaming, split vs full
   tunnel, log redaction layer, auto-update, signing/notarization, interop
   matrix.
