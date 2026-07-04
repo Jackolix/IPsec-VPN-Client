@@ -1,46 +1,39 @@
 //! Apply a profile's DNS over the tunnel on Windows.
 //!
 //! IPsec/WFP installs no adapter and charon-svc doesn't touch Windows DNS, so
-//! the app configures it after the tunnel is up: point the tunnel interface's
-//! resolvers at the VPN DNS servers and, when the profile names a domain, add a
-//! split-DNS NRPT rule so only that suffix resolves over the tunnel. Changing
-//! DNS/NRPT needs Administrator, so it runs through an elevated PowerShell (a
-//! UAC prompt); what was applied is recorded to a temp file so disconnect can
-//! revert it precisely (the virtual IP is gone by then).
+//! the app configures resolution itself. We use the Name Resolution Policy
+//! Table (NRPT) rather than per-adapter DNS: an NRPT rule is system-wide policy
+//! keyed by namespace, so it never clobbers an adapter's existing resolvers and
+//! reverts cleanly by just removing the rule. With a `domain` it's split-DNS
+//! (only that suffix resolves via the VPN servers); without one it's a catch-all
+//! (`.`) so every query goes to the VPN servers while connected.
+//!
+//! NRPT changes need Administrator, so this runs through an elevated PowerShell
+//! (a UAC prompt); the namespace we created is recorded to a temp file so
+//! disconnect can remove exactly that rule.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Applied {
-    if_index: u32,
-    domain: Option<String>,
-}
 
 fn record_path(conn: &str) -> PathBuf {
     let safe: String = conn
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    std::env::temp_dir().join(format!("vpn-dns-{safe}.json"))
+    std::env::temp_dir().join(format!("vpn-dns-{safe}.namespace"))
 }
 
-/// The interface index currently holding `vip`. Read-only, no elevation.
-#[cfg(windows)]
-fn interface_for_vip(vip: &str) -> Option<u32> {
-    let cmd = format!(
-        "(Get-NetIPAddress -IPAddress '{vip}' -ErrorAction SilentlyContinue | \
-         Select-Object -First 1).InterfaceIndex"
-    );
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &cmd])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().ok()
+/// The NRPT namespace for a profile: the domain suffix (`.corp.example`) for
+/// split-DNS, or `.` (all names) when the profile names no domain.
+fn namespace(domain: Option<&str>) -> String {
+    match domain {
+        Some(d) if !d.trim().is_empty() => format!(".{}", d.trim().trim_start_matches('.')),
+        _ => ".".to_string(),
+    }
 }
 
 /// Run a block of PowerShell elevated (one UAC prompt) and wait for it. The
-/// block writes `OK` or `ERR: ...` to `result`, which we read back so a failure
+/// block writes `OK` or `ERR: ...` to a result file we read back, so a failure
 /// in the elevated context is surfaced instead of silently swallowed.
 #[cfg(windows)]
 fn run_elevated(body: &str) -> Result<(), String> {
@@ -81,75 +74,47 @@ fn run_elevated(body: &str) -> Result<(), String> {
     }
 }
 
-/// Configure DNS for a freshly-established tunnel. Returns a short human summary
-/// for the connect log. On non-Windows this is a no-op (the eventual Linux
-/// backend uses strongSwan's `resolve` plugin instead).
+/// Route DNS for this connection over the tunnel via an NRPT rule. Returns a
+/// short human summary for the connect log. No-op with no servers.
 #[cfg(windows)]
-pub fn apply(conn: &str, servers: &[Ipv4Addr], domain: Option<&str>, vip: &str) -> Result<String, String> {
+pub fn apply(conn: &str, servers: &[Ipv4Addr], domain: Option<&str>) -> Result<String, String> {
     if servers.is_empty() {
         return Ok(String::new());
     }
-    let if_index = interface_for_vip(vip)
-        .ok_or_else(|| format!("could not find the tunnel interface for virtual IP {vip}"))?;
-    let list = servers
-        .iter()
-        .map(|s| format!("'{s}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let mut body = format!(
-        "Set-DnsClientServerAddress -InterfaceIndex {if_index} -ServerAddresses @({list});"
+    let ns = namespace(domain);
+    let list = servers.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
+    // Replace any stale rule for this namespace, then add ours.
+    let body = format!(
+        "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -contains '{ns}' }} | \
+         Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue;\
+         Add-DnsClientNrptRule -Namespace '{ns}' -NameServers @({list});\
+         Clear-DnsClientCache -ErrorAction SilentlyContinue"
     );
-    let summary;
-    if let Some(d) = domain {
-        let d = d.trim_start_matches('.');
-        // Replace any stale rule for this namespace, then add split-DNS.
-        body.push_str(&format!(
-            "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -contains '.{d}' }} | \
-             Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue;\
-             Add-DnsClientNrptRule -Namespace '.{d}' -NameServers @({list});"
-        ));
-        summary = format!(
-            "DNS {} for *.{} (split-DNS) on if{}",
-            servers.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "),
-            d,
-            if_index
-        );
-    } else {
-        summary = format!(
-            "DNS {} on the tunnel interface (if{})",
-            servers.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "),
-            if_index
-        );
-    }
-    body.push_str("Clear-DnsClientCache -ErrorAction SilentlyContinue");
-
     run_elevated(&body)?;
-    let rec = Applied { if_index, domain: domain.map(|d| d.trim_start_matches('.').to_string()) };
-    let _ = std::fs::write(record_path(conn), serde_json::to_vec(&rec).unwrap_or_default());
-    Ok(summary)
+    let _ = std::fs::write(record_path(conn), &ns);
+
+    let servers_txt = servers.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ");
+    Ok(if ns == "." {
+        format!("DNS routed over the tunnel via {servers_txt} (all names)")
+    } else {
+        format!("split-DNS: *{ns} resolves via {servers_txt}")
+    })
 }
 
-/// Undo whatever [`apply`] configured for `conn`. No-op when nothing was
-/// recorded (e.g. a profile with no DNS).
+/// Remove the NRPT rule [`apply`] created for `conn`. No-op when nothing was
+/// recorded (a profile with no DNS, or already reverted).
 #[cfg(windows)]
 pub fn revert(conn: &str) -> Result<(), String> {
     let path = record_path(conn);
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(ns) = std::fs::read_to_string(&path) else {
         return Ok(());
     };
-    let rec: Applied = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let mut body = format!(
-        "Set-DnsClientServerAddress -InterfaceIndex {} -ResetServerAddresses -ErrorAction SilentlyContinue;",
-        rec.if_index
+    let ns = ns.trim();
+    let body = format!(
+        "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -contains '{ns}' }} | \
+         Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue;\
+         Clear-DnsClientCache -ErrorAction SilentlyContinue"
     );
-    if let Some(d) = &rec.domain {
-        body.push_str(&format!(
-            "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -contains '.{d}' }} | \
-             Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue;"
-        ));
-    }
-    body.push_str("Clear-DnsClientCache -ErrorAction SilentlyContinue");
     let r = run_elevated(&body);
     let _ = std::fs::remove_file(&path);
     r
@@ -157,7 +122,7 @@ pub fn revert(conn: &str) -> Result<(), String> {
 
 // ---- non-Windows stubs ----------------------------------------------------
 #[cfg(not(windows))]
-pub fn apply(_conn: &str, _servers: &[Ipv4Addr], _domain: Option<&str>, _vip: &str) -> Result<String, String> {
+pub fn apply(_conn: &str, _servers: &[Ipv4Addr], _domain: Option<&str>) -> Result<String, String> {
     Ok(String::new())
 }
 
