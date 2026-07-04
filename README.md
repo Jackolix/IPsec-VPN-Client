@@ -92,6 +92,18 @@ plane live.
 
 If the app icons are ever regenerated: `powershell.exe -File scripts\gen-icons.ps1`.
 
+### Releases / shipping
+
+Push a `v*` tag and `.github/workflows/release.yml` builds everything and
+attaches it to a GitHub Release: a Windows **installer** (NSIS `*-setup.exe`
+and an MSI) that bundles the app **and** `charon-svc.exe` + its DLLs (installed
+to `<app>\charon\`), plus the standalone `vpn-agent.exe` / `vpn-cli.exe`. No
+TAP/WinTUN driver is installed — IPsec runs in-kernel via WFP, and the
+gateway-assigned virtual IP is placed on an existing interface. The installer
+is **unsigned** (SmartScreen will warn) until a code-signing cert is added.
+DPD/auto-reconnect is on by default (probe every 30s; charon re-establishes the
+tunnel after a dead peer or link flap).
+
 The responder side (test gateway) must accept: IKEv2, PSK, the profile's
 identity, IKE `aes256-sha256-prfsha256-modp3072`, ESP `aes256-sha256` with
 PFS group 15 (modp3072), and assign a virtual IP.
