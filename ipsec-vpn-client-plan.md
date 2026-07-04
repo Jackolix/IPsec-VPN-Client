@@ -73,9 +73,19 @@ Windows).
 - **Phase 3**: macOS — start with `NEVPNProtocolIKEv2`; fall back to embedded
   strongSwan Network Extension only on cipher/feature gaps. Apple Developer
   account + Network Extension entitlement lead time.
-- **Phase 4**: Windows — try native RAS/`Add-VpnConnection` first, bundle
-  strongSwan if the crypto suite isn't supported natively. Plan the UAC UX
-  early.
+- **Phase 4 (native daemon done 2026-07-04)**: Windows — native RAS was ruled
+  out empirically (its IKEv2 client can't do DH group 15 / modp3072 or IKEv2
+  PSK), so we bundle strongSwan. `docker/strongswan-windows/Dockerfile`
+  cross-builds the native `charon-svc.exe` (kernel-wfp + kernel-iph +
+  socket-win + vici, `--enable-monolithic`, OpenSSL) via MinGW-w64;
+  `scripts/build-strongswan-windows.ps1` exports a flat artifact tree to
+  `out/strongswan-windows`. `scripts/run-charon-windows.ps1` launches it
+  elevated (WFP needs Administrator) with vici on `127.0.0.1:4502`; the
+  existing `Transport::Tcp` path drives it unchanged. Verified live against the
+  LANCOM: IKEv2/PSK/modp3072 negotiated, virtual IP + route installed on a host
+  adapter via WFP/IP-Helper (not a container), ESP data plane moved (out
+  counter). Still open: wire the Tauri app to spawn/stop charon-svc elevated
+  (UAC UX) instead of a manual launch, and a signed installer.
 - **Phase 5**: hardening — DPD/reconnect, network roaming, split vs full
   tunnel, log redaction layer, auto-update, signing/notarization, interop
   matrix.
