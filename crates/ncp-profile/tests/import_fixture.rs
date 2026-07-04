@@ -18,6 +18,8 @@ fn imports_sample_profile() {
     assert_eq!(c.name, "EFA_MDT_42");
     assert_eq!(c.gateway, "gateway.example.test");
     assert_eq!(c.local_id.as_deref(), Some("efa_mdt_42"));
+    // IkeIdType=3 must be carried as RFC822 so charon presents the right type.
+    assert_eq!(c.local_id_type, Some(vpn_core::IkeIdType::Rfc822));
     assert_eq!(c.ike_enc, EncAlg::Aes256);
     assert_eq!(c.ike_integ, IntegAlg::Sha256);
     assert_eq!(c.ike_prf, PrfAlg::Sha256);
@@ -69,7 +71,7 @@ fn renders_expected_swanctl_conf() {
     assert!(conf.contains("esp_proposals = aes256-sha256-modp3072"));
     assert!(conf.contains("remote_ts = 10.102.15.0/24"));
     assert!(conf.contains("vips = 0.0.0.0"));
-    assert!(conf.contains("id = \"efa_mdt_42\""));
+    assert!(conf.contains("id = \"rfc822:efa_mdt_42\""));
     assert!(conf.contains("secret = \"REDACTED-PSK-PLACEHOLDER\""));
     assert!(!conf.contains("ipcomp"));
 

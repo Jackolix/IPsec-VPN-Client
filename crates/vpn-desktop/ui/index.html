@@ -162,6 +162,40 @@
   #dropzone .dz-card { border: 2px dashed var(--accent); border-radius: 16px; padding: 34px 46px; background: var(--surface);
     font-family: var(--mono); font-size: var(--fs-md); color: var(--text); text-align: center; box-shadow: 0 0 0 6px var(--accent-soft); }
   #dropzone .dz-card span { display: block; margin-top: 6px; font-size: var(--fs-xs); color: var(--muted); }
+
+  /* compact / full view toggle */
+  .view-toggle {
+    font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .06em; color: var(--muted);
+    background: rgba(0,0,0,.18); border: 1px solid var(--line); border-radius: 999px;
+    padding: 5px 12px; cursor: pointer; white-space: nowrap;
+  }
+  .view-toggle:hover { color: var(--text); border-color: var(--muted); }
+  .view-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* compact view: hidden until body.compact; then it replaces the dashboard */
+  .compact-view { display: none; }
+  body.compact .body { display: none; }
+  body.compact .compact-view { display: flex; flex: 1; min-height: 0; align-items: center; justify-content: center; padding: 22px; }
+  .cpanel {
+    width: min(400px, 100%); background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
+    padding: 18px 20px 20px; display: flex; flex-direction: column; gap: 13px;
+    box-shadow: 0 24px 64px -28px rgba(0,0,0,.75);
+  }
+  .cpanel-head { display: flex; align-items: center; gap: 10px; }
+  .cpanel-head .chead-title { font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .14em; text-transform: uppercase; color: var(--faint); }
+  .cpanel-head .spacer { flex: 1; }
+  .cstatus { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+  .compact-select {
+    width: 100%; font-family: var(--mono); font-size: var(--fs-base); color: var(--text);
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; cursor: pointer;
+  }
+  .compact-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .cident { display: flex; flex-direction: column; gap: 3px; }
+  .cname { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.01em; word-break: break-word; }
+  .cgw { font-size: var(--fs-sm); color: var(--muted); word-break: break-all; }
+  .cmeta { font-size: var(--fs-sm); color: var(--faint); font-variant-numeric: tabular-nums; }
+  .cbig { width: 100%; padding: 13px; font-size: var(--fs-md); }
+  #c-msg { margin: 0; }
 </style>
 </head>
 <body>
@@ -172,6 +206,7 @@
       <b>IPsec&nbsp;VPN</b><span>· NCP profile client</span>
     </div>
     <div class="spacer"></div>
+    <button id="view-toggle" class="view-toggle" title="Switch to a compact view">▭ Compact</button>
     <div class="global-status"><span id="glob-led" class="led"></span><span id="glob-text">disconnected</span></div>
   </div>
 
@@ -217,6 +252,24 @@
         </div>
       </div>
     </section>
+  </div>
+
+  <div class="compact-view" id="compact-view">
+    <div class="cpanel">
+      <div class="cpanel-head">
+        <span class="chead-title">Connection</span>
+        <span class="spacer"></span>
+        <span class="cstatus"><span id="c-led" class="led"></span><span id="c-status">disconnected</span></span>
+      </div>
+      <select id="compact-select" class="compact-select" aria-label="Profile"></select>
+      <div class="cident">
+        <div class="cname mono" id="c-name">—</div>
+        <div class="cgw mono" id="c-gw">—</div>
+      </div>
+      <div class="cmeta mono" id="c-meta" style="display:none"></div>
+      <div id="c-msg" class="notice" role="status"></div>
+      <button id="compact-action" class="btn btn-primary cbig">Connect</button>
+    </div>
   </div>
 </div>
 
@@ -304,7 +357,7 @@
       empty.style.cssText = "color:var(--faint);font-family:var(--mono);font-size:var(--fs-xs);padding:10px 12px;line-height:1.5;";
       empty.innerHTML = 'No profiles yet. Click <b>+ Import .ini</b> or drag a profile onto the window.' +
         (PROFILE_DIR ? '<br><span style="color:var(--faint)">Folder: ' + esc(PROFILE_DIR) + "</span>" : "");
-      ul.appendChild(empty); return;
+      ul.appendChild(empty); renderCompactSelect(); return;
     }
     profiles.forEach(function (p) {
       var li = document.createElement("li");
@@ -321,6 +374,7 @@
       b.addEventListener("click", function () { current = p; renderAll(); });
       li.appendChild(b); ul.appendChild(li);
     });
+    renderCompactSelect();
   }
 
   function renderSecurity() {
@@ -370,6 +424,7 @@
     var anyConn = Object.keys(state).some(function (k) { return state[k] === "connecting"; });
     $("glob-led").className = "led" + (anyUp ? " ok" : anyConn ? " warn pulse" : "");
     $("glob-text").textContent = anyUp ? "tunnel up" : anyConn ? "negotiating" : "disconnected";
+    renderCompactStatus();
   }
 
   function setAction() {
@@ -378,6 +433,7 @@
     if (st === "disconnected") { btn.className = "btn btn-primary"; btn.textContent = "Connect"; }
     else if (st === "connecting") { btn.className = "btn btn-ghost"; btn.textContent = "Cancel"; }
     else { btn.className = "btn btn-ghost"; btn.textContent = "Disconnect"; }
+    renderCompactStatus();
   }
 
   function renderTiles() {
@@ -390,8 +446,84 @@
       setTile("t-vip", current.vip || "—", false);
     }
     drawSpark();
+    renderCompactStatus();
   }
   function setTile(id, val, dim) { var el = $(id); el.textContent = val; el.className = "v" + (dim ? " dim" : ""); }
+
+  /* ---------- compact view ---------- */
+  // The compact panel mirrors the essentials — profile picker, status, and the
+  // one action — and is fed from the same state as the full dashboard.
+  function renderCompactSelect() {
+    var sel = $("compact-select"); if (!sel) { return; }
+    sel.innerHTML = "";
+    if (!profiles.length) {
+      var o = document.createElement("option"); o.textContent = "No profiles imported"; o.disabled = true;
+      sel.appendChild(o); sel.disabled = true; return;
+    }
+    sel.disabled = false;
+    profiles.forEach(function (p) {
+      var opt = document.createElement("option"); opt.value = p.id;
+      var st = state[p.id];
+      var dot = st === "established" ? "● " : st === "connecting" ? "◐ " : "○ ";
+      opt.textContent = dot + p.name;
+      if (current && p.id === current.id) { opt.selected = true; }
+      sel.appendChild(opt);
+    });
+  }
+  function renderCompactStatus() {
+    var b = $("compact-action");
+    if (!current) {
+      $("c-name").textContent = "—"; $("c-gw").textContent = "";
+      $("c-status").textContent = "no profile"; $("c-led").className = "led";
+      $("c-meta").style.display = "none"; b.disabled = true; return;
+    }
+    var st = state[current.id];
+    $("c-name").textContent = current.name;
+    $("c-gw").textContent = current.gateway;
+    $("c-led").className = "led" + (st === "established" ? " ok" : st === "connecting" ? " warn pulse" : "");
+    $("c-status").textContent = st === "established" ? "established" : st;
+    b.disabled = false;
+    if (st === "disconnected") { b.className = "btn btn-primary cbig"; b.textContent = "Connect"; }
+    else if (st === "connecting") { b.className = "btn btn-ghost cbig"; b.textContent = "Cancel"; }
+    else { b.className = "btn btn-ghost cbig"; b.textContent = "Disconnect"; }
+    var bits = [];
+    if (st === "established") {
+      if (current.vip && current.vip !== "—") { bits.push("IP " + current.vip); }
+      if (connectAt) { bits.push(fmtDur(Date.now() - connectAt)); }
+    }
+    var meta = $("c-meta"); meta.textContent = bits.join("   ·   "); meta.style.display = bits.length ? "" : "none";
+  }
+  function renderCompact() { renderCompactSelect(); renderCompactStatus(); }
+
+  // Keep the uptime tile (and compact meta) ticking; shared by both lifecycles.
+  function updateUptime() {
+    if (!current || state[current.id] !== "established") { return; }
+    setTile("t-up", fmtDur(Date.now() - connectAt), false);
+    renderCompactStatus();
+  }
+
+  function setView(mode) {
+    var compact = mode === "compact";
+    document.body.classList.toggle("compact", compact);
+    var t = $("view-toggle");
+    t.textContent = compact ? "⤢ Full view" : "▭ Compact";
+    t.title = compact ? "Switch to the full dashboard" : "Switch to a compact view";
+    try { localStorage.setItem("viewMode", mode); } catch (e) {}
+    resizeWindow(compact);
+    if (compact) { renderCompact(); }
+  }
+  // Best-effort: shrink/restore the OS window to match the view. Harmless if the
+  // window API/permission isn't present — the layout toggle stands on its own.
+  function resizeWindow(compact) {
+    try {
+      var wapi = window.__TAURI__ && window.__TAURI__.window;
+      var dpi = window.__TAURI__ && window.__TAURI__.dpi;
+      if (!wapi || !dpi || !wapi.getCurrentWindow || !dpi.LogicalSize) { return; }
+      var win = wapi.getCurrentWindow();
+      var size = compact ? new dpi.LogicalSize(400, 560) : new dpi.LogicalSize(1180, 840);
+      Promise.resolve(win.setSize(size)).catch(function () {});
+    } catch (e) {}
+  }
 
   function renderAll() {
     if (!current) { return; }
@@ -441,9 +573,16 @@
 
   function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 
-  /* ---------- notice ---------- */
-  function showNotice(html, kind) { var n = $("notice"); n.className = "notice show" + (kind ? " " + kind : ""); n.innerHTML = html; }
-  function hideNotice() { $("notice").className = "notice"; }
+  /* ---------- notice (mirrored into the compact panel) ---------- */
+  function showNotice(html, kind) {
+    var cls = "notice show" + (kind ? " " + kind : "");
+    var n = $("notice"); n.className = cls; n.innerHTML = html;
+    var c = $("c-msg"); if (c) { c.className = cls; c.innerHTML = html; }
+  }
+  function hideNotice() {
+    $("notice").className = "notice";
+    var c = $("c-msg"); if (c) { c.className = "notice"; c.innerHTML = ""; }
+  }
 
   /* ---------- log ---------- */
   function pad(n) { return (n < 10 ? "0" : "") + n; }
@@ -527,9 +666,7 @@
 
   function startPolling() {
     stopPolling();
-    upTimer = setInterval(function () {
-      if (state[current.id] === "established") { setTile("t-up", fmtDur(Date.now() - connectAt), false); }
-    }, 1000);
+    upTimer = setInterval(updateUptime, 1000);
     pollTimer = setInterval(pollOnce, 1600);
     pollOnce();
   }
@@ -555,6 +692,7 @@
     samples.push(delta); if (samples.length > 40) { samples.shift(); }
     $("t-rate").textContent = fmtBytes(delta) + "/s";
     drawSpark();
+    renderCompactStatus();
   }
 
   async function realDisconnect(p) {
@@ -649,7 +787,7 @@
   function demoFinish(p) {
     state[p.id] = "established"; connectAt = Date.now(); samples = [];
     setPill(); setAction(); renderList(); current.vip = p.vip; setTile("t-vip", p.vip, false);
-    upTimer = setInterval(function () { if (state[p.id] === "established") { setTile("t-up", fmtDur(Date.now() - connectAt), false); } }, 1000);
+    upTimer = setInterval(updateUptime, 1000);
     var inB = 0, outB = 0;
     pollTimer = setInterval(function () {
       if (state[p.id] !== "established") { return; }
@@ -706,6 +844,14 @@
   }
 
   $("action").addEventListener("click", onAction);
+  $("compact-action").addEventListener("click", onAction);
+  $("view-toggle").addEventListener("click", function () {
+    setView(document.body.classList.contains("compact") ? "full" : "compact");
+  });
+  $("compact-select").addEventListener("change", function (e) {
+    var p = profiles.filter(function (x) { return x.id === e.target.value; })[0];
+    if (p) { current = p; renderAll(); }
+  });
   $("daemon-btn").addEventListener("click", onDaemonBtn);
   $("clear-log").addEventListener("click", clearLog);
   $("import-btn").addEventListener("click", onImport);
@@ -746,7 +892,11 @@
   // Keep the backend indicator live (it can be started/stopped out-of-band).
   if (TAURI) { setInterval(function () { if (!daemonBusy) { refreshDaemon(); } }, 4000); }
 
-  refresh();
+  // Restore the last-used view once profiles are loaded so the compact panel
+  // has a current profile to show.
+  var savedView = "full";
+  try { savedView = localStorage.getItem("viewMode") || "full"; } catch (e) {}
+  refresh().then(function () { setView(savedView); });
 })();
 </script>
 </body>

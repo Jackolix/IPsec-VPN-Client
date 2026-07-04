@@ -173,6 +173,21 @@ impl fmt::Display for Ipv4Net {
     }
 }
 
+/// The IKE identity type declared by a profile. Maps to an IANA IKEv2 ID
+/// type; we use it to emit a strongSwan-typed identity so charon presents the
+/// exact type the peer expects instead of inferring it from the string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IkeIdType {
+    /// IANA 1 — an IPv4 address literal (inferred correctly, no prefix needed).
+    Ipv4,
+    /// IANA 2 — a DNS name (`fqdn:`).
+    Fqdn,
+    /// IANA 3 — RFC822/USER_FQDN address (`rfc822:`). NCP's `IkeIdType=3`.
+    Rfc822,
+    /// IANA 11 — an opaque key id (`keyid:`).
+    KeyId,
+}
+
 /// The internal, importer-independent connection configuration.
 #[derive(Debug)]
 pub struct ConnectionConfig {
@@ -183,6 +198,11 @@ pub struct ConnectionConfig {
     /// Local IKE identity (e.g. a USER_FQDN / KEY_ID string). `None` = derive
     /// from local address.
     pub local_id: Option<String>,
+    /// The IKE ID *type* the profile declared for [`local_id`]. strongSwan
+    /// otherwise infers the type from the string, which is wrong for a bare
+    /// token the gateway treats as RFC822 — so we force it (see
+    /// [`ConnectionConfig::local_id_wire`]). `None` = let charon infer.
+    pub local_id_type: Option<IkeIdType>,
     pub auth: AuthMethod,
     /// IKE (phase 1) proposal.
     pub ike_enc: EncAlg,
@@ -261,6 +281,22 @@ impl ConnectionConfig {
             self.ike_prf.swanctl_name(),
             self.ike_dh.swanctl_name()
         )
+    }
+
+    /// The local IKE identity as strongSwan should parse it: a typed prefix
+    /// forces the ID type so a bare token like `efa_mdt_42` is presented as
+    /// RFC822 (what the gateway expects) rather than an inferred FQDN. Returns
+    /// `None` when the profile declares no local id.
+    pub fn local_id_wire(&self) -> Option<String> {
+        let id = self.local_id.as_ref()?;
+        Some(match self.local_id_type {
+            Some(IkeIdType::Fqdn) => format!("fqdn:{id}"),
+            Some(IkeIdType::Rfc822) => format!("rfc822:{id}"),
+            Some(IkeIdType::KeyId) => format!("keyid:{id}"),
+            // An IPv4 literal is inferred correctly; no prefix, and none when
+            // the type is unknown (fall back to charon's inference).
+            Some(IkeIdType::Ipv4) | None => id.clone(),
+        })
     }
 
     /// ESP (phase 2) proposal string, e.g. `aes256-sha256-modp3072` (the DH
