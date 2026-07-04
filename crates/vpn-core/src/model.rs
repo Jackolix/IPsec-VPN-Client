@@ -200,6 +200,33 @@ pub struct ConnectionConfig {
     pub request_virtual_ip: bool,
     /// IPComp compression.
     pub compression: bool,
+    /// Dead-Peer-Detection / auto-reconnect behaviour.
+    pub dpd: DpdConfig,
+}
+
+/// Dead-Peer-Detection and auto-reconnect policy.
+///
+/// DPD periodically probes an otherwise-idle peer (IKEv2 liveness check); if it
+/// stops answering, `auto_reconnect` decides whether charon re-establishes the
+/// tunnel on its own (also covers the peer closing the SA).
+#[derive(Debug, Clone, Copy)]
+pub struct DpdConfig {
+    /// Liveness-probe interval in seconds. `0` disables DPD probing.
+    pub delay_secs: u32,
+    /// Re-establish the SA automatically when the peer is declared dead or
+    /// closes the tunnel, instead of just clearing it.
+    pub auto_reconnect: bool,
+}
+
+impl Default for DpdConfig {
+    /// Probe every 30s and reconnect automatically — a sensible always-on VPN
+    /// default that recovers from peer reboots, roaming and link flaps.
+    fn default() -> Self {
+        DpdConfig {
+            delay_secs: 30,
+            auto_reconnect: true,
+        }
+    }
 }
 
 impl ConnectionConfig {

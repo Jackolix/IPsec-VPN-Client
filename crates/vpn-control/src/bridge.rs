@@ -19,9 +19,14 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
     }
     let remote = Message::new().str("auth", "psk");
 
+    // Auto-reconnect: on a dead peer (DPD) or the peer closing the SA,
+    // `restart` makes charon re-establish it; otherwise it just clears.
+    let on_fail = if config.dpd.auto_reconnect { "restart" } else { "clear" };
     let mut child = Message::new()
         .list("esp_proposals", [config.esp_proposal()])
-        .str("start_action", "none");
+        .str("start_action", "none")
+        .str("dpd_action", on_fail)
+        .str("close_action", if config.dpd.auto_reconnect { "restart" } else { "none" });
     if config.compression {
         child = child.str("ipcomp", "yes");
     }
@@ -40,6 +45,10 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
         .section("local", local)
         .section("remote", remote)
         .section("children", children);
+    // DPD liveness probing on the IKE_SA (0 = off).
+    if config.dpd.delay_secs > 0 {
+        conn = conn.str("dpd_delay", format!("{}s", config.dpd.delay_secs));
+    }
     if config.request_virtual_ip {
         conn = conn.list("vips", ["0.0.0.0".to_string()]);
     }
@@ -87,6 +96,7 @@ mod tests {
             }],
             request_virtual_ip: true,
             compression: false,
+            dpd: vpn_core::DpdConfig::default(),
         }
     }
 
@@ -113,6 +123,32 @@ mod tests {
             Some(vec!["aes256-sha256-modp3072".to_string()])
         );
         assert_eq!(child.get_list("remote_ts"), Some(vec!["10.0.0.0/24".to_string()]));
+    }
+
+    #[test]
+    fn load_conn_sets_dpd_and_auto_reconnect() {
+        let msg = load_conn_message(&sample(), "vRouter-TEST-1");
+        let conn = msg.get_section("vRouter-TEST-1").unwrap();
+        assert_eq!(conn.get_str("dpd_delay").as_deref(), Some("30s"));
+        let child = conn
+            .get_section("children")
+            .unwrap()
+            .get_section("vRouter-TEST-1")
+            .unwrap();
+        assert_eq!(child.get_str("dpd_action").as_deref(), Some("restart"));
+        assert_eq!(child.get_str("close_action").as_deref(), Some("restart"));
+    }
+
+    #[test]
+    fn dpd_off_omits_delay_and_clears() {
+        let mut cfg = sample();
+        cfg.dpd = vpn_core::DpdConfig { delay_secs: 0, auto_reconnect: false };
+        let msg = load_conn_message(&cfg, "c");
+        let conn = msg.get_section("c").unwrap();
+        assert_eq!(conn.get_str("dpd_delay"), None);
+        let child = conn.get_section("children").unwrap().get_section("c").unwrap();
+        assert_eq!(child.get_str("dpd_action").as_deref(), Some("clear"));
+        assert_eq!(child.get_str("close_action").as_deref(), Some("none"));
     }
 
     #[test]
