@@ -59,9 +59,6 @@
   .profile-top { display: flex; align-items: center; gap: 8px; }
   .profile-name { font-family: var(--mono); font-size: var(--fs-base); font-weight: 600; }
   .profile-gw { font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tag { margin-left: auto; font-family: var(--mono); font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase; padding: 2px 6px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); flex: 0 0 auto; }
-  .tag.prod { color: var(--warn); border-color: rgba(217,165,49,.4); background: var(--warn-soft); }
-  .tag.test { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
   .side-foot { padding: 11px 16px; border-top: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); display: flex; align-items: center; gap: 7px; }
   #daemon-btn { margin-left: auto; }
   #daemon-btn.busy { opacity: .6; pointer-events: none; }
@@ -254,17 +251,17 @@
 
   // Demo data used only when the page is opened outside the Tauri shell.
   var DEMO = [
-    { id: "test1", name: "vRouter-TEST-1", kind: "test", gateway: "192.168.100.10",
+    { id: "test1", name: "vRouter-TEST-1", gateway: "192.168.100.10",
       localId: "test-1@test.local", remote: "10.0.0.0/24", vip: "10.0.0.15",
-      ike: "aes256-sha256-prfsha256-modp3072", esp: "aes256-sha256", pfs: "modp3072", confirmed: true,
+      ike: "aes256-sha256-prfsha256-modp3072", esp: "aes256-sha256", pfs: "modp3072",
       warns: [
         { lvl: "medium", t: "IkeIdType=3 interpreted as USER_FQDN", n: "unconfirmed mapping — verify on first connect" },
         { lvl: "ignored", t: "ConnMedia=21", n: "not interpreted yet — ignored" },
         { lvl: "ignored", t: "SeamRoaming=1", n: "not interpreted yet — ignored" }
       ] },
-    { id: "efa", name: "EFA_MDT_42", kind: "prod", gateway: "gateway.example.test",
+    { id: "efa", name: "EFA_MDT_42", gateway: "gateway.example.test",
       localId: "efa_mdt_42", remote: "10.102.15.0/24", vip: "—",
-      ike: "aes256-sha256-prfsha256-modp3072", esp: "aes256-sha256", pfs: "modp3072", confirmed: true,
+      ike: "aes256-sha256-prfsha256-modp3072", esp: "aes256-sha256", pfs: "modp3072",
       warns: [{ lvl: "medium", t: "IkeIdType=3 interpreted as USER_FQDN", n: "unconfirmed mapping — verify on first connect" }] }
   ];
 
@@ -280,12 +277,10 @@
   function mapSummary(s) {
     return {
       id: s.id, name: s.name, gateway: s.gateway,
-      kind: s.kind === "prod" ? "prod" : "test",
       localId: s.local_id || "—",
       remote: (s.remote && s.remote.length) ? s.remote.join(", ") : "—",
       vip: "—",
       ike: s.ike, esp: s.esp, pfs: s.pfs || null,
-      confirmed: s.kind !== "prod",
       stored: !!s.stored,
       dns: (s.dns && s.dns.length) ? s.dns.join(", ") : null,
       dnsDomain: s.dns_domain || null,
@@ -319,8 +314,7 @@
       var st = state[p.id];
       var led = st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
       b.innerHTML = '<div class="profile-top"><span class="' + led + '"></span>' +
-        '<span class="profile-name"></span>' +
-        '<span class="tag ' + (p.kind === "prod" ? "prod" : "test") + '">' + (p.kind === "prod" ? "prod" : "lab") + '</span></div>' +
+        '<span class="profile-name"></span></div>' +
         '<div class="profile-gw"></div>';
       b.querySelector(".profile-name").textContent = p.name;
       b.querySelector(".profile-gw").textContent = p.gateway;
@@ -331,9 +325,8 @@
 
   function renderSecurity() {
     var p = current;
-    var confirmed = p.confirmed ? ' <span class="badge">confirmed</span>' : "";
     var rows = [
-      ["IKE proposal", esc(p.ike) + confirmed],
+      ["IKE proposal", esc(p.ike)],
       ["ESP proposal", esc(p.esp)],
       ["PFS group", p.pfs ? esc(p.pfs) : "none"],
       ["Auth", '<span class="redacted">psk ••••••••••••</span>'],

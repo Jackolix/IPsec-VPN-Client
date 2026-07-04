@@ -6,7 +6,6 @@
 //! duration of a connect. Connection control goes through `vpn-control`.
 
 use serde::Serialize;
-use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use vpn_control::{IkeSa, Transport};
 
@@ -104,7 +103,6 @@ pub struct ProfileSummary {
     pub id: String,
     pub name: String,
     pub gateway: String,
-    pub kind: String,
     pub local_id: Option<String>,
     pub remote: Vec<String>,
     pub ike: String,
@@ -119,15 +117,6 @@ pub struct ProfileSummary {
     pub dns: Vec<String>,
     /// Split-DNS domain scoping those servers, if the profile names one.
     pub dns_domain: Option<String>,
-}
-
-/// A purely informational label for the profile list: a bare private IP reads
-/// as a lab/test target, an FQDN or public IP as production.
-fn classify(gateway: &str) -> &'static str {
-    match gateway.parse::<Ipv4Addr>() {
-        Ok(ip) if ip.is_private() || ip.is_loopback() => "lab",
-        _ => "prod",
-    }
 }
 
 /// Split "Foo=1 interpreted as bar (note...)" into a headline and a note,
@@ -162,7 +151,6 @@ fn summarize(
         id: id.to_string(),
         name: config.name.clone(),
         gateway: config.gateway.clone(),
-        kind: classify(&config.gateway).to_string(),
         local_id: config.local_id.clone(),
         remote: config.remote_subnets.iter().map(|n| n.to_string()).collect(),
         ike: config.ike_proposal(),
