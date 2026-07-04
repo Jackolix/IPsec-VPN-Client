@@ -82,7 +82,11 @@ cargo run -p vpn-agent -- --tcp 127.0.0.1:4502 status
 
 The desktop app spawns/stops the native daemon over UAC (`start_daemon` /
 `stop_daemon` commands; `daemon.rs`) and otherwise drives it exactly like the
-container backend. Verified against the LANCOM: IKEv2/PSK/modp3072 negotiated,
+container backend. `charon-svc.exe` + its DLLs ship as bundled app resources
+(`tauri.conf.json` -> `charon/`), so a packaged app is self-contained; in dev
+they resolve from `out\strongswan-windows`. Run
+`scripts\build-strongswan-windows.ps1` before `tauri build` so the artifacts
+exist to bundle. Verified against the LANCOM: IKEv2/PSK/modp3072 negotiated,
 virtual IP and route installed on a host adapter (WFP + IP Helper), ESP data
 plane live.
 

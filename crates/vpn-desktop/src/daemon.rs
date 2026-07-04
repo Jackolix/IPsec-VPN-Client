@@ -4,14 +4,14 @@
 //! needs Administrator rights — so the GUI (which runs unelevated) launches it
 //! through a UAC prompt and talks to it over loopback vici afterwards.
 //!
-//! The heavy lifting (materializing an effective `strongswan.conf`, setting
-//! `STRONGSWAN_CONF`, launching `charon-svc.exe`) lives in the tested
-//! `scripts/run-charon-windows.ps1`; here we just elevate it. Elevation resets
-//! the environment, so we must elevate the *script* (which re-establishes the
-//! config in the elevated context), not `charon-svc.exe` directly.
+//! `charon-svc.exe` and its DLLs are shipped as bundled app resources (see
+//! `tauri.conf.json` `bundle.resources`), so the app is self-contained. We
+//! elevate `charon-svc.exe` directly with its own directory as the working
+//! directory (so it finds its sibling DLLs); it comes up on its default vici
+//! port with routing/virtual-IP install on by default — no config file needed.
 
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// charon-svc's built-in Windows vici default; the app targets this for the
@@ -26,46 +26,64 @@ pub fn is_running(addr: &str) -> bool {
         .is_some()
 }
 
-/// Locate `scripts/run-charon-windows.ps1`. `VPN_CHARON_SCRIPT` overrides;
-/// otherwise look next to the current working directory (the repo root when
-/// launched via cargo / the run scripts).
-fn run_script() -> Result<PathBuf, String> {
-    if let Some(p) = std::env::var_os("VPN_CHARON_SCRIPT") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Ok(p);
+/// Locate `charon-svc.exe`. Resolution order:
+///   1. `VPN_CHARON_EXE` (explicit full path) / `VPN_CHARON_DIR` (its folder),
+///   2. bundled next to the app exe (`<exe_dir>/charon/`, or beside it),
+///   3. the dev build tree (`out/strongswan-windows`, relative to cwd or the
+///      target/ dir), so `cargo run` and the CLI work without a bundle.
+fn charon_exe() -> Result<PathBuf, String> {
+    const EXE: &str = "charon-svc.exe";
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(p) = std::env::var_os("VPN_CHARON_EXE") {
+        candidates.push(PathBuf::from(p));
+    }
+    if let Some(d) = std::env::var_os("VPN_CHARON_DIR") {
+        candidates.push(PathBuf::from(d).join(EXE));
+    }
+    // Bundled resource layout (Tauri copies bundle.resources next to the exe).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("charon").join(EXE));
+            candidates.push(dir.join(EXE));
+            candidates.push(dir.join("resources").join("charon").join(EXE));
+            // Dev: target/debug/vpn-desktop.exe -> repo/out/strongswan-windows
+            candidates.push(dir.join("../../out/strongswan-windows").join(EXE));
         }
-        return Err(format!("VPN_CHARON_SCRIPT does not point at a file: {}", p.display()));
     }
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let p = cwd.join("scripts").join("run-charon-windows.ps1");
-    if p.is_file() {
-        return Ok(p);
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("out/strongswan-windows").join(EXE));
     }
-    Err(format!(
-        "run-charon-windows.ps1 not found at {} (set VPN_CHARON_SCRIPT to its path)",
-        p.display()
-    ))
+
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            "charon-svc.exe not found (build it with scripts/build-strongswan-windows.ps1, \
+             or set VPN_CHARON_DIR)"
+                .to_string()
+        })
 }
 
 /// Start the native daemon if it is not already listening at `addr`. On
-/// Windows this raises a UAC prompt (elevating the launch script) and then
-/// waits for vici to come up. A no-op if already running.
+/// Windows this raises a UAC prompt (elevating `charon-svc.exe`) and then waits
+/// for vici to come up. A no-op if already running.
 #[cfg(windows)]
 pub fn start(addr: &str) -> Result<(), String> {
     if is_running(addr) {
         return Ok(());
     }
-    let script = run_script()?;
-    let script = script.to_string_lossy().replace('\'', "''");
+    let exe = charon_exe()?;
+    let dir: &Path = exe.parent().ok_or("charon-svc.exe has no parent directory")?;
+    let exe_ps = exe.to_string_lossy().replace('\'', "''");
+    let dir_ps = dir.to_string_lossy().replace('\'', "''");
 
     // A non-elevated powershell issues Start-Process -Verb RunAs, which raises
-    // the UAC prompt and launches an elevated powershell running the script.
-    // The elevated process keeps charon-svc alive in the foreground; this outer
-    // command returns as soon as the prompt is answered.
+    // the UAC prompt and launches charon-svc.exe elevated. Its working dir is
+    // its own folder so the sibling DLLs resolve; it keeps running in the
+    // background after this command returns (once the prompt is answered).
     let inner = format!(
-        "Start-Process -FilePath 'powershell' -Verb RunAs -ArgumentList \
-         @('-NoProfile','-ExecutionPolicy','Bypass','-File','{script}')"
+        "Start-Process -FilePath '{exe_ps}' -WorkingDirectory '{dir_ps}' -Verb RunAs"
     );
     let status = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &inner])
@@ -75,8 +93,8 @@ pub fn start(addr: &str) -> Result<(), String> {
         return Err("elevation was declined or failed (UAC)".to_string());
     }
 
-    // Wait for WFP init + vici bind (and however long the user took at the UAC
-    // prompt is already spent above).
+    // Wait for WFP init + vici bind (the time spent at the UAC prompt is
+    // already elapsed above).
     let deadline = Instant::now() + Duration::from_secs(40);
     while Instant::now() < deadline {
         if is_running(addr) {
@@ -84,7 +102,7 @@ pub fn start(addr: &str) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    Err("charon-svc did not start listening within 40s (check the elevated console/charon.log)".to_string())
+    Err("charon-svc did not start listening within 40s".to_string())
 }
 
 /// Stop the native daemon. On Windows this raises a UAC prompt (an elevated
