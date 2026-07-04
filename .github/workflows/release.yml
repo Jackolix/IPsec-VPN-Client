@@ -64,6 +64,14 @@ jobs:
       - name: Build CLI binaries
         run: cargo build --release -p vpn-agent -p vpn-cli
 
+      - name: Build + stage the privileged broker service
+        shell: pwsh
+        run: |
+          cargo build --release -p vpn-broker
+          New-Item -ItemType Directory -Force out\broker | Out-Null
+          Copy-Item target\release\vpn-broker.exe out\broker\ -Force
+          Get-ChildItem out\broker
+
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0" --locked
 
@@ -75,8 +83,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist-assets | Out-Null
-          Copy-Item target\release\vpn-agent.exe dist-assets\ -ErrorAction SilentlyContinue
-          Copy-Item target\release\vpn-cli.exe   dist-assets\ -ErrorAction SilentlyContinue
+          Copy-Item target\release\vpn-agent.exe  dist-assets\ -ErrorAction SilentlyContinue
+          Copy-Item target\release\vpn-cli.exe    dist-assets\ -ErrorAction SilentlyContinue
+          Copy-Item target\release\vpn-broker.exe dist-assets\ -ErrorAction SilentlyContinue
           Get-ChildItem -Recurse target\release\bundle -Include *.exe,*.msi |
             ForEach-Object { Copy-Item $_.FullName dist-assets\ }
           Write-Host "== assets =="

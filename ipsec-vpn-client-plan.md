@@ -123,9 +123,24 @@ Windows).
   lab-responder override — Connect dials the profile's own gateway. The
   `vpn-agent` CLI keeps an optional `--gateway-override` for testing. (The
   earlier Phase 2.5 lock/override notes are historical.)
+- **Broker service (done 2026-07-04)**: `crates/vpn-broker` is a privileged
+  LocalSystem Windows service that removes *both* per-connect UAC prompts. It
+  supervises `charon-svc.exe` (so the WFP daemon is up from boot) and applies /
+  reverts the NRPT DNS rule on request from the unelevated GUI over an ACL'd
+  named pipe (`\\.\pipe\ipsec-vpn-broker`, SDDL grants LocalSystem + Admins
+  full and the interactive user R/W; `PIPE_REJECT_REMOTE_CLIENTS`). Requests are
+  tiny and validated — DNS servers must parse as IPv4 and a domain may only
+  contain DNS-label characters — because some fields are interpolated into the
+  SYSTEM-side NRPT PowerShell (the privilege boundary). The GUI's `dns.rs` and
+  `daemon.rs` prefer the broker and fall back to the old elevated-PowerShell /
+  elevate-spawn paths when it isn't installed (dev). The NSIS installer registers
+  the service post-install and removes it pre-uninstall (`installer-hooks.nsh`),
+  so the single install-time elevation is the only UAC prompt. `vpn-broker.exe`
+  ships as a bundled app resource next to `charon\`.
 - Still open: a *signed* installer (avoids SmartScreen); verify virtual-IP /
-  DNS on a clean PC with no spare adapter; a service-mode daemon to avoid the
-  per-connect UAC prompts (DNS + daemon each need elevation today).
+  DNS on a clean PC with no spare adapter; the MSI target doesn't run the broker
+  install hook (NSIS only) — MSI users would run `vpn-broker install` once by
+  hand, or we drop MSI in favour of the NSIS `*-setup.exe`.
 - **Phase 5**: hardening — DPD/reconnect, network roaming, split vs full
   tunnel, log redaction layer, auto-update, signing/notarization, interop
   matrix.
