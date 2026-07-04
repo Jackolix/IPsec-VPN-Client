@@ -299,6 +299,8 @@
       confirmed: s.kind !== "prod",
       locked: s.locked,
       stored: !!s.stored,
+      dns: (s.dns && s.dns.length) ? s.dns.join(", ") : null,
+      dnsDomain: s.dns_domain || null,
       warns: (s.warnings || []).map(function (w) { return { lvl: w.level, t: w.text, n: w.note }; })
     };
   }
@@ -349,6 +351,9 @@
       ["Local ID", esc(p.localId)],
       ["Remote subnet", esc(p.remote)]
     ];
+    if (p.dns) {
+      rows.push(["DNS", esc(p.dns) + (p.dnsDomain ? ' <span class="badge">*.' + esc(p.dnsDomain) + "</span>" : "")]);
+    }
     $("sec-kv").innerHTML = rows.map(function (r) {
       return '<div class="kv-row"><span class="kk">' + r[0] + '</span><span class="vv">' + r[1] + '</span></div>';
     }).join("");

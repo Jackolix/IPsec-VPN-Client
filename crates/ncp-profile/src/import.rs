@@ -360,6 +360,32 @@ pub fn import_profile(input: &str) -> Result<ImportedProfile, ImportError> {
 
     let compression = profile.get("UseComp").map(str::trim) == Some("1");
 
+    // --- DNS ---------------------------------------------------------------
+    // DNS1..DNS4 are the resolvers to use over the tunnel; DomainName, when
+    // present, scopes them to that suffix (split-DNS). A 0.0.0.0/empty slot
+    // means "unset".
+    let mut dns_servers = Vec::new();
+    for key in ["DNS1", "DNS2", "DNS3", "DNS4"] {
+        let Some(raw) = profile.get(key) else { continue };
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "0.0.0.0" {
+            continue;
+        }
+        match raw.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => dns_servers.push(ip),
+            Err(_) => ctx.warn(format!("{key}={raw} is not a valid IPv4 DNS server and was ignored")),
+        }
+    }
+    let dns_domain = profile
+        .get("DomainName")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let dns = vpn_core::DnsConfig {
+        servers: dns_servers,
+        domain: dns_domain,
+    };
+
     // --- Fields we deliberately ignore for now ----------------------------
     for field in ["ConnMedia", "ConnMode", "SeamRoaming", "PriVoIP"] {
         if let Some(v) = profile.get(field) {
@@ -391,6 +417,7 @@ pub fn import_profile(input: &str) -> Result<ImportedProfile, ImportError> {
             // DPD/auto-reconnect isn't expressed in the fields we parse from
             // the NCP profile yet; use the always-on VPN default.
             dpd: vpn_core::DpdConfig::default(),
+            dns,
         },
         warnings: ctx.warnings,
     })
