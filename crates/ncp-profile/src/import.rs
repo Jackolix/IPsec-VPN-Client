@@ -183,16 +183,24 @@ pub fn import_profile(input: &str) -> Result<ImportedProfile, ImportError> {
     };
 
     // --- Identity ----------------------------------------------------------
+    // The type matters: strongSwan infers the ID type from the string unless we
+    // force it, and a bare token like `acme_site_01` infers as FQDN while the
+    // gateway expects RFC822 (NCP's IkeIdType=3) — a mismatch the peer silently
+    // drops at IKE_AUTH. So we carry the declared type through to the emitter.
     let local_id = profile.get("IkeIdStr").map(str::to_string);
+    let mut local_id_type = None;
     if let Some(id_type_str) = profile.get("IkeIdType") {
         let code = parse_u32("IkeIdType", id_type_str)?;
         match codes::ike_id_type(code) {
-            Some(m) => ctx.note_confidence(
-                "IkeIdType",
-                code,
-                &format!("{:?}", m.value),
-                m.confidence,
-            ),
+            Some(m) => {
+                ctx.note_confidence("IkeIdType", code, &format!("{:?}", m.value), m.confidence);
+                local_id_type = Some(match m.value {
+                    codes::IkeIdType::Ipv4Addr => vpn_core::IkeIdType::Ipv4,
+                    codes::IkeIdType::Fqdn => vpn_core::IkeIdType::Fqdn,
+                    codes::IkeIdType::UserFqdn => vpn_core::IkeIdType::Rfc822,
+                    codes::IkeIdType::KeyId => vpn_core::IkeIdType::KeyId,
+                });
+            }
             None => ctx.warn(format!(
                 "IkeIdType={code} is unknown; passing IkeIdStr through as-is"
             )),
@@ -403,6 +411,7 @@ pub fn import_profile(input: &str) -> Result<ImportedProfile, ImportError> {
             name,
             gateway,
             local_id,
+            local_id_type,
             auth,
             ike_enc: ike_enc.value,
             ike_integ: ike_integ.value,
