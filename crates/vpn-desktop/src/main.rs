@@ -23,6 +23,42 @@ async fn list_profiles(state: tauri::State<'_, AppState>) -> Result<Vec<ProfileS
 }
 
 #[tauri::command]
+async fn profiles_dir(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let s = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || Ok(backend::profiles_dir(&s)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Open a native file picker and import the chosen `.ini`. Returns the new
+/// profile id, or `None` if the dialog was cancelled.
+#[tauri::command]
+async fn import_profile_dialog(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let s = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = app
+            .dialog()
+            .file()
+            .add_filter("NCP profile", &["ini"])
+            .set_title("Import NCP profile")
+            .blocking_pick_file();
+        match picked {
+            Some(fp) => {
+                let path = fp.into_path().map_err(|e| e.to_string())?;
+                backend::import_path(&s, &path).map(Some)
+            }
+            None => Ok(None),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn connect(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -131,6 +167,9 @@ fn dev(args: &[String]) {
         } else {
             "stopped".to_string()
         }),
+        Some("import") => backend::import_path(&state, std::path::Path::new(args.get(1).map(String::as_str).unwrap_or("")))
+            .map(|id| format!("imported {id}")),
+        Some("profiles-dir") => Ok(backend::profiles_dir(&state)),
         Some("daemon-start") => backend::daemon_start(&state).map(|_| "started".to_string()),
         Some("daemon-stop") => backend::daemon_stop(&state).map(|_| "stopped".to_string()),
         Some("save-creds") => {
@@ -168,9 +207,12 @@ fn main() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::from_env())
         .invoke_handler(tauri::generate_handler![
             list_profiles,
+            profiles_dir,
+            import_profile_dialog,
             connect,
             disconnect,
             status,
@@ -184,13 +226,39 @@ fn main() {
             tray::build(app.handle())?;
             Ok(())
         })
-        // Closing the window hides it to the tray instead of quitting, so the
-        // tunnel (and the app that drives it) keeps running in the background.
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            // Closing the window hides it to the tray instead of quitting, so
+            // the tunnel (and the app that drives it) keeps running.
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.hide();
                 api.prevent_close();
             }
+            // Dragging .ini files onto the window imports them; Enter/Leave
+            // drive a drop-zone highlight in the UI.
+            tauri::WindowEvent::DragDrop(drag) => {
+                use tauri::{Emitter, Manager};
+                match drag {
+                    tauri::DragDropEvent::Enter { .. } => {
+                        let _ = window.emit("drag-active", true);
+                    }
+                    tauri::DragDropEvent::Leave => {
+                        let _ = window.emit("drag-active", false);
+                    }
+                    tauri::DragDropEvent::Drop { paths, .. } => {
+                        let _ = window.emit("drag-active", false);
+                        let state = window.state::<AppState>();
+                        let imported: Vec<String> = paths
+                            .iter()
+                            .filter_map(|p| backend::import_path(state.inner(), p).ok())
+                            .collect();
+                        if !imported.is_empty() {
+                            let _ = window.emit("profiles-changed", imported);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running the IPsec VPN Client");

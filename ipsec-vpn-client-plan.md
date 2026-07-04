@@ -104,7 +104,23 @@ Windows).
 - Release automation: `.github/workflows/release.yml` builds everything on a
   `v*` tag — a Linux job cross-builds charon-svc (Docker/MinGW) and a Windows
   job bundles it into the Tauri installer and publishes the installer + CLIs to
-  a GitHub Release. Still open: a *signed* installer (avoids SmartScreen).
+  a GitHub Release. Verified locally: `cargo tauri build` produces a self-
+  contained NSIS `*-setup.exe` + MSI that install `vpn-desktop.exe` and
+  `charon\charon-svc.exe`.
+- **DNS (done 2026-07-04)**: the importer now reads `DNS1..4` + `DomainName`
+  into `vpn-core::DnsConfig`; on connect the app installs a Windows NRPT rule
+  (split-DNS `*.<domain>` → VPN servers, or catch-all `.` when no domain) and
+  removes it on disconnect (elevated; NRPT is safe — it never touches adapter
+  DNS). Verified live: rule created/removed around a LANCOM connect.
+- **Tray + import UX (done 2026-07-04)**: system-tray icon/menu; closing the
+  window hides to tray (tunnel keeps running). `+ Import .ini` opens a native
+  file picker and drag-and-drop onto the window imports profiles (both copy
+  into the profiles folder and refresh). Default profiles folder is a stable
+  per-user dir (`%APPDATA%\ipsec-vpn\profiles`), overridable with
+  `VPN_PROFILE_DIR`.
+- Still open: a *signed* installer (avoids SmartScreen); verify virtual-IP /
+  DNS on a clean PC with no spare adapter; a service-mode daemon to avoid the
+  per-connect UAC prompts (DNS + daemon each need elevation today).
 - **Phase 5**: hardening — DPD/reconnect, network roaming, split vs full
   tunnel, log redaction layer, auto-update, signing/notarization, interop
   matrix.
