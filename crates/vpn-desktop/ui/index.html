@@ -163,6 +163,13 @@
   .gw-input { width: 100%; box-sizing: border-box; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font-family: var(--mono); font-size: var(--fs-md); letter-spacing: .02em; }
   .gw-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
   .gw-err { min-height: 15px; margin-top: 9px; color: var(--crit); font-family: var(--mono); font-size: var(--fs-xs); }
+  /* Drag-and-drop import overlay */
+  #dropzone { position: fixed; inset: 0; z-index: 50; display: none; align-items: center; justify-content: center;
+    background: rgba(10,12,16,.72); backdrop-filter: blur(2px); pointer-events: none; }
+  #dropzone.show { display: flex; }
+  #dropzone .dz-card { border: 2px dashed var(--accent); border-radius: 16px; padding: 34px 46px; background: var(--surface);
+    font-family: var(--mono); font-size: var(--fs-md); color: var(--text); text-align: center; box-shadow: 0 0 0 6px var(--accent-soft); }
+  #dropzone .dz-card span { display: block; margin-top: 6px; font-size: var(--fs-xs); color: var(--muted); }
 </style>
 </head>
 <body>
@@ -233,6 +240,8 @@
   </div>
 </div>
 
+<div id="dropzone"><div class="dz-card">Drop NCP <b>.ini</b> profile to import<span>it's copied into your profiles folder</span></div></div>
+
 <div class="overlay" id="ov-gw">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="gw-title">
     <h3 id="gw-title" class="mono">Gateway override</h3>
@@ -283,6 +292,7 @@
   var profiles = [];
   var state = {};          // id -> 'disconnected' | 'connecting' | 'established'
   var current = null;
+  var PROFILE_DIR = null;  // filled from the backend once known
   var pollTimer = null, upTimer = null, connectAt = 0, prevTotal = 0;
   var samples = [];
   var seqTimers = [];
@@ -318,8 +328,9 @@
     var ul = $("profile-list"); ul.innerHTML = "";
     if (!profiles.length) {
       var empty = document.createElement("li");
-      empty.style.cssText = "color:var(--faint);font-family:var(--mono);font-size:var(--fs-xs);padding:10px 12px;";
-      empty.textContent = "No profiles found. Drop a .ini into the profiles folder.";
+      empty.style.cssText = "color:var(--faint);font-family:var(--mono);font-size:var(--fs-xs);padding:10px 12px;line-height:1.5;";
+      empty.innerHTML = 'No profiles yet. Click <b>+ Import .ini</b> or drag a profile onto the window.' +
+        (PROFILE_DIR ? '<br><span style="color:var(--faint)">Folder: ' + esc(PROFILE_DIR) + "</span>" : "");
       ul.appendChild(empty); return;
     }
     profiles.forEach(function (p) {
@@ -732,10 +743,26 @@
     if (current) { renderAll(); } else { renderList(); }
   }
 
+  // Import a profile via the native file picker (falls back to the info modal
+  // in preview mode outside the Tauri shell).
+  async function onImport() {
+    if (!TAURI) { $("overlay").classList.add("show"); return; }
+    try {
+      var id = await TAURI.invoke("import_profile_dialog");
+      if (!id) { return; }                 // cancelled
+      await refresh();
+      var p = profiles.filter(function (x) { return x.id === id; })[0];
+      if (p) { current = p; renderAll(); }
+      showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported <b>' + esc(id) + "</b>.</div>", "");
+    } catch (e) {
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+    }
+  }
+
   $("action").addEventListener("click", onAction);
   $("daemon-btn").addEventListener("click", onDaemonBtn);
   $("clear-log").addEventListener("click", clearLog);
-  $("import-btn").addEventListener("click", function () { $("overlay").classList.add("show"); });
+  $("import-btn").addEventListener("click", onImport);
   $("modal-cancel").addEventListener("click", function () { $("overlay").classList.remove("show"); });
   $("modal-refresh").addEventListener("click", function () { $("overlay").classList.remove("show"); refresh(); });
   $("overlay").addEventListener("click", function (e) { if (e.target === $("overlay")) { $("overlay").classList.remove("show"); } });
@@ -745,6 +772,32 @@
   $("gw-input").addEventListener("keydown", function (e) { if (e.key === "Enter") { submitGateway(); } });
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") { $("overlay").classList.remove("show"); $("ov-gw").classList.remove("show"); } });
   window.addEventListener("resize", drawSpark);
+
+  // Native events from the Rust side: drag-and-drop highlight + import refresh.
+  var EVT = (window.__TAURI__ && window.__TAURI__.event) ? window.__TAURI__.event : null;
+  if (EVT) {
+    EVT.listen("drag-active", function (e) { $("dropzone").classList.toggle("show", !!e.payload); });
+    EVT.listen("profiles-changed", function (e) {
+      $("dropzone").classList.remove("show");
+      var ids = (e && e.payload) || [];
+      refresh().then(function () {
+        if (ids.length) {
+          var p = profiles.filter(function (x) { return x.id === ids[0]; })[0];
+          if (p) { current = p; renderAll(); }
+        }
+        showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported ' + ids.length + ' profile' + (ids.length === 1 ? "" : "s") + ".</div>", "");
+      });
+    });
+  }
+
+  // Show where profiles live (used in the empty state + the info modal).
+  if (TAURI) {
+    TAURI.invoke("profiles_dir").then(function (d) {
+      PROFILE_DIR = d;
+      $("modal-dir").textContent = d;
+      renderList();
+    }).catch(function () {});
+  }
 
   renderDaemon();
   refreshDaemon();

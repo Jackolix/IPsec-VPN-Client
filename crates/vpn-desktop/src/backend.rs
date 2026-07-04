@@ -20,11 +20,10 @@ impl AppState {
     pub fn from_env() -> Self {
         let profile_dir = std::env::var_os("VPN_PROFILE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join("profiles")
-            });
+            .unwrap_or_else(default_profile_dir);
+        // Make sure it exists so the picker/drag-drop have somewhere to copy to
+        // and the scan doesn't fail on a fresh install.
+        let _ = std::fs::create_dir_all(&profile_dir);
 
         let transport = match std::env::var("VPN_VICI_TCP") {
             Ok(addr) if !addr.trim().is_empty() => Transport::Tcp(addr),
@@ -36,6 +35,22 @@ impl AppState {
             transport,
         }
     }
+}
+
+/// Where imported profiles live when `VPN_PROFILE_DIR` isn't set. A per-user
+/// data dir, so an installed app (whose working directory is unpredictable)
+/// always finds the same stable folder.
+fn default_profile_dir() -> PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+
+    base.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join("ipsec-vpn")
+        .join("profiles")
 }
 
 fn default_transport() -> Transport {
@@ -198,6 +213,45 @@ pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
     out
 }
 
+/// The directory profiles are read from (shown in the UI, so the user knows
+/// where their `.ini` files live).
+pub fn profiles_dir(state: &AppState) -> String {
+    state.profile_dir.display().to_string()
+}
+
+/// Import a `.ini` file into the profile directory so it shows up in the list.
+/// Validates the extension and that it parses as an NCP profile (so junk is
+/// rejected), then copies it in under a sanitized name. Returns the new
+/// profile id (its file stem).
+pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Result<String, String> {
+    if src.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("ini")) != Some(true) {
+        return Err("only .ini profiles can be imported".to_string());
+    }
+    let text = std::fs::read_to_string(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    // Parse to reject files that aren't valid NCP profiles.
+    ncp_profile::import_profile(&text).map_err(|e| format!("not a valid NCP profile: {e}"))?;
+
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| {
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .ok_or("the file needs a name")?;
+
+    std::fs::create_dir_all(&state.profile_dir).map_err(|e| e.to_string())?;
+    let dest = state.profile_dir.join(format!("{stem}.ini"));
+    // Don't silently overwrite a different existing profile.
+    if dest.exists() && std::fs::canonicalize(&dest).ok() != std::fs::canonicalize(src).ok() {
+        return Err(format!("a profile named \"{stem}\" already exists"));
+    }
+    std::fs::write(&dest, text).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+    Ok(stem)
+}
+
 /// Connect the profile identified by `id`. Production (locked) profiles
 /// require an explicit `gateway_override` so the operator can't accidentally
 /// dial the production gateway.
@@ -237,36 +291,26 @@ pub fn connect(
     Ok(outcome)
 }
 
-/// Configure DNS for an established tunnel and note the result in the connect
-/// log. Needs the tunnel's virtual IP to find the interface, so it reads it
-/// back from charon's SA list.
+/// Configure DNS for an established tunnel (via an NRPT rule) and note the
+/// result in the connect log. Best-effort: a DNS failure doesn't fail the
+/// connect.
 fn apply_dns(
-    state: &AppState,
+    _state: &AppState,
     name: &str,
     dns: &vpn_core::DnsConfig,
     outcome: &mut vpn_control::ConnectOutcome,
 ) {
-    let mut note = |msg: String, bad: bool| {
-        outcome.log.push(vpn_control::LogLine {
-            group: "DNS".to_string(),
-            level: if bad { 1 } else { 2 },
-            ikesa: Some(name.to_string()),
-            msg,
-        });
+    let (msg, bad) = match crate::dns::apply(name, &dns.servers, dns.domain.as_deref()) {
+        Ok(summary) if !summary.is_empty() => (summary, false),
+        Ok(_) => return,
+        Err(e) => (format!("DNS setup failed: {e}"), true),
     };
-    let vip = vpn_control::status(&state.transport)
-        .ok()
-        .and_then(|sas| sas.into_iter().find(|s| s.name == name))
-        .and_then(|s| s.virtual_ips.into_iter().next());
-    let Some(vip) = vip else {
-        note("no virtual IP assigned; skipping DNS setup".to_string(), true);
-        return;
-    };
-    match crate::dns::apply(name, &dns.servers, dns.domain.as_deref(), &vip) {
-        Ok(summary) if !summary.is_empty() => note(summary, false),
-        Ok(_) => {}
-        Err(e) => note(format!("DNS setup failed: {e}"), true),
-    }
+    outcome.log.push(vpn_control::LogLine {
+        group: "DNS".to_string(),
+        level: if bad { 1 } else { 2 },
+        ikesa: Some(name.to_string()),
+        msg,
+    });
 }
 
 /// Copy a profile's PSK from its `.ini` into the OS keychain.
