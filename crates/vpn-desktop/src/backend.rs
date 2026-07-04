@@ -113,7 +113,6 @@ pub struct ProfileSummary {
     pub auth: String,
     pub virtual_ip_requested: bool,
     pub warnings: Vec<WarnItem>,
-    pub locked: bool,
     /// Whether the PSK for this profile is saved in the OS keychain.
     pub stored: bool,
     /// DNS servers used over the tunnel (from the profile), if any.
@@ -122,13 +121,12 @@ pub struct ProfileSummary {
     pub dns_domain: Option<String>,
 }
 
-/// A gateway that is a bare private IP is treated as a lab/test target; an
-/// FQDN (or public IP) is treated as production and locked against an
-/// accidental connect without an explicit override.
-fn classify(gateway: &str) -> (&'static str, bool) {
+/// A purely informational label for the profile list: a bare private IP reads
+/// as a lab/test target, an FQDN or public IP as production.
+fn classify(gateway: &str) -> &'static str {
     match gateway.parse::<Ipv4Addr>() {
-        Ok(ip) if ip.is_private() || ip.is_loopback() => ("lab", false),
-        _ => ("prod", true),
+        Ok(ip) if ip.is_private() || ip.is_loopback() => "lab",
+        _ => "prod",
     }
 }
 
@@ -160,12 +158,11 @@ fn summarize(
     config: &vpn_core::ConnectionConfig,
     warnings: &[ncp_profile::ImportWarning],
 ) -> ProfileSummary {
-    let (kind, locked) = classify(&config.gateway);
     ProfileSummary {
         id: id.to_string(),
         name: config.name.clone(),
         gateway: config.gateway.clone(),
-        kind: kind.to_string(),
+        kind: classify(&config.gateway).to_string(),
         local_id: config.local_id.clone(),
         remote: config.remote_subnets.iter().map(|n| n.to_string()).collect(),
         ike: config.ike_proposal(),
@@ -174,7 +171,6 @@ fn summarize(
         auth: "psk".to_string(),
         virtual_ip_requested: config.request_virtual_ip,
         warnings: warnings.iter().map(|w| to_warn_item(&w.to_string())).collect(),
-        locked,
         stored: crate::creds::has(id),
         dns: config.dns.servers.iter().map(|s| s.to_string()).collect(),
         dns_domain: config.dns.domain.clone(),
@@ -252,26 +248,12 @@ pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Resu
     Ok(stem)
 }
 
-/// Connect the profile identified by `id`. Production (locked) profiles
-/// require an explicit `gateway_override` so the operator can't accidentally
-/// dial the production gateway.
+/// Connect the profile identified by `id` to the gateway it names.
 pub fn connect(
     state: &AppState,
     id: String,
-    gateway_override: Option<String>,
 ) -> std::result::Result<vpn_control::ConnectOutcome, String> {
     let mut imported = load(&profile_path(state, &id))?;
-    let (_, locked) = classify(&imported.config.gateway);
-    match &gateway_override {
-        Some(gw) if !gw.trim().is_empty() => imported.config.gateway = gw.trim().to_string(),
-        _ if locked => {
-            return Err(format!(
-                "{} is a production gateway; provide a gateway override to connect to a lab responder instead.",
-                imported.config.gateway
-            ));
-        }
-        _ => {}
-    }
     // Prefer a PSK saved in the OS keychain over the one parsed from the
     // (plaintext-on-disk) .ini, so saved credentials are what actually
     // authenticate the tunnel.

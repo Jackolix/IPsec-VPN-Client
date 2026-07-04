@@ -62,12 +62,9 @@ async fn import_profile_dialog(
 async fn connect(
     state: tauri::State<'_, AppState>,
     id: String,
-    gateway_override: Option<String>,
 ) -> Result<ConnectOutcome, String> {
     let s = state.inner().clone();
-    match tauri::async_runtime::spawn_blocking(move || backend::connect(&s, id, gateway_override))
-        .await
-    {
+    match tauri::async_runtime::spawn_blocking(move || backend::connect(&s, id)).await {
         Ok(result) => result,
         Err(e) => Err(e.to_string()),
     }
@@ -154,12 +151,8 @@ fn selftest() {
 fn dev(args: &[String]) {
     let state = AppState::from_env();
     let result: std::result::Result<String, String> = match args.first().map(String::as_str) {
-        Some("connect") => {
-            let id = args.get(1).cloned().unwrap_or_default();
-            let gw = args.get(2).cloned();
-            backend::connect(&state, id, gw)
-                .map(|o| serde_json::to_string(&o).expect("serialize outcome"))
-        }
+        Some("connect") => backend::connect(&state, args.get(1).cloned().unwrap_or_default())
+            .map(|o| serde_json::to_string(&o).expect("serialize outcome")),
         Some("disconnect") => backend::disconnect(&state, args.get(1).cloned().unwrap_or_default())
             .map(|_| "disconnected".to_string()),
         Some("daemon-status") => Ok(if backend::daemon_running(&state) {

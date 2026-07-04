@@ -158,11 +158,6 @@
   .btn-sm { padding: 5px 12px; font-size: var(--fs-xs); border-radius: 7px; }
 
   /* gateway-override modal field */
-  .gw-field { display: block; margin-top: 16px; }
-  .gw-field > span { display: block; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin-bottom: 7px; }
-  .gw-input { width: 100%; box-sizing: border-box; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font-family: var(--mono); font-size: var(--fs-md); letter-spacing: .02em; }
-  .gw-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-  .gw-err { min-height: 15px; margin-top: 9px; color: var(--crit); font-family: var(--mono); font-size: var(--fs-xs); }
   /* Drag-and-drop import overlay */
   #dropzone { position: fixed; inset: 0; z-index: 50; display: none; align-items: center; justify-content: center;
     background: rgba(10,12,16,.72); backdrop-filter: blur(2px); pointer-events: none; }
@@ -242,22 +237,6 @@
 
 <div id="dropzone"><div class="dz-card">Drop NCP <b>.ini</b> profile to import<span>it's copied into your profiles folder</span></div></div>
 
-<div class="overlay" id="ov-gw">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="gw-title">
-    <h3 id="gw-title" class="mono">Gateway override</h3>
-    <div class="mbody">
-      <b id="gw-profile" class="mono">This profile</b> targets a production gateway
-      (<code id="gw-prod">—</code>). The production gateway is never contacted — enter the
-      address of a lab responder to connect to instead.
-      <label class="gw-field"><span>Lab responder (IPv4)</span>
-        <input id="gw-input" class="gw-input" type="text" inputmode="decimal" placeholder="192.168.100.10" autocomplete="off" spellcheck="false" />
-      </label>
-      <div id="gw-err" class="gw-err" role="alert"></div>
-    </div>
-    <div class="mfoot"><button class="btn btn-ghost" id="gw-cancel">Cancel</button><button class="btn btn-primary" id="gw-connect">Connect to lab</button></div>
-  </div>
-</div>
-
 <script>
 (function () {
   "use strict";
@@ -275,7 +254,7 @@
 
   // Demo data used only when the page is opened outside the Tauri shell.
   var DEMO = [
-    { id: "test1", name: "vRouter-TEST-1", kind: "test", gateway: "192.168.100.10", locked: false,
+    { id: "test1", name: "vRouter-TEST-1", kind: "test", gateway: "192.168.100.10",
       localId: "test-1@test.local", remote: "10.0.0.0/24", vip: "10.0.0.15",
       ike: "aes256-sha256-prfsha256-modp3072", esp: "aes256-sha256", pfs: "modp3072", confirmed: true,
       warns: [
@@ -283,7 +262,7 @@
         { lvl: "ignored", t: "ConnMedia=21", n: "not interpreted yet — ignored" },
         { lvl: "ignored", t: "SeamRoaming=1", n: "not interpreted yet — ignored" }
       ] },
-    { id: "efa", name: "EFA_MDT_42", kind: "prod", gateway: "gateway.example.test", locked: true,
+    { id: "efa", name: "EFA_MDT_42", kind: "prod", gateway: "gateway.example.test",
       localId: "efa_mdt_42", remote: "10.102.15.0/24", vip: "—",
       ike: "aes256-sha256-prfsha256-modp3072", esp: "aes256-sha256", pfs: "modp3072", confirmed: true,
       warns: [{ lvl: "medium", t: "IkeIdType=3 interpreted as USER_FQDN", n: "unconfirmed mapping — verify on first connect" }] }
@@ -307,7 +286,6 @@
       vip: "—",
       ike: s.ike, esp: s.esp, pfs: s.pfs || null,
       confirmed: s.kind !== "prod",
-      locked: s.locked,
       stored: !!s.stored,
       dns: (s.dns && s.dns.length) ? s.dns.join(", ") : null,
       dnsDomain: s.dns_domain || null,
@@ -404,7 +382,6 @@
   function setAction() {
     var st = state[current.id], btn = $("action");
     btn.disabled = false;
-    if (current.locked && st === "disconnected") { btn.className = "btn btn-warn"; btn.textContent = "Override…"; return; }
     if (st === "disconnected") { btn.className = "btn btn-primary"; btn.textContent = "Connect"; }
     else if (st === "connecting") { btn.className = "btn btn-ghost"; btn.textContent = "Cancel"; }
     else { btn.className = "btn btn-ghost"; btn.textContent = "Disconnect"; }
@@ -469,23 +446,6 @@
     }
   }
 
-  /* ---------- gateway-override dialog ---------- */
-  function openGatewayDialog() {
-    $("gw-profile").textContent = current.name;
-    $("gw-prod").textContent = current.gateway;
-    $("gw-input").value = ""; $("gw-err").textContent = "";
-    $("ov-gw").classList.add("show");
-    setTimeout(function () { $("gw-input").focus(); }, 30);
-  }
-  function submitGateway() {
-    var v = $("gw-input").value.trim();
-    var ok = /^(\d{1,3})(\.\d{1,3}){3}$/.test(v) && v.split(".").every(function (o) { return +o <= 255; });
-    if (!ok) { $("gw-err").textContent = "Enter a valid IPv4 address, e.g. 192.168.100.10"; return; }
-    $("ov-gw").classList.remove("show");
-    state[current.id] = "connecting"; setPill(); setAction(); renderList();
-    realConnect(current, v);
-  }
-
   function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 
   /* ---------- notice ---------- */
@@ -543,18 +503,16 @@
       log(sys, l.msg, logSeverity(l.msg));
     });
   }
-  async function realConnect(p, gatewayOverride) {
-    var target = gatewayOverride || p.gateway;
+  async function realConnect(p) {
     if (!(await ensureDaemon())) {
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       return;
     }
-    if (gatewayOverride) { log("KNL", "gateway override → " + gatewayOverride + " (production " + p.gateway + " not contacted)", "good"); }
     log("KNL", "load-conn + load-shared via vici (" + (p.stored ? "PSK from " + KEYSTORE : "PSK held in memory") + ")");
-    log("IKE", "initiating IKE_SA " + p.name + " to " + target);
+    log("IKE", "initiating IKE_SA " + p.name + " to " + p.gateway);
     var out;
     try {
-      out = await TAURI.invoke("connect", { id: p.id, gatewayOverride: gatewayOverride || null });
+      out = await TAURI.invoke("connect", { id: p.id });
     } catch (e) {
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       log("IKE", String(e), "bad");
@@ -717,11 +675,6 @@
   /* ---------- action button ---------- */
   function onAction() {
     var st = state[current.id];
-    if (current.locked && st === "disconnected") {
-      if (TAURI) { openGatewayDialog(); }
-      else { showNotice('<span class="led warn" style="box-shadow:none"></span><div><b>' + esc(current.gateway) + '</b> is a production gateway. Connecting requires an explicit gateway override — point it at a lab responder first.</div>', ""); }
-      return;
-    }
     if (st === "disconnected") {
       state[current.id] = "connecting"; setPill(); setAction(); renderList();
       if (TAURI) { realConnect(current); } else { demoConnect(current); }
@@ -766,11 +719,7 @@
   $("modal-cancel").addEventListener("click", function () { $("overlay").classList.remove("show"); });
   $("modal-refresh").addEventListener("click", function () { $("overlay").classList.remove("show"); refresh(); });
   $("overlay").addEventListener("click", function (e) { if (e.target === $("overlay")) { $("overlay").classList.remove("show"); } });
-  $("gw-cancel").addEventListener("click", function () { $("ov-gw").classList.remove("show"); });
-  $("gw-connect").addEventListener("click", submitGateway);
-  $("ov-gw").addEventListener("click", function (e) { if (e.target === $("ov-gw")) { $("ov-gw").classList.remove("show"); } });
-  $("gw-input").addEventListener("keydown", function (e) { if (e.key === "Enter") { submitGateway(); } });
-  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { $("overlay").classList.remove("show"); $("ov-gw").classList.remove("show"); } });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { $("overlay").classList.remove("show"); } });
   window.addEventListener("resize", drawSpark);
 
   // Native events from the Rust side: drag-and-drop highlight + import refresh.
