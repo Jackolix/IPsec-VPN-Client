@@ -93,8 +93,18 @@ Windows).
   elevates the bundled `charon-svc.exe` directly (no config file needed - it
   runs on defaults) and is self-contained; `daemon.rs` resolves it from the
   bundle next to the exe, falling back to `out/strongswan-windows` for dev.
-  Build the daemon (`build-strongswan-windows.ps1`) before `tauri build`. Still
-  open: a signed installer.
+  Build the daemon (`build-strongswan-windows.ps1`) before `tauri build`.
+- **DPD / auto-reconnect (done 2026-07-04)**: `vpn-core::DpdConfig` (default:
+  probe every 30s, auto-reconnect on) rides on `ConnectionConfig`; the vici
+  bridge emits `dpd_delay` on the IKE_SA and `dpd_action`/`close_action =
+  restart` on the CHILD_SA, so charon re-establishes the tunnel by itself after
+  a dead peer, reboot or link flap. Verified live vs the LANCOM: blocking the
+  gateway dropped the SA at ~t+36s (DPD), and unblocking it reconnected within
+  seconds with no app involvement.
+- Release automation: `.github/workflows/release.yml` builds everything on a
+  `v*` tag — a Linux job cross-builds charon-svc (Docker/MinGW) and a Windows
+  job bundles it into the Tauri installer and publishes the installer + CLIs to
+  a GitHub Release. Still open: a *signed* installer (avoids SmartScreen).
 - **Phase 5**: hardening — DPD/reconnect, network roaming, split vs full
   tunnel, log redaction layer, auto-update, signing/notarization, interop
   matrix.
