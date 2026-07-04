@@ -68,16 +68,23 @@ DH group 15 / modp3072).
 # 1. Cross-build charon-svc.exe + plugins (Docker + MinGW) and export to out\:
 .\scripts\build-strongswan-windows.ps1
 
-# 2. Launch the daemon ELEVATED (WFP needs Administrator). vici on 127.0.0.1:4502:
-.\scripts\run-charon-windows.ps1        # accepts -Install / -Uninstall for a service
+# 2a. Desktop app against the native backend (no container). The app starts
+#     charon-svc itself - hit Connect (or the sidebar Start button) and approve
+#     the UAC prompt; the GUI runs unelevated and talks to vici on loopback:
+.\scripts\run-desktop-native.ps1
 
-# 3. Drive it from a normal (non-elevated) shell - loopback vici needs no elevation:
+# 2b. …or drive it from the CLI. Launch the daemon ELEVATED (WFP needs
+#     Administrator; vici on 127.0.0.1:4502) and drive it unelevated:
+.\scripts\run-charon-windows.ps1        # accepts -Install / -Uninstall for a service
 cargo run -p vpn-agent -- --tcp 127.0.0.1:4502 connect --profile .\TEST-1.ini --gateway-override 192.168.100.10
 cargo run -p vpn-agent -- --tcp 127.0.0.1:4502 status
 ```
 
-Verified against the LANCOM: IKEv2/PSK/modp3072 negotiated, virtual IP and
-route installed on a host adapter (WFP + IP Helper), ESP data plane live.
+The desktop app spawns/stops the native daemon over UAC (`start_daemon` /
+`stop_daemon` commands; `daemon.rs`) and otherwise drives it exactly like the
+container backend. Verified against the LANCOM: IKEv2/PSK/modp3072 negotiated,
+virtual IP and route installed on a host adapter (WFP + IP Helper), ESP data
+plane live.
 
 If the app icons are ever regenerated: `powershell.exe -File scripts\gen-icons.ps1`.
 

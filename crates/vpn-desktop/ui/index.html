@@ -63,6 +63,8 @@
   .tag.prod { color: var(--warn); border-color: rgba(217,165,49,.4); background: var(--warn-soft); }
   .tag.test { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
   .side-foot { padding: 11px 16px; border-top: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); display: flex; align-items: center; gap: 7px; }
+  #daemon-btn { margin-left: auto; }
+  #daemon-btn.busy { opacity: .6; pointer-events: none; }
 
   .main { min-height: 0; display: flex; flex-direction: column; }
   .main-scroll { overflow-y: auto; padding: 20px 22px 22px; display: flex; flex-direction: column; gap: 16px; }
@@ -178,7 +180,7 @@
     <aside class="sidebar">
       <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import .ini</button></div>
       <ul class="profiles" id="profile-list"></ul>
-      <div class="side-foot"><span id="foot-led" class="led"></span><span id="foot-text">connecting to vici…</span></div>
+      <div class="side-foot"><span id="foot-led" class="led"></span><span id="foot-text">connecting to vici…</span><button id="daemon-btn" class="btn-sm" style="display:none">Start</button></div>
     </aside>
 
     <section class="main">
@@ -257,7 +259,8 @@
   function sanitize(n) { var o = (n || "").replace(/[^A-Za-z0-9_-]/g, "_"); return o.length ? o : "conn"; }
 
   // Name the OS credential store per platform, for user-facing copy.
-  var KEYSTORE = /Windows/.test(navigator.userAgent) ? "Windows Credential Manager"
+  var IS_WIN = /Windows/.test(navigator.userAgent);
+  var KEYSTORE = IS_WIN ? "Windows Credential Manager"
     : /Mac/.test(navigator.userAgent) ? "the macOS Keychain"
     : "the OS keychain";
 
@@ -526,6 +529,10 @@
   }
   async function realConnect(p, gatewayOverride) {
     var target = gatewayOverride || p.gateway;
+    if (!(await ensureDaemon())) {
+      state[p.id] = "disconnected"; setPill(); setAction(); renderList();
+      return;
+    }
     if (gatewayOverride) { log("KNL", "gateway override → " + gatewayOverride + " (production " + p.gateway + " not contacted)", "good"); }
     log("KNL", "load-conn + load-shared via vici (" + (p.stored ? "PSK from " + KEYSTORE : "PSK held in memory") + ")");
     log("IKE", "initiating IKE_SA " + p.name + " to " + target);
@@ -591,6 +598,67 @@
     state[p.id] = "disconnected";
     setPill(); setAction(); renderList(); renderTiles();
     log("NET", "virtual IP released, CHILD_SA removed");
+  }
+
+  /* ---------- native backend (charon-svc) lifecycle ---------- */
+  // On Windows the app spawns strongSwan's native charon-svc itself (it needs
+  // Administrator for the Windows Filtering Platform, hence a UAC prompt); the
+  // Linux dev container manages its own charon, so the button is Windows-only.
+  var daemonUp = false, daemonBusy = false;
+  var DAEMON_UI = TAURI && IS_WIN;
+
+  function renderDaemon() {
+    $("foot-led").className = "led" + (!TAURI ? "" : daemonUp ? " ok" : " warn");
+    $("foot-text").textContent = !TAURI ? "preview (no backend)"
+      : daemonUp ? "charon · vici" : "backend stopped";
+    var btn = $("daemon-btn");
+    if (!DAEMON_UI) { btn.style.display = "none"; return; }
+    btn.style.display = "";
+    btn.textContent = daemonBusy ? "…" : daemonUp ? "Stop" : "Start";
+    btn.className = "btn-sm" + (daemonBusy ? " busy" : "");
+    btn.title = daemonUp ? "Stop charon-svc (elevation prompt)"
+      : "Start charon-svc on this host (elevation prompt)";
+  }
+
+  async function refreshDaemon() {
+    if (!TAURI) { renderDaemon(); return; }
+    try { daemonUp = await TAURI.invoke("daemon_running"); } catch (e) { daemonUp = false; }
+    renderDaemon();
+  }
+
+  // Make sure the backend is up before a connect. Returns true if reachable.
+  async function ensureDaemon() {
+    if (!TAURI) { return true; }
+    await refreshDaemon();
+    if (daemonUp || !IS_WIN) { return daemonUp || !IS_WIN; }
+    log("KNL", "starting native backend charon-svc — approve the elevation prompt", "");
+    daemonBusy = true; renderDaemon();
+    try {
+      await TAURI.invoke("start_daemon");
+      daemonUp = true;
+      log("KNL", "charon-svc up; vici ready on the host", "good");
+    } catch (e) {
+      log("KNL", "backend did not start: " + String(e), "bad");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>Native backend didn\'t start: ' + esc(String(e)) + "</div>", "bad");
+    } finally { daemonBusy = false; renderDaemon(); }
+    return daemonUp;
+  }
+
+  async function onDaemonBtn() {
+    if (daemonBusy) { return; }
+    daemonBusy = true; renderDaemon();
+    try {
+      if (daemonUp) {
+        await TAURI.invoke("stop_daemon"); daemonUp = false;
+        log("KNL", "charon-svc stopped", "");
+      } else {
+        await TAURI.invoke("start_daemon"); daemonUp = true;
+        log("KNL", "charon-svc up; vici ready on the host", "good");
+      }
+    } catch (e) {
+      log("KNL", String(e), "bad");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+    } finally { daemonBusy = false; renderDaemon(); }
   }
 
   /* ---------- lifecycle: demo (no backend) ---------- */
@@ -660,6 +728,7 @@
   }
 
   $("action").addEventListener("click", onAction);
+  $("daemon-btn").addEventListener("click", onDaemonBtn);
   $("clear-log").addEventListener("click", clearLog);
   $("import-btn").addEventListener("click", function () { $("overlay").classList.add("show"); });
   $("modal-cancel").addEventListener("click", function () { $("overlay").classList.remove("show"); });
@@ -672,8 +741,10 @@
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") { $("overlay").classList.remove("show"); $("ov-gw").classList.remove("show"); } });
   window.addEventListener("resize", drawSpark);
 
-  $("foot-led").className = "led" + (TAURI ? " ok" : "");
-  $("foot-text").textContent = TAURI ? "charon · vici" : "preview (no backend)";
+  renderDaemon();
+  refreshDaemon();
+  // Keep the backend indicator live (it can be started/stopped out-of-band).
+  if (TAURI) { setInterval(function () { if (!daemonBusy) { refreshDaemon(); } }, 4000); }
 
   refresh();
 })();
