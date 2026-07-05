@@ -58,12 +58,10 @@ jobs:
         shell: pwsh
         run: Get-ChildItem out\strongswan-windows
 
-      - name: Run tests
-        run: cargo test --workspace --release
-
-      - name: Build CLI binaries
-        run: cargo build --release -p vpn-agent -p vpn-cli
-
+      # vpn-desktop's build.rs (tauri_build::build()) validates that the
+      # "../../out/broker/*" resource glob in tauri.windows.conf.json
+      # resolves to real files, so out/broker must exist before *any* build
+      # of the workspace (including `cargo test`) touches that crate.
       - name: Build + stage the privileged broker service
         shell: pwsh
         run: |
@@ -71,6 +69,12 @@ jobs:
           New-Item -ItemType Directory -Force out\broker | Out-Null
           Copy-Item target\release\vpn-broker.exe out\broker\ -Force
           Get-ChildItem out\broker
+
+      - name: Run tests
+        run: cargo test --workspace --release
+
+      - name: Build CLI binaries
+        run: cargo build --release -p vpn-agent -p vpn-cli
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0" --locked
