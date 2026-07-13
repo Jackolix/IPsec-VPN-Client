@@ -1,14 +1,16 @@
 //! Lifecycle control for the native Windows strongSwan daemon
-//! (`charon-svc.exe`). Unlike the Linux dev container, the daemon terminates
-//! the tunnel on the Windows host via the Windows Filtering Platform, which
-//! needs Administrator rights — so the GUI (which runs unelevated) launches it
-//! through a UAC prompt and talks to it over loopback vici afterwards.
+//! (`charon-svc.exe`). Unlike the Linux dev container, the daemon terminates the
+//! tunnel on the Windows host itself: it does ESP in userland over a Wintun
+//! adapter it creates, and installs the virtual IP and routes on that adapter.
+//! All of that needs Administrator rights — so the GUI (which runs unelevated)
+//! launches it through a UAC prompt and talks to it over loopback vici
+//! afterwards.
 //!
-//! `charon-svc.exe` and its DLLs are shipped as bundled app resources (see
-//! `tauri.conf.json` `bundle.resources`), so the app is self-contained. We
-//! elevate `charon-svc.exe` directly with its own directory as the working
-//! directory (so it finds its sibling DLLs); it comes up on its default vici
-//! port with routing/virtual-IP install on by default — no config file needed.
+//! `charon-svc.exe` and its DLLs (including `wintun.dll`, which carries the
+//! signed driver, and `libipsec-0.dll`) are shipped as bundled app resources
+//! (see `tauri.conf.json` `bundle.resources`), so the app is self-contained. We
+//! elevate `charon-svc.exe` with its own directory as the working directory, so
+//! the sibling DLLs resolve.
 
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -144,8 +146,8 @@ pub fn start(addr: &str) -> Result<(), String> {
         return Err("elevation was declined or failed (UAC)".to_string());
     }
 
-    // Wait for WFP init + vici bind (the time spent at the UAC prompt is
-    // already elapsed above).
+    // Wait for the Wintun adapter to come up + vici to bind (the time spent at
+    // the UAC prompt is already elapsed above).
     let deadline = Instant::now() + Duration::from_secs(40);
     while Instant::now() < deadline {
         if is_running(addr) {
