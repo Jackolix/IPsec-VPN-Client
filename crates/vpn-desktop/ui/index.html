@@ -125,6 +125,7 @@
   .log-empty { color: var(--faint); }
 
   .notice { display: none; align-items: center; gap: 10px; padding: 11px 14px; border-radius: var(--r); background: var(--warn-soft); border: 1px solid rgba(217,165,49,.4); color: #e7c579; font-size: var(--fs-sm); }
+  #c-msg.notice { padding: 8px 14px; }
   .notice.show { display: flex; }
   .notice.ok { background: var(--ok-soft); border-color: rgba(70,194,102,.4); color: #a9e2ba; }
   .notice.bad { background: var(--crit-soft); border-color: rgba(240,96,58,.4); color: #f0a996; }
@@ -176,10 +177,10 @@
   body.compact .brand span { display: none; }
   .compact-view { display: none; }
   body.compact .body { display: none; }
-  body.compact .compact-view { display: flex; flex: 1; min-height: 0; align-items: center; justify-content: center; padding: 22px; }
+  body.compact .compact-view { display: flex; flex: 1; min-height: 0; align-items: center; justify-content: center; padding: 14px; overflow-y: auto; }
   .cpanel {
     width: min(400px, 100%); background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
-    padding: 18px 20px 20px; display: flex; flex-direction: column; gap: 13px;
+    padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 9px;
     box-shadow: 0 24px 64px -28px rgba(0,0,0,.75);
   }
   .cpanel-head { display: flex; align-items: center; gap: 10px; }
@@ -188,14 +189,14 @@
   .cstatus { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
   .compact-select {
     width: 100%; font-family: var(--mono); font-size: var(--fs-base); color: var(--text);
-    background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; cursor: pointer;
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; padding: 7px 11px; cursor: pointer;
   }
   .compact-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .cident { display: flex; flex-direction: column; gap: 3px; }
+  .cident { display: flex; flex-direction: column; gap: 2px; }
   .cname { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.01em; word-break: break-word; }
   .cgw { font-size: var(--fs-sm); color: var(--muted); word-break: break-all; }
   .cmeta { font-size: var(--fs-sm); color: var(--faint); font-variant-numeric: tabular-nums; }
-  .cbig { width: 100%; padding: 13px; font-size: var(--fs-md); }
+  .cbig { width: 100%; padding: 11px; font-size: var(--fs-md); }
   #c-msg { margin: 0; }
 </style>
 </head>
@@ -521,8 +522,13 @@
       var dpi = window.__TAURI__ && window.__TAURI__.dpi;
       if (!wapi || !dpi || !wapi.getCurrentWindow || !dpi.LogicalSize) { return; }
       var win = wapi.getCurrentWindow();
-      var size = compact ? new dpi.LogicalSize(400, 440) : new dpi.LogicalSize(1180, 840);
-      Promise.resolve(win.setSize(size)).catch(function () {});
+      // tauri.conf.json's minHeight (520) is sized for the full dashboard and
+      // would otherwise clamp the compact window back up on every resize.
+      var minSize = compact ? new dpi.LogicalSize(360, 300) : new dpi.LogicalSize(380, 520);
+      var size = compact ? new dpi.LogicalSize(400, 350) : new dpi.LogicalSize(1180, 840);
+      Promise.resolve(win.setMinSize(minSize)).catch(function () {}).then(function () {
+        return win.setSize(size);
+      }).catch(function () {});
     } catch (e) {}
   }
 
