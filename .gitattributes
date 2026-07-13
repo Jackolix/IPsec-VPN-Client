@@ -1,2 +1,7 @@
 # Shell scripts run inside Linux containers and must stay LF on Windows checkouts.
 *.sh text eol=lf
+
+# So do the strongSwan patches and the Dockerfiles that apply them: with CRLF
+# context lines, patch(1) in the build container rejects every hunk.
+*.patch text eol=lf
+Dockerfile text eol=lf

@@ -20,15 +20,22 @@ this plugin already uses for routes in manage_route():
   del_ip  -> DeleteUnicastIpAddressEntry(), located by scanning the address table
              (del_ip gets no interface name, only the address)
 
+add_ip also honours `install_virtual_ip_on`. ike_sa.c always passes the
+interface the *outer* address sits on, which is right for a kernel datapath but
+wrong for a userland one: kernel-libipsec needs the address on its TUN device,
+and points that setting at it. The setting is not applied centrally -- every
+networking backend applies it itself, as kernel-netlink does.
+
 The address is installed with SkipAsSource = FALSE so Windows will actually
 source tunnelled traffic from it. Windows runs duplicate-address detection on a
 newly added address, leaving it Tentative for a moment — during which ICMP still
 flows from it but no socket can bind to it — so callers must wait for it to
 become preferred before declaring the tunnel usable.
 
---- a/src/libcharon/plugins/kernel_iph/kernel_iph_net.c
-+++ b/src/libcharon/plugins/kernel_iph/kernel_iph_net.c
-@@ -609,18 +609,130 @@
+diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c
+--- orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2023-03-27 21:00:49.000000000 +0000
++++ work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-07-13 15:06:42.150151828 +0000
+@@ -609,18 +609,145 @@
  	return NULL;
  }
  
@@ -65,16 +72,31 @@ become preferred before declaring the tunnel usable.
 +	MIB_UNICASTIPADDRESS_ROW row;
 +	DWORD ifindex;
 +	ULONG ret;
++	char *iface;
 +
-+	if (!iface_name)
++	/* charon hands us the interface its outer address sits on, which is what a
++	 * kernel datapath wants. A userland one (kernel-libipsec) instead needs the
++	 * address on its own TUN device, and points this setting at it. ike_sa.c
++	 * does not apply the setting, every networking backend has to do it itself
++	 * -- kernel-netlink does the same thing here. */
++	iface = lib->settings->get_str(lib->settings, "%s.install_virtual_ip_on",
++								   iface_name, lib->ns);
++	if (!iface)
 +	{
 +		return NOT_SUPPORTED;
 +	}
-+	ifindex = find_ifindex(this, iface_name);
++	ifindex = find_ifindex(this, iface);
++	if (!ifindex && iface_name && !streq(iface, iface_name))
++	{	/* the configured device is gone, use the one charon picked */
++		DBG1(DBG_KNL, "interface '%s' not found, installing %H on '%s' instead",
++			 iface, virtual_ip, iface_name);
++		iface = iface_name;
++		ifindex = find_ifindex(this, iface);
++	}
 +	if (!ifindex)
 +	{
 +		DBG1(DBG_KNL, "interface '%s' not found, unable to install %H",
-+			 iface_name, virtual_ip);
++			 iface, virtual_ip);
 +		return NOT_FOUND;
 +	}
 +	if (prefix == -1)
@@ -98,11 +120,11 @@ become preferred before declaring the tunnel usable.
 +	if (ret != NO_ERROR)
 +	{
 +		DBG1(DBG_KNL, "adding virtual IP %H on '%s' failed: 0x%08lx",
-+			 virtual_ip, iface_name, ret);
++			 virtual_ip, iface, ret);
 +		return FAILED;
 +	}
 +	DBG2(DBG_KNL, "installed virtual IP %H/%d on '%s' (interface %lu)",
-+		 virtual_ip, prefix, iface_name, ifindex);
++		 virtual_ip, prefix, iface, ifindex);
 +	return SUCCESS;
  }
  
