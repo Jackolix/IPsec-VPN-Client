@@ -31,13 +31,13 @@
     display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 16px;
     background: linear-gradient(180deg,#16212f,#121b27); border-bottom: 1px solid var(--line-soft); flex: 0 0 auto;
   }
-  .brand { display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: var(--fs-sm); letter-spacing: .04em; }
-  .brand .glyph { width: 20px; height: 20px; display: grid; place-items: center; color: var(--accent); }
-  .brand b { font-weight: 600; } .brand span { color: var(--faint); }
+  .brand { display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: var(--fs-sm); letter-spacing: .04em; min-width: 0; }
+  .brand .glyph { width: 20px; height: 20px; display: grid; place-items: center; color: var(--accent); flex: 0 0 auto; }
+  .brand b { font-weight: 600; white-space: nowrap; } .brand span { color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .titlebar .spacer { flex: 1; }
   .global-status {
     display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs);
-    letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+    letter-spacing: .08em; text-transform: uppercase; color: var(--muted); white-space: nowrap; flex: 0 0 auto;
     padding: 5px 11px 5px 9px; border: 1px solid var(--line); border-radius: 999px; background: rgba(0,0,0,.18);
   }
   .led { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
@@ -173,6 +173,7 @@
   .view-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   /* compact view: hidden until body.compact; then it replaces the dashboard */
+  body.compact .brand span { display: none; }
   .compact-view { display: none; }
   body.compact .body { display: none; }
   body.compact .compact-view { display: flex; flex: 1; min-height: 0; align-items: center; justify-content: center; padding: 22px; }
@@ -520,7 +521,7 @@
       var dpi = window.__TAURI__ && window.__TAURI__.dpi;
       if (!wapi || !dpi || !wapi.getCurrentWindow || !dpi.LogicalSize) { return; }
       var win = wapi.getCurrentWindow();
-      var size = compact ? new dpi.LogicalSize(400, 560) : new dpi.LogicalSize(1180, 840);
+      var size = compact ? new dpi.LogicalSize(400, 440) : new dpi.LogicalSize(1180, 840);
       Promise.resolve(win.setSize(size)).catch(function () {});
     } catch (e) {}
   }
