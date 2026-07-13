@@ -164,6 +164,33 @@
     font-family: var(--mono); font-size: var(--fs-md); color: var(--text); text-align: center; box-shadow: 0 0 0 6px var(--accent-soft); }
   #dropzone .dz-card span { display: block; margin-top: 6px; font-size: var(--fs-xs); color: var(--muted); }
 
+  /* edit-parameters dialog */
+  .modal.wide { width: min(720px,100%); }
+  .modal .mbody.form { max-height: min(62vh,560px); overflow-y: auto; color: var(--text); }
+  .fgroup { border: 0; margin: 0 0 16px; padding: 0; }
+  .fgroup:last-child { margin-bottom: 0; }
+  .fgroup > legend { padding: 0 0 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+  .fgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+  .fgrid.four { grid-template-columns: repeat(4,1fr); }
+  .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .field.wide { grid-column: 1 / -1; }
+  .field > label { font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .06em; text-transform: uppercase; color: var(--faint); display: flex; align-items: center; gap: 6px; }
+  .field.edited > label { color: var(--accent); }
+  .field.edited > label::after { content: "modified"; font-size: 9.5px; letter-spacing: .05em; padding: 1px 5px; border-radius: 5px; border: 1px solid var(--accent-line); background: var(--accent-soft); }
+  .field input[type=text], .field input[type=number], .field input[type=password], .field select, .field textarea {
+    font-family: var(--mono); font-size: var(--fs-sm); color: var(--text); background: var(--surface-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; width: 100%;
+  }
+  .field textarea { resize: vertical; min-height: 62px; line-height: 1.6; }
+  .field input:focus-visible, .field select:focus-visible, .field textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .field .hint { font-size: var(--fs-xs); color: var(--faint); line-height: 1.45; }
+  .check { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-sm); color: var(--text); padding-top: 4px; }
+  .check input { accent-color: var(--accent); width: 15px; height: 15px; }
+  .modal .mfoot .spacer { flex: 1; }
+  #edit-err { display: none; margin: 0 18px 14px; }
+  #edit-err.show { display: flex; }
+  .edited-badge { font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .06em; color: var(--accent); border: 1px solid var(--accent-line); background: var(--accent-soft); border-radius: 999px; padding: 3px 9px; }
+
   /* compact / full view toggle */
   .view-toggle {
     font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .06em; color: var(--muted);
@@ -229,6 +256,7 @@
           <div class="spacer"></div>
           <div style="display:flex; align-items:center; gap:12px;">
             <span id="pill" class="status-pill"><span id="pill-led" class="led"></span><span id="pill-text">disconnected</span></span>
+            <button id="edit-btn" class="btn btn-ghost">Edit</button>
             <button id="action" class="btn btn-primary">Connect</button>
           </div>
         </div>
@@ -287,6 +315,83 @@
   </div>
 </div>
 
+<!-- Edit parameters. The imported .ini stays untouched: what's saved here is the
+     set of fields that differ from it, replayed on top every time it's loaded. -->
+<div class="overlay" id="edit-overlay">
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="edit-title">
+    <h3 id="edit-title" class="mono">Edit parameters — <span id="edit-name">profile</span></h3>
+    <div class="mbody form">
+      <fieldset class="fgroup">
+        <legend>Connection</legend>
+        <div class="fgrid">
+          <div class="field" id="f-name"><label for="e-name">Name</label><input id="e-name" type="text" spellcheck="false" /></div>
+          <div class="field" id="f-gateway"><label for="e-gateway">Gateway</label><input id="e-gateway" type="text" spellcheck="false" /></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="fgroup">
+        <legend>Identity</legend>
+        <div class="fgrid">
+          <div class="field" id="f-local_id"><label for="e-local_id">Local IKE ID</label><input id="e-local_id" type="text" spellcheck="false" /><span class="hint">Empty: charon derives it from the local address.</span></div>
+          <div class="field" id="f-local_id_type"><label for="e-local_id_type">ID type</label><select id="e-local_id_type"></select><span class="hint">Forces the IKEv2 ID type the gateway sees.</span></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="fgroup">
+        <legend>IKE proposal (phase 1)</legend>
+        <div class="fgrid four">
+          <div class="field" id="f-ike_enc"><label for="e-ike_enc">Encryption</label><select id="e-ike_enc"></select></div>
+          <div class="field" id="f-ike_integ"><label for="e-ike_integ">Integrity</label><select id="e-ike_integ"></select></div>
+          <div class="field" id="f-ike_prf"><label for="e-ike_prf">PRF</label><select id="e-ike_prf"></select></div>
+          <div class="field" id="f-ike_dh"><label for="e-ike_dh">DH group</label><select id="e-ike_dh"></select></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="fgroup">
+        <legend>ESP proposal (phase 2)</legend>
+        <div class="fgrid four">
+          <div class="field" id="f-esp_enc"><label for="e-esp_enc">Encryption</label><select id="e-esp_enc"></select></div>
+          <div class="field" id="f-esp_integ"><label for="e-esp_integ">Integrity</label><select id="e-esp_integ"></select></div>
+          <div class="field" id="f-pfs"><label for="e-pfs">PFS group</label><select id="e-pfs"></select></div>
+          <div class="field" id="f-compression"><label>Compression</label><label class="check"><input id="e-compression" type="checkbox" /> IPComp</label></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="fgroup">
+        <legend>Traffic &amp; addressing</legend>
+        <div class="fgrid">
+          <div class="field wide" id="f-remote"><label for="e-remote">Remote subnets</label><textarea id="e-remote" spellcheck="false" placeholder="10.0.0.0/24"></textarea><span class="hint">One CIDR per line. A bare address is a /32 host route.</span></div>
+          <div class="field" id="f-request_virtual_ip"><label>Virtual IP</label><label class="check"><input id="e-request_virtual_ip" type="checkbox" /> Request one from the gateway</label></div>
+          <div class="field" id="f-auto_reconnect"><label>Reconnect</label><label class="check"><input id="e-auto_reconnect" type="checkbox" /> Re-establish automatically</label></div>
+          <div class="field" id="f-dpd_delay"><label for="e-dpd_delay">DPD interval (s)</label><input id="e-dpd_delay" type="number" min="0" max="3600" step="1" /><span class="hint">0 disables liveness probing.</span></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="fgroup">
+        <legend>DNS over the tunnel</legend>
+        <div class="fgrid">
+          <div class="field" id="f-dns"><label for="e-dns">Servers</label><input id="e-dns" type="text" spellcheck="false" placeholder="10.0.0.53, 10.0.0.54" /><span class="hint">Comma-separated IPv4 resolvers.</span></div>
+          <div class="field" id="f-dns_domain"><label for="e-dns_domain">Split-DNS domain</label><input id="e-dns_domain" type="text" spellcheck="false" placeholder="corp.example.net" /><span class="hint">Empty: the servers resolve everything while connected.</span></div>
+        </div>
+      </fieldset>
+
+      <fieldset class="fgroup">
+        <legend>Pre-shared key</legend>
+        <div class="fgrid">
+          <div class="field wide"><label for="e-psk">Replace PSK</label><input id="e-psk" type="password" autocomplete="off" placeholder="leave empty to keep the current key" /><span class="hint" id="psk-hint"></span></div>
+        </div>
+      </fieldset>
+    </div>
+    <div id="edit-err" class="notice bad" role="alert"></div>
+    <div class="mfoot">
+      <button class="btn btn-ghost" id="edit-reset" title="Discard all edits and use the imported .ini as-is">Reset to file</button>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost" id="edit-cancel">Cancel</button>
+      <button class="btn btn-primary" id="edit-save">Save</button>
+    </div>
+  </div>
+</div>
+
 <div id="dropzone"><div class="dz-card">Drop NCP <b>.ini</b> profile to import<span>it's copied into your profiles folder</span></div></div>
 
 <script>
@@ -339,6 +444,7 @@
       stored: !!s.stored,
       dns: (s.dns && s.dns.length) ? s.dns.join(", ") : null,
       dnsDomain: s.dns_domain || null,
+      edits: s.edits || [],
       warns: (s.warnings || []).map(function (w) { return { lvl: w.level, t: w.text, n: w.note }; })
     };
   }
@@ -381,6 +487,8 @@
 
   function renderSecurity() {
     var p = current;
+    var n = (p.edits || []).length;
+    $("sec-badge").textContent = n ? n + (n === 1 ? " field edited" : " fields edited") : "";
     var rows = [
       ["IKE proposal", esc(p.ike)],
       ["ESP proposal", esc(p.esp)],
@@ -435,6 +543,7 @@
     if (st === "disconnected") { btn.className = "btn btn-primary"; btn.textContent = "Connect"; }
     else if (st === "connecting") { btn.className = "btn btn-ghost"; btn.textContent = "Cancel"; }
     else { btn.className = "btn btn-ghost"; btn.textContent = "Disconnect"; }
+    renderEditBtn();
     renderCompactStatus();
   }
 
@@ -582,6 +691,145 @@
   }
 
   function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+  /* ---------- edit parameters ---------- */
+  // The .ini is read-only source material (re-parsed on every load, which is what
+  // keeps the PSK off our disk). Editing therefore writes a sidecar of just the
+  // changed fields, which the backend replays onto the parsed config — so "Reset
+  // to file" is simply deleting it.
+  var ENC = ["aes128", "aes192", "aes256"];
+  var INTEG = ["sha1", "sha256", "sha384", "sha512"];
+  var PRF = ["prfsha1", "prfsha256", "prfsha384", "prfsha512"];
+  var DH = ["modp1024", "modp1536", "modp2048", "modp3072", "modp4096", "ecp256", "ecp384"];
+  var ID_TYPES = [["", "auto (charon infers)"], ["ipv4", "ipv4"], ["fqdn", "fqdn"], ["rfc822", "rfc822 (user FQDN)"], ["keyid", "keyid"]];
+  // Every field the dialog edits, in the order the backend names them.
+  var FIELDS = ["name", "gateway", "local_id", "local_id_type", "ike_enc", "ike_integ", "ike_prf",
+    "ike_dh", "esp_enc", "esp_integ", "pfs", "remote", "request_virtual_ip", "compression",
+    "dns", "dns_domain", "dpd_delay", "auto_reconnect"];
+
+  function fillSelect(id, values) {
+    var sel = $(id); sel.innerHTML = "";
+    values.forEach(function (v) {
+      var value = Array.isArray(v) ? v[0] : v, label = Array.isArray(v) ? v[1] : v;
+      var o = document.createElement("option"); o.value = value; o.textContent = label; sel.appendChild(o);
+    });
+  }
+  fillSelect("e-local_id_type", ID_TYPES);
+  fillSelect("e-ike_enc", ENC); fillSelect("e-ike_integ", INTEG);
+  fillSelect("e-ike_prf", PRF); fillSelect("e-ike_dh", DH);
+  fillSelect("e-esp_enc", ENC); fillSelect("e-esp_integ", INTEG);
+  fillSelect("e-pfs", [["", "none (PFS off)"]].concat(DH.map(function (g) { return [g, g]; })));
+
+  // Outside the Tauri shell there's no backend to ask, so derive the same shape
+  // from the proposal strings the demo profiles carry.
+  function demoEdit(p) {
+    var ike = (p.ike || "").split("-"), esp = (p.esp || "").split("-");
+    return {
+      name: p.name, gateway: p.gateway,
+      local_id: p.localId === "—" ? "" : p.localId, local_id_type: "rfc822",
+      ike_enc: ike[0] || "aes256", ike_integ: ike[1] || "sha256",
+      ike_prf: ike[2] || "prfsha256", ike_dh: ike[3] || "modp3072",
+      esp_enc: esp[0] || "aes256", esp_integ: esp[1] || "sha256", pfs: p.pfs || "",
+      remote: p.remote === "—" ? [] : p.remote.split(",").map(function (s) { return s.trim(); }),
+      request_virtual_ip: true, compression: false,
+      dns: p.dns ? p.dns.split(",").map(function (s) { return s.trim(); }) : [],
+      dns_domain: p.dnsDomain || "", dpd_delay: 30, auto_reconnect: true
+    };
+  }
+
+  function showEditErr(msg) { var e = $("edit-err"); e.className = "notice bad show"; e.textContent = msg; }
+  function clearEditErr() { $("edit-err").className = "notice bad"; $("edit-err").textContent = ""; }
+
+  function fillForm(edit, edits) {
+    FIELDS.forEach(function (f) {
+      var el = $("e-" + f), v = edit[f];
+      if (el.type === "checkbox") { el.checked = !!v; }
+      else if (f === "remote") { el.value = (v || []).join("\n"); }
+      else if (f === "dns") { el.value = (v || []).join(", "); }
+      else { el.value = v == null ? "" : String(v); }
+      $("f-" + f).classList.toggle("edited", (edits || []).indexOf(f) >= 0);
+    });
+  }
+
+  function readForm() {
+    var edit = {};
+    FIELDS.forEach(function (f) {
+      var el = $("e-" + f);
+      if (el.type === "checkbox") { edit[f] = el.checked; }
+      else if (f === "remote" || f === "dns") {
+        edit[f] = el.value.split(/[\n,]/).map(function (s) { return s.trim(); }).filter(Boolean);
+      } else if (f === "dpd_delay") { edit[f] = parseInt(el.value, 10) || 0; }
+      else { edit[f] = el.value.trim(); }
+    });
+    return edit;
+  }
+
+  async function openEdit() {
+    if (!current) { return; }
+    clearEditErr();
+    $("e-psk").value = "";
+    $("edit-name").textContent = current.name;
+    if (TAURI) {
+      var pe;
+      try { pe = await TAURI.invoke("get_profile_edit", { id: current.id }); }
+      catch (e) { showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad"); return; }
+      fillForm(pe.edit, pe.edits);
+      $("psk-hint").textContent = pe.stored
+        ? "Replaces the key saved in " + KEYSTORE + "."
+        : "Saved to " + KEYSTORE + " and used in place of the key in the profile file.";
+      $("edit-reset").disabled = !pe.edits.length;
+    } else {
+      fillForm(demoEdit(current), current.edits || []);
+      $("psk-hint").textContent = "Preview mode — nothing is saved.";
+      $("edit-reset").disabled = true;
+    }
+    $("edit-overlay").classList.add("show");
+    $("e-name").focus();
+  }
+
+  function closeEdit() { $("edit-overlay").classList.remove("show"); }
+
+  async function onEditSave() {
+    if (!TAURI) { closeEdit(); showNotice('<span class="led warn" style="box-shadow:none"></span><div>Preview mode — parameters are not saved.</div>', ""); return; }
+    clearEditErr();
+    var id = current.id, psk = $("e-psk").value;
+    try {
+      var names = await TAURI.invoke("save_profile_edit", { id: id, edit: readForm() });
+      if (psk) { await TAURI.invoke("set_credentials", { id: id, psk: psk }); }
+      closeEdit();
+      await refresh();
+      var p = profiles.filter(function (x) { return x.id === id; })[0];
+      if (p) { current = p; renderAll(); }
+      log("CFG", names.length ? "profile edited: " + names.join(", ") + " (applies on next connect)"
+        : "profile parameters match the imported file", "good");
+      if (psk) { log("KNL", "PSK replaced in " + KEYSTORE, "good"); }
+    } catch (e) {
+      showEditErr(String(e));
+    }
+  }
+
+  async function onEditReset() {
+    if (!TAURI) { return; }
+    try {
+      await TAURI.invoke("reset_profile_edit", { id: current.id });
+      var id = current.id;
+      closeEdit();
+      await refresh();
+      var p = profiles.filter(function (x) { return x.id === id; })[0];
+      if (p) { current = p; renderAll(); }
+      log("CFG", "edits discarded — using the imported profile file as-is");
+    } catch (e) { showEditErr(String(e)); }
+  }
+
+  // Editing while the tunnel is up would change the connection name/parameters
+  // out from under the SA we'd later have to tear down, so it waits for a
+  // disconnect. (Saved changes take effect on the next connect either way.)
+  function renderEditBtn() {
+    var btn = $("edit-btn"), st = current ? state[current.id] : null;
+    btn.disabled = !current || st !== "disconnected";
+    btn.title = btn.disabled ? "Disconnect first to change parameters"
+      : "Change this profile's parameters";
+  }
 
   /* ---------- notice (mirrored into the compact panel) ---------- */
   function showNotice(html, kind) {
@@ -865,10 +1113,19 @@
   $("daemon-btn").addEventListener("click", onDaemonBtn);
   $("clear-log").addEventListener("click", clearLog);
   $("import-btn").addEventListener("click", onImport);
+  $("edit-btn").addEventListener("click", openEdit);
+  $("edit-cancel").addEventListener("click", closeEdit);
+  $("edit-save").addEventListener("click", onEditSave);
+  $("edit-reset").addEventListener("click", onEditReset);
+  $("edit-overlay").addEventListener("click", function (e) { if (e.target === $("edit-overlay")) { closeEdit(); } });
   $("modal-cancel").addEventListener("click", function () { $("overlay").classList.remove("show"); });
   $("modal-refresh").addEventListener("click", function () { $("overlay").classList.remove("show"); refresh(); });
   $("overlay").addEventListener("click", function (e) { if (e.target === $("overlay")) { $("overlay").classList.remove("show"); } });
-  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { $("overlay").classList.remove("show"); } });
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") { return; }
+    $("overlay").classList.remove("show");
+    closeEdit();
+  });
   window.addEventListener("resize", drawSpark);
 
   // Native events from the Rust side: drag-and-drop highlight + import refresh.

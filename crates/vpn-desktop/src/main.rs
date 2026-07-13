@@ -10,8 +10,9 @@ mod backend;
 mod creds;
 mod daemon;
 mod dns;
+mod overrides;
 
-use backend::{AppState, ProfileSummary};
+use backend::{AppState, ProfileEdit, ProfileSummary};
 use vpn_control::{ConnectOutcome, IkeSa};
 
 #[tauri::command]
@@ -56,6 +57,46 @@ async fn import_profile_dialog(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The editable parameters of a profile, as currently in effect.
+#[tauri::command]
+async fn get_profile_edit(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<ProfileEdit, String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::get_profile_edit(&s, id)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Persist edited parameters (only what differs from the `.ini` is stored).
+/// Returns the names of the fields that are now overridden.
+#[tauri::command]
+async fn save_profile_edit(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    edit: overrides::Edit,
+) -> Result<Vec<String>, String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::save_profile_edit(&s, id, edit))
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Drop a profile's edits, falling back to the imported `.ini`.
+#[tauri::command]
+async fn reset_profile_edit(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::reset_profile_edit(&s, id)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -123,6 +164,20 @@ async fn save_credentials(state: tauri::State<'_, AppState>, id: String) -> Resu
     }
 }
 
+/// Replace the profile's PSK with a user-supplied one (keychain only).
+#[tauri::command]
+async fn set_credentials(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    psk: String,
+) -> Result<(), String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::set_credentials(&s, id, psk)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[tauri::command]
 async fn forget_credentials(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let s = state.inner().clone();
@@ -163,6 +218,19 @@ fn dev(args: &[String]) {
         Some("import") => backend::import_path(&state, std::path::Path::new(args.get(1).map(String::as_str).unwrap_or("")))
             .map(|id| format!("imported {id}")),
         Some("profiles-dir") => Ok(backend::profiles_dir(&state)),
+        Some("get-edit") => backend::get_profile_edit(&state, args.get(1).cloned().unwrap_or_default())
+            .map(|e| serde_json::to_string_pretty(&e).expect("serialize edit")),
+        // Takes the same JSON `get-edit` prints (its `edit` object), so a test
+        // can round-trip: read the parameters, change one, save it back.
+        Some("save-edit") => {
+            let id = args.get(1).cloned().unwrap_or_default();
+            serde_json::from_str::<overrides::Edit>(args.get(2).map(String::as_str).unwrap_or(""))
+                .map_err(|e| format!("bad edit json: {e}"))
+                .and_then(|edit| backend::save_profile_edit(&state, id, edit))
+                .map(|names| format!("overrides: {}", names.join(", ")))
+        }
+        Some("reset-edit") => backend::reset_profile_edit(&state, args.get(1).cloned().unwrap_or_default())
+            .map(|_| "reset".to_string()),
         Some("daemon-start") => backend::daemon_start(&state).map(|_| "started".to_string()),
         Some("daemon-stop") => backend::daemon_stop(&state).map(|_| "stopped".to_string()),
         Some("save-creds") => {
@@ -218,7 +286,11 @@ fn main() {
             start_daemon,
             stop_daemon,
             save_credentials,
-            forget_credentials
+            set_credentials,
+            forget_credentials,
+            get_profile_edit,
+            save_profile_edit,
+            reset_profile_edit
         ])
         .setup(|app| {
             tray::build(app.handle())?;
