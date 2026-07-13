@@ -136,7 +136,13 @@ pub fn ike_id_type(code: u32) -> Option<Mapped<IkeIdType>> {
     match code {
         1 => mapped(IkeIdType::Ipv4Addr, Confidence::Medium),
         2 => mapped(IkeIdType::Fqdn, Confidence::Medium),
-        3 => mapped(IkeIdType::UserFqdn, Confidence::Medium),
+        // 2026-07-13 confirmed live against the production LANCOM
+        // (ITS5597555LCM010) with a bare, non-email token (`vpnuser4597`,
+        // no `@`) forced through the `rfc822:` prefix — a real test of the
+        // forced type, unlike the earlier local-gateway confirmation whose
+        // id string already contained `@` and would've inferred correctly
+        // either way.
+        3 => mapped(IkeIdType::UserFqdn, Confidence::High),
         11 => mapped(IkeIdType::KeyId, Confidence::Medium),
         _ => None,
     }
