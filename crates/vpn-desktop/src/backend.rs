@@ -117,6 +117,21 @@ pub struct ProfileSummary {
     pub dns: Vec<String>,
     /// Split-DNS domain scoping those servers, if the profile names one.
     pub dns_domain: Option<String>,
+    /// Names of the fields the user has overridden (empty = the `.ini` as-is).
+    /// Everything above already reflects them; this is what the UI marks up.
+    pub edits: Vec<String>,
+}
+
+/// A profile opened for editing: its current effective values, plus which of
+/// them are user overrides rather than what the `.ini` said.
+#[derive(Debug, Serialize)]
+pub struct ProfileEdit {
+    pub id: String,
+    pub edit: crate::overrides::Edit,
+    pub edits: Vec<String>,
+    /// Whether a PSK is stored in the keychain — the edit dialog offers to
+    /// replace it (the `.ini`'s own PSK is never editable in place).
+    pub stored: bool,
 }
 
 /// Split "Foo=1 interpreted as bar (note...)" into a headline and a note,
@@ -124,7 +139,7 @@ pub struct ProfileSummary {
 fn to_warn_item(raw: &str) -> WarnItem {
     let level = if raw.contains("LOW-confidence") {
         "low"
-    } else if raw.contains("unconfirmed") {
+    } else if raw.contains("unconfirmed") || raw.contains("were not applied") {
         "medium"
     } else if raw.contains("ignored") || raw.contains("not interpreted") || raw.contains("not supported") {
         "ignored"
@@ -146,8 +161,10 @@ fn summarize(
     id: &str,
     config: &vpn_core::ConnectionConfig,
     warnings: &[ncp_profile::ImportWarning],
+    edits: Vec<String>,
 ) -> ProfileSummary {
     ProfileSummary {
+        edits,
         id: id.to_string(),
         name: config.name.clone(),
         gateway: config.gateway.clone(),
@@ -165,9 +182,36 @@ fn summarize(
     }
 }
 
-fn load(path: &std::path::Path) -> std::result::Result<ncp_profile::ImportedProfile, String> {
+fn parse(path: &std::path::Path) -> std::result::Result<ncp_profile::ImportedProfile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     ncp_profile::import_profile(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A profile as it is actually used: the `.ini` re-parsed from disk, with the
+/// user's saved overrides replayed on top. Also reports which fields those
+/// overrides changed, so the UI can mark them.
+///
+/// Overrides that no longer apply (a hand-edited sidecar, or one written
+/// against an `.ini` that has since been replaced) are dropped with a warning
+/// rather than taking the profile down — the file is always a usable fallback.
+fn load(
+    state: &AppState,
+    id: &str,
+) -> std::result::Result<(ncp_profile::ImportedProfile, Vec<String>), String> {
+    let mut imported = parse(&profile_path(state, id))?;
+    let base = crate::overrides::Edit::from_config(&imported.config);
+    let (edited, mut names) = crate::overrides::load(&state.profile_dir, id).overlay(&base);
+    if !names.is_empty() {
+        if let Err(e) = edited.apply_to(&mut imported.config) {
+            // Phrased for `to_warn_item`, which splits a trailing parenthetical
+            // off as the note.
+            imported.warnings.push(ncp_profile::ImportWarning(format!(
+                "saved edits were not applied; using the profile file as imported ({e})"
+            )));
+            names.clear();
+        }
+    }
+    Ok((imported, names))
 }
 
 fn profile_path(state: &AppState, id: &str) -> PathBuf {
@@ -189,12 +233,48 @@ pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        if let Ok(imported) = load(&path) {
-            out.push(summarize(id, &imported.config, &imported.warnings));
+        if let Ok((imported, edits)) = load(state, id) {
+            out.push(summarize(id, &imported.config, &imported.warnings, edits));
         }
     }
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
+}
+
+/// The editable view of a profile — what the edit dialog opens on.
+pub fn get_profile_edit(state: &AppState, id: String) -> std::result::Result<ProfileEdit, String> {
+    let (imported, edits) = load(state, &id)?;
+    Ok(ProfileEdit {
+        edit: crate::overrides::Edit::from_config(&imported.config),
+        edits,
+        stored: crate::creds::has(&id),
+        id,
+    })
+}
+
+/// Validate an edited profile and persist the fields that differ from the
+/// `.ini`. Returns the field names that are now overridden.
+pub fn save_profile_edit(
+    state: &AppState,
+    id: String,
+    edit: crate::overrides::Edit,
+) -> std::result::Result<Vec<String>, String> {
+    // Validate against the profile as imported: an edit that can't be applied
+    // must not reach the sidecar, or the profile would carry a broken override.
+    let mut imported = parse(&profile_path(state, &id))?;
+    let base = crate::overrides::Edit::from_config(&imported.config);
+    edit.apply_to(&mut imported.config)?;
+    // Diff the *normalized* edit (trimmed, empty-vs-absent resolved) so that
+    // e.g. a re-typed identical value doesn't register as an override.
+    let normalized = crate::overrides::Edit::from_config(&imported.config);
+    let (overrides, names) = crate::overrides::Overrides::diff(&base, &normalized);
+    crate::overrides::save(&state.profile_dir, &id, &overrides)?;
+    Ok(names)
+}
+
+/// Discard a profile's edits; it falls back to its `.ini` verbatim.
+pub fn reset_profile_edit(state: &AppState, id: String) -> std::result::Result<(), String> {
+    crate::overrides::clear(&state.profile_dir, &id)
 }
 
 /// The directory profiles are read from (shown in the UI, so the user knows
@@ -241,7 +321,7 @@ pub fn connect(
     state: &AppState,
     id: String,
 ) -> std::result::Result<vpn_control::ConnectOutcome, String> {
-    let mut imported = load(&profile_path(state, &id))?;
+    let (mut imported, _) = load(state, &id)?;
     // Prefer a PSK saved in the OS keychain over the one parsed from the
     // (plaintext-on-disk) .ini, so saved credentials are what actually
     // authenticate the tunnel.
@@ -285,9 +365,23 @@ fn apply_dns(
 
 /// Copy a profile's PSK from its `.ini` into the OS keychain.
 pub fn save_credentials(state: &AppState, id: String) -> std::result::Result<(), String> {
-    let imported = load(&profile_path(state, &id))?;
+    let (imported, _) = load(state, &id)?;
     let vpn_core::AuthMethod::PresharedKey(psk) = &imported.config.auth;
     crate::creds::store(&id, psk)
+}
+
+/// Replace a profile's PSK with one the user typed. It goes straight to the OS
+/// keychain — where [`connect`] prefers it over the `.ini`'s — so the new key is
+/// never written to disk in plaintext, and the profile file stays untouched.
+pub fn set_credentials(
+    _state: &AppState,
+    id: String,
+    psk: String,
+) -> std::result::Result<(), String> {
+    if psk.is_empty() {
+        return Err("the pre-shared key cannot be empty".to_string());
+    }
+    crate::creds::store(&id, &vpn_core::Secret::new(psk))
 }
 
 /// Remove a profile's saved PSK from the OS keychain.
