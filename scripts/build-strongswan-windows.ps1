@@ -7,9 +7,10 @@
   Wraps docker/strongswan-windows/Dockerfile (a MinGW-w64 cross build of
   OpenSSL + strongSwan on Linux). The result is a self-contained tree of
   Windows .exe/.dll files that terminate the IPsec tunnel on the Windows host
-  via the Windows Filtering Platform -- no container, no WSL. The desktop app
-  drives the daemon over vici on 127.0.0.1:4502, exactly as it drives the
-  Linux dev container.
+  itself -- no container, no WSL. ESP runs in userland (libipsec) over a Wintun
+  adapter, so wintun.dll ships alongside charon-svc.exe. The desktop app drives
+  the daemon over vici on 127.0.0.1:45023, exactly as it drives the Linux dev
+  container.
 
 .PARAMETER OutDir
   Where to place the exported tree. Default: out\strongswan-windows.
