@@ -2,21 +2,29 @@
 //! as LocalSystem, so it can spawn charon directly (no UAC) and charon installs
 //! its SAs through the Windows Filtering Platform, which needs that privilege.
 //!
-//! charon comes up on its built-in Windows vici default (`127.0.0.1:4502`); the
-//! GUI drives connect/status/disconnect over that socket exactly as before.
-//! We run it on defaults (no config file needed), matching the app's proven
-//! elevate-and-spawn path — the only change is *who* spawns it.
+//! charon comes up on a vici port dedicated to this app (see [`VICI_ADDR`]) and
+//! the GUI drives connect/status/disconnect over it.
+//!
+//! It deliberately does *not* use `charon-svc`'s built-in default (4502): that
+//! default is the same for every strongSwan-based client, so on a machine that
+//! also has one installed (Sophos Connect ships one, and runs it permanently)
+//! whoever binds first owns the port. We used to treat any listener there as
+//! "our backend is up", which meant never starting our own daemon and instead
+//! pushing connections — and the PSK — into theirs, then killing it on stop.
+//! Hence both halves of the fix: our own port, and [`is_ours`] to prove the
+//! daemon behind it is the binary we shipped.
 
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Child;
 use std::time::{Duration, Instant};
 
-/// charon-svc's Windows vici default.
-pub const VICI_ADDR: &str = "127.0.0.1:4502";
+/// vici socket for *our* charon. Must match `plugins.vici.socket` in the
+/// bundled `strongswan.conf`, and `NATIVE_VICI_ADDR` in the desktop app.
+pub const VICI_ADDR: &str = "127.0.0.1:45023";
 
-/// Is charon's vici socket accepting connections? A successful TCP connect
-/// means it's up (vici is charon's only TCP listener).
+/// Is anything listening on our vici port? Says nothing about *whose* daemon it
+/// is — see [`is_ours`].
 pub fn is_running() -> bool {
     use std::net::ToSocketAddrs;
     VICI_ADDR
@@ -25,6 +33,32 @@ pub fn is_running() -> bool {
         .and_then(|mut it| it.next())
         .and_then(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(400)).ok())
         .is_some()
+}
+
+/// Is the daemon on our vici port the `charon-svc.exe` we shipped?
+///
+/// `Ok(true)`: ours, adopt it. `Ok(false)`: nothing is listening. `Err`: someone
+/// else's process holds the port — refuse, rather than drive (or kill) a daemon
+/// that isn't ours. The broker runs as LocalSystem, so it can read the image
+/// path of even a SYSTEM-owned process; if it somehow can't, we treat that as
+/// foreign, because "cannot prove it's ours" is exactly the case this guards.
+pub fn is_ours() -> Result<bool, String> {
+    let Some(pid) = vpn_broker::listener::owner_pid(VICI_ADDR) else {
+        return Ok(false);
+    };
+    let ours = charon_exe()?;
+    match vpn_broker::listener::image_of(pid) {
+        Some(img) if vpn_broker::listener::same_file(&img, &ours) => Ok(true),
+        Some(img) => Err(format!(
+            "vici port {VICI_ADDR} is held by {} (pid {pid}), which is not our charon-svc — \
+             refusing to use it",
+            img.display()
+        )),
+        None => Err(format!(
+            "vici port {VICI_ADDR} is held by pid {pid}, whose image could not be read — \
+             refusing to use a daemon we cannot identify"
+        )),
+    }
 }
 
 /// Locate `charon-svc.exe`. The broker exe is installed next to the bundled
@@ -59,17 +93,34 @@ fn charon_exe() -> Result<PathBuf, String> {
     })
 }
 
-/// Start charon as a child if it isn't already listening, and wait for vici.
-/// Returns the child handle to keep (so a stop can terminate it), or `None`
-/// when charon was already up (not ours to own).
+/// Start charon as a child if our daemon isn't already listening, and wait for
+/// vici. Returns the child handle to keep (so a stop can terminate it), or
+/// `None` when our charon was already up (not ours to own).
+///
+/// Errors when the port is held by a process that isn't our charon: driving a
+/// foreign daemon is how the PSK ended up in another vendor's client.
 pub fn start() -> Result<Option<Child>, String> {
-    if is_running() {
+    if is_ours()? {
         return Ok(None);
     }
     let exe = charon_exe()?;
     let dir = exe.parent().ok_or("charon-svc.exe has no parent directory")?.to_path_buf();
+
+    // charon-svc cannot find strongswan.conf on Windows by itself; STRONGSWAN_CONF
+    // is the only way to point it at one. Without it charon uses its built-in
+    // defaults — vici on 4502, the shared port we moved off — and would come up
+    // somewhere the app never looks.
+    let conf = dir.join("etc").join("strongswan.conf");
+    if !conf.is_file() {
+        return Err(format!(
+            "strongswan.conf not found at {} — charon would come up on its default \
+             vici port instead of {VICI_ADDR}",
+            conf.display()
+        ));
+    }
     let child = std::process::Command::new(&exe)
         .current_dir(&dir)
+        .env("STRONGSWAN_CONF", &conf)
         .spawn()
         .map_err(|e| format!("failed to launch charon-svc: {e}"))?;
 
@@ -84,13 +135,21 @@ pub fn start() -> Result<Option<Child>, String> {
 }
 
 /// Stop charon. `charon-svc` detaches after launch, so the `Child` handle we
-/// kept may no longer be the live daemon — kill by image name (the broker is
-/// SYSTEM, so this needs no elevation), then reap our handle for good measure.
-/// This mirrors what the GUI's own `daemon.rs` does with an elevated taskkill.
+/// kept may no longer be the live daemon — find the daemon by our vici port and
+/// kill that pid (the broker is SYSTEM, so this needs no elevation), then reap
+/// our handle for good measure.
+///
+/// Killing by image name (`taskkill /IM charon-svc.exe`) would also take down
+/// any other vendor's strongSwan running under the same executable name, so we
+/// only ever kill the pid we have positively identified as ours.
 pub fn stop(child: Option<&mut Child>) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/IM", "charon-svc.exe"])
-        .output();
+    if matches!(is_ours(), Ok(true)) {
+        if let Some(pid) = vpn_broker::listener::owner_pid(VICI_ADDR) {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .output();
+        }
+    }
     if let Some(c) = child {
         let _ = c.kill();
         let _ = c.wait();
