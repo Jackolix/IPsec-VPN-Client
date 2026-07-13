@@ -15,6 +15,7 @@ vpn-control = { path = "../vpn-control" }
 vpn-broker = { path = "../vpn-broker" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
 serde = { workspace = true }
 serde_json = "1"
 
