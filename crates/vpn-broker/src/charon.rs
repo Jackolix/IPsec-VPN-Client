@@ -1,6 +1,7 @@
-//! Supervise the native strongSwan daemon, `charon-svc.exe`. The broker runs
-//! as LocalSystem, so it can spawn charon directly (no UAC) and charon installs
-//! its SAs through the Windows Filtering Platform, which needs that privilege.
+//! Supervise the native strongSwan daemon, `charon-svc.exe`. The broker runs as
+//! LocalSystem, so it can spawn charon directly (no UAC) — and charon needs that
+//! privilege: it creates a Wintun adapter and installs the virtual IP and routes
+//! on it.
 //!
 //! charon comes up on a vici port dedicated to this app (see [`VICI_ADDR`]) and
 //! the GUI drives connect/status/disconnect over it.
