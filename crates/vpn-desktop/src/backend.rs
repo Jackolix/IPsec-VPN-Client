@@ -329,8 +329,39 @@ pub fn connect(
         imported.config.auth = vpn_core::AuthMethod::PresharedKey(psk);
     }
     let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
+
+    // charon's `initiate` is unconditional: called against a connection that is
+    // already up, it negotiates a *second* CHILD_SA on the same IKE_SA rather
+    // than refusing. They stack up (and only one gets torn down on disconnect),
+    // so adopt the live SA instead of initiating over it. This happens whenever
+    // a tunnel outlives the app — the SA belongs to charon, not to us.
+    if let Some(existing) = established_sa(state, &name) {
+        let mut outcome = vpn_control::ConnectOutcome {
+            connected: true,
+            error: None,
+            log: vec![note_line(
+                &name,
+                2,
+                format!(
+                    "{name} is already established ({} → {}); adopting the existing SA",
+                    existing.local_host, existing.remote_host
+                ),
+            )],
+        };
+        if imported.config.request_virtual_ip {
+            wait_for_virtual_ip(state, &name, &mut outcome);
+        }
+        return Ok(outcome);
+    }
+
     let mut outcome =
         vpn_control::connect_logged(&state.transport, &imported.config, &name).map_err(|e| e.to_string())?;
+
+    // An established CHILD_SA does not mean the tunnel carries traffic yet: the
+    // assigned virtual IP still has to land on an OS interface first.
+    if outcome.connected && imported.config.request_virtual_ip {
+        wait_for_virtual_ip(state, &name, &mut outcome);
+    }
 
     // With the tunnel up, apply the profile's DNS so names on the remote
     // network resolve over the VPN. Failure here doesn't fail the connect —
@@ -339,6 +370,105 @@ pub fn connect(
         apply_dns(state, &name, &imported.config.dns, &mut outcome);
     }
     Ok(outcome)
+}
+
+/// The live SA for `name`, if charon already has one carrying traffic — i.e. an
+/// established IKE_SA with at least one installed CHILD_SA. A half-open SA
+/// doesn't count: there's nothing to adopt, and `initiate` is the right call.
+fn established_sa(state: &AppState, name: &str) -> Option<IkeSa> {
+    status(state).ok()?.into_iter().find(|sa| {
+        sa.name == name
+            && sa.state == "ESTABLISHED"
+            && sa.children.iter().any(|c| c.state == "INSTALLED")
+    })
+}
+
+/// How long to wait for the virtual IP to become usable before giving up and
+/// reporting the tunnel as up anyway (it is — just not yet sourceable).
+const VIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Of that budget, how long to wait for charon to even report an assigned
+/// address. It arrives with the IKE_SA, so this is generous.
+const VIP_ASSIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const VIP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Block until the gateway-assigned virtual IP is actually usable as a source
+/// address, so "established" means the tunnel really carries traffic.
+///
+/// charon reports the CHILD_SA up as soon as it is negotiated, but the OS still
+/// has to install the virtual IP. On Windows a freshly added address spends a
+/// moment in duplicate-address detection (`Tentative`), and — this is the part
+/// that makes it look like a protocol bug — ICMP still flows from it while no
+/// socket can *bind* to it. So ping works and every TCP connect fails, for
+/// several seconds after the UI has already said "established".
+///
+/// Best-effort: a timeout is a warning, never a failed connect.
+fn wait_for_virtual_ip(
+    state: &AppState,
+    name: &str,
+    outcome: &mut vpn_control::ConnectOutcome,
+) {
+    let started = std::time::Instant::now();
+    let Some(vip) = assigned_vip(state, name, started) else {
+        note(outcome, name, 1, "no virtual IP was assigned; skipping the readiness wait".to_string());
+        return;
+    };
+    while started.elapsed() < VIP_TIMEOUT {
+        // Binding is the same operation a TCP connect performs, so it tests
+        // exactly what fails while the address is Tentative — and it needs no
+        // platform-specific API to ask.
+        if std::net::UdpSocket::bind((vip, 0)).is_ok() {
+            note(
+                outcome,
+                name,
+                2,
+                format!("virtual IP {vip} ready after {:.1}s", started.elapsed().as_secs_f32()),
+            );
+            return;
+        }
+        std::thread::sleep(VIP_POLL);
+    }
+    note(
+        outcome,
+        name,
+        1,
+        format!(
+            "virtual IP {vip} was still not usable after {}s — connections over the tunnel may fail until it is",
+            VIP_TIMEOUT.as_secs()
+        ),
+    );
+}
+
+/// The virtual IP charon assigned to this connection, once it reports one.
+fn assigned_vip(state: &AppState, name: &str, started: std::time::Instant) -> Option<std::net::IpAddr> {
+    while started.elapsed() < VIP_ASSIGN_TIMEOUT {
+        if let Ok(sas) = status(state) {
+            let vip = sas
+                .iter()
+                .find(|sa| sa.name == name)
+                .and_then(|sa| sa.virtual_ips.first())
+                .and_then(|v| v.parse::<std::net::IpAddr>().ok());
+            if vip.is_some() {
+                return vip;
+            }
+        }
+        std::thread::sleep(VIP_POLL);
+    }
+    None
+}
+
+/// A log line attributed to this connection, in charon's own shape, so the UI
+/// renders our findings exactly like the daemon's.
+fn note_line(name: &str, level: i32, msg: String) -> vpn_control::LogLine {
+    vpn_control::LogLine {
+        group: "NET".to_string(),
+        level,
+        ikesa: Some(name.to_string()),
+        msg,
+    }
+}
+
+fn note(outcome: &mut vpn_control::ConnectOutcome, name: &str, level: i32, msg: String) {
+    outcome.log.push(note_line(name, level, msg));
 }
 
 /// Configure DNS for an established tunnel (via an NRPT rule) and note the
@@ -355,12 +485,9 @@ fn apply_dns(
         Ok(_) => return,
         Err(e) => (format!("DNS setup failed: {e}"), true),
     };
-    outcome.log.push(vpn_control::LogLine {
-        group: "DNS".to_string(),
-        level: if bad { 1 } else { 2 },
-        ikesa: Some(name.to_string()),
-        msg,
-    });
+    let mut line = note_line(name, if bad { 1 } else { 2 }, msg);
+    line.group = "DNS".to_string();
+    outcome.log.push(line);
 }
 
 /// Copy a profile's PSK from its `.ini` into the OS keychain.
