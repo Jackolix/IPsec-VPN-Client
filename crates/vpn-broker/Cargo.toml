@@ -30,4 +30,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Pipes",
     "Win32_System_Memory",
     "Win32_System_IO",
+    # Identify who owns the vici port (GetExtendedTcpTable) and what binary it
+    # is (QueryFullProcessImageNameW) — see `listener`.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
 ] }

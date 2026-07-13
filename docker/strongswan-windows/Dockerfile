@@ -25,6 +25,7 @@ ENV PREFIX=/opt/win
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64-tools \
         build-essential wget ca-certificates perl pkg-config file bzip2 xz-utils \
+        patch \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -41,6 +42,15 @@ RUN cd "openssl-${OPENSSL_VER}" \
 # ---- strongSwan (native Windows daemon) ----
 RUN wget -q "https://download.strongswan.org/strongswan-${STRONGSWAN_VER}.tar.bz2" \
     && tar xf "strongswan-${STRONGSWAN_VER}.tar.bz2"
+
+# Teach kernel-iph to install virtual IPs. Upstream ships add_ip/del_ip as
+# NOT_SUPPORTED stubs, which makes the Windows port unusable as a road-warrior
+# client: the gateway assigns a virtual IP, charon fails to install it, discards
+# it, and the peer then rejects the traffic selectors. See the patch header.
+COPY docker/strongswan-windows/0001-kernel-iph-install-virtual-ips.patch /src/
+RUN cd "strongswan-${STRONGSWAN_VER}" \
+    && patch -p1 --fuzz=0 < /src/0001-kernel-iph-install-virtual-ips.patch
+
 RUN cd "strongswan-${STRONGSWAN_VER}" \
     && ./configure --host="${MINGW}" --prefix="${PREFIX}" \
         --disable-defaults \

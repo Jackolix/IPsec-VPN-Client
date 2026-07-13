@@ -3,6 +3,7 @@
   "bundle": {
     "resources": {
       "../../out/strongswan-windows/*": "charon/",
+      "../../out/strongswan-windows/etc/*": "charon/etc/",
       "../../out/broker/*": "./"
     },
     "windows": {
