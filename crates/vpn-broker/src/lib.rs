@@ -10,3 +10,8 @@ pub mod protocol;
 
 #[cfg(windows)]
 pub mod client;
+
+/// Identify the process behind a loopback port, so neither the GUI nor the
+/// broker mistakes another vendor's strongSwan for ours.
+#[cfg(windows)]
+pub mod listener;

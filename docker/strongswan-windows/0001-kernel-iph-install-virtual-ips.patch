@@ -1,0 +1,185 @@
+Implement virtual IP installation in kernel-iph.
+
+strongSwan's Windows port ships `add_ip`/`del_ip` as stubs returning
+NOT_SUPPORTED, which upstream documents as "the kernel-iph networking backend
+currently does not support the installation of virtual IP addresses ... making
+the strongSwan Windows port not usable as client for this particular scenario"
+(https://docs.strongswan.org/docs/latest/os/windows.html, issue #1259).
+
+That is exactly our scenario: the gateway assigns a virtual IP via the IKEv2
+configuration payload and narrows the CHILD_SA's traffic selectors to it. With
+add_ip failing, ike_sa.c discards the assigned address (the call is not gated by
+any setting, so no strongswan.conf option can work around it), charon then
+offers the physical address as the local TS, and the peer answers "no acceptable
+traffic selectors found". No tunnel.
+
+Implement both methods with the IP Helper API, mirroring the interface lookup
+this plugin already uses for routes in manage_route():
+
+  add_ip  -> CreateUnicastIpAddressEntry() on the interface charon selected
+  del_ip  -> DeleteUnicastIpAddressEntry(), located by scanning the address table
+             (del_ip gets no interface name, only the address)
+
+add_ip also honours `install_virtual_ip_on`. ike_sa.c always passes the
+interface the *outer* address sits on, which is right for a kernel datapath but
+wrong for a userland one: kernel-libipsec needs the address on its TUN device,
+and points that setting at it. The setting is not applied centrally -- every
+networking backend applies it itself, as kernel-netlink does.
+
+The address is installed with SkipAsSource = FALSE so Windows will actually
+source tunnelled traffic from it. Windows runs duplicate-address detection on a
+newly added address, leaving it Tentative for a moment — during which ICMP still
+flows from it but no socket can bind to it — so callers must wait for it to
+become preferred before declaring the tunnel usable.
+
+diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c
+--- orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2023-03-27 21:00:49.000000000 +0000
++++ work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-07-13 15:06:42.150151828 +0000
+@@ -609,18 +609,145 @@
+ 	return NULL;
+ }
+ 
++/**
++ * Look up the index of an interface by name
++ */
++static DWORD find_ifindex(private_kernel_iph_net_t *this, char *name)
++{
++	enumerator_t *enumerator;
++	iface_t *entry;
++	DWORD ifindex = 0;
++
++	this->mutex->lock(this->mutex);
++	enumerator = this->ifaces->create_enumerator(this->ifaces);
++	while (enumerator->enumerate(enumerator, &entry))
++	{
++		if (streq(name, entry->ifname))
++		{
++			ifindex = entry->ifindex;
++			break;
++		}
++	}
++	enumerator->destroy(enumerator);
++	this->mutex->unlock(this->mutex);
++
++	return ifindex;
++}
++
+ METHOD(kernel_net_t, add_ip, status_t,
+ 	private_kernel_iph_net_t *this, host_t *virtual_ip, int prefix,
+ 	char *iface_name)
+ {
+-	return NOT_SUPPORTED;
++	MIB_UNICASTIPADDRESS_ROW row;
++	DWORD ifindex;
++	ULONG ret;
++	char *iface;
++
++	/* charon hands us the interface its outer address sits on, which is what a
++	 * kernel datapath wants. A userland one (kernel-libipsec) instead needs the
++	 * address on its own TUN device, and points this setting at it. ike_sa.c
++	 * does not apply the setting, every networking backend has to do it itself
++	 * -- kernel-netlink does the same thing here. */
++	iface = lib->settings->get_str(lib->settings, "%s.install_virtual_ip_on",
++								   iface_name, lib->ns);
++	if (!iface)
++	{
++		return NOT_SUPPORTED;
++	}
++	ifindex = find_ifindex(this, iface);
++	if (!ifindex && iface_name && !streq(iface, iface_name))
++	{	/* the configured device is gone, use the one charon picked */
++		DBG1(DBG_KNL, "interface '%s' not found, installing %H on '%s' instead",
++			 iface, virtual_ip, iface_name);
++		iface = iface_name;
++		ifindex = find_ifindex(this, iface);
++	}
++	if (!ifindex)
++	{
++		DBG1(DBG_KNL, "interface '%s' not found, unable to install %H",
++			 iface, virtual_ip);
++		return NOT_FOUND;
++	}
++	if (prefix == -1)
++	{
++		prefix = (virtual_ip->get_family(virtual_ip) == AF_INET) ? 32 : 128;
++	}
++
++	InitializeUnicastIpAddressEntry(&row);
++	row.InterfaceIndex = ifindex;
++	memcpy(&row.Address, virtual_ip->get_sockaddr(virtual_ip),
++		   *virtual_ip->get_sockaddr_len(virtual_ip));
++	row.OnLinkPrefixLength = prefix;
++	row.PrefixOrigin = IpPrefixOriginManual;
++	row.SuffixOrigin = IpSuffixOriginManual;
++	row.ValidLifetime = INFINITE;
++	row.PreferredLifetime = INFINITE;
++	/* the whole point is to source tunnelled traffic from this address */
++	row.SkipAsSource = FALSE;
++
++	ret = CreateUnicastIpAddressEntry(&row);
++	if (ret != NO_ERROR)
++	{
++		DBG1(DBG_KNL, "adding virtual IP %H on '%s' failed: 0x%08lx",
++			 virtual_ip, iface, ret);
++		return FAILED;
++	}
++	DBG2(DBG_KNL, "installed virtual IP %H/%d on '%s' (interface %lu)",
++		 virtual_ip, prefix, iface, ifindex);
++	return SUCCESS;
+ }
+ 
+ METHOD(kernel_net_t, del_ip, status_t,
+ 	private_kernel_iph_net_t *this, host_t *virtual_ip, int prefix,
+ 	bool wait)
+ {
+-	return NOT_SUPPORTED;
++	MIB_UNICASTIPADDRESS_TABLE *table;
++	MIB_UNICASTIPADDRESS_ROW *row;
++	status_t status = NOT_FOUND;
++	host_t *host;
++	ULONG ret, i;
++
++	/* del_ip gets no interface name, so find the address in the table */
++	ret = GetUnicastIpAddressTable(AF_UNSPEC, &table);
++	if (ret != NO_ERROR)
++	{
++		DBG1(DBG_KNL, "getting address table failed: 0x%08lx", ret);
++		return FAILED;
++	}
++	for (i = 0; i < table->NumEntries; i++)
++	{
++		row = &table->Table[i];
++		host = host_create_from_sockaddr((struct sockaddr*)&row->Address);
++		if (!host)
++		{
++			continue;
++		}
++		if (host->ip_equals(host, virtual_ip))
++		{
++			ret = DeleteUnicastIpAddressEntry(row);
++			if (ret != NO_ERROR)
++			{
++				DBG1(DBG_KNL, "removing virtual IP %H failed: 0x%08lx",
++					 virtual_ip, ret);
++				status = FAILED;
++			}
++			else
++			{
++				DBG2(DBG_KNL, "removed virtual IP %H", virtual_ip);
++				status = SUCCESS;
++			}
++			host->destroy(host);
++			break;
++		}
++		host->destroy(host);
++	}
++	FreeMibTable(table);
++
++	if (status == NOT_FOUND)
++	{
++		DBG1(DBG_KNL, "virtual IP %H not found, nothing to remove", virtual_ip);
++	}
++	return status;
+ }
+ 
+ /**

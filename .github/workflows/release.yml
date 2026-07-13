@@ -71,9 +71,21 @@ jobs:
           name: strongswan-windows
           path: out/strongswan-windows
 
+      # Every one of these is load-bearing and fails in a way that is hard to
+      # read at runtime: no wintun.dll => no TUN device => no datapath; no
+      # libipsec-0.dll => charon won't even start; no etc\strongswan.conf =>
+      # charon comes up on its built-in default vici port (shared with every
+      # other strongSwan client) instead of ours, and the app won't find it.
       - name: Sanity-check the daemon artifacts are present
         shell: pwsh
-        run: Get-ChildItem out\strongswan-windows
+        run: |
+          Get-ChildItem -Recurse out\strongswan-windows
+          $required = @(
+            'charon-svc.exe', 'wintun.dll', 'libipsec-0.dll',
+            'libstrongswan-0.dll', 'libcharon-0.dll', 'etc\strongswan.conf'
+          )
+          $missing = $required | Where-Object { -not (Test-Path "out\strongswan-windows\$_") }
+          if ($missing) { throw "daemon artifacts missing: $($missing -join ', ')" }
 
       # vpn-desktop's build.rs (tauri_build::build()) validates that the
       # "../../out/broker/*" resource glob in tauri.windows.conf.json
