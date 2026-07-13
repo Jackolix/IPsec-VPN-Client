@@ -200,6 +200,11 @@ fn main() {
     }
 
     tauri::Builder::default()
+        // Must be the first plugin registered: a second launch hands off to
+        // this instance (focusing its window) instead of opening a duplicate.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tray::reveal(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::from_env())
         .invoke_handler(tauri::generate_handler![
@@ -266,7 +271,7 @@ mod tray {
         AppHandle, Manager,
     };
 
-    fn reveal(app: &AppHandle) {
+    pub(crate) fn reveal(app: &AppHandle) {
         if let Some(w) = app.get_webview_window("main") {
             let _ = w.show();
             let _ = w.unminimize();
