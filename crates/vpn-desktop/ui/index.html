@@ -524,11 +524,14 @@
       var win = wapi.getCurrentWindow();
       // tauri.conf.json's minHeight (520) is sized for the full dashboard and
       // would otherwise clamp the compact window back up on every resize.
-      var minSize = compact ? new dpi.LogicalSize(360, 300) : new dpi.LogicalSize(380, 520);
-      var size = compact ? new dpi.LogicalSize(400, 350) : new dpi.LogicalSize(1180, 840);
+      var minSize = compact ? new dpi.LogicalSize(360, 280) : new dpi.LogicalSize(380, 520);
+      var size = compact ? new dpi.LogicalSize(400, 300) : new dpi.LogicalSize(1180, 840);
       Promise.resolve(win.setMinSize(minSize)).catch(function () {}).then(function () {
         return win.setSize(size);
       }).catch(function () {});
+      // The compact card is sized to its content — free resizing just leaves
+      // empty space or clips it, so lock the window while compact.
+      Promise.resolve(win.setResizable(!compact)).catch(function () {});
     } catch (e) {}
   }
 
