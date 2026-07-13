@@ -14,12 +14,40 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// charon-svc's built-in Windows vici default; the app targets this for the
-/// native backend (the Linux dev container uses 45022 instead).
-pub const NATIVE_VICI_ADDR: &str = "127.0.0.1:4502";
+/// vici socket for *our* charon — a port dedicated to this app, not
+/// `charon-svc`'s built-in default (4502). That default is shared by every
+/// strongSwan-based client: Sophos Connect ships one and runs it permanently,
+/// so on such a machine the app used to find *its* daemon on 4502, conclude the
+/// backend was up, and push connections and the PSK into it. Must match
+/// `plugins.vici.socket` in the bundled `strongswan.conf` and the broker's
+/// `VICI_ADDR`. (The Linux dev container uses 45022.)
+pub const NATIVE_VICI_ADDR: &str = "127.0.0.1:45023";
 
-/// Is a vici control socket accepting connections at `addr`? A successful TCP
-/// connect means charon is up (vici is charon's only TCP listener).
+/// The `strongswan.conf` shipped beside charon. charon-svc cannot locate it on
+/// Windows by itself — it is passed via the `STRONGSWAN_CONF` environment
+/// variable — and it is what puts vici on [`NATIVE_VICI_ADDR`] instead of the
+/// shared default port, so a missing conf is a hard error rather than a daemon
+/// that silently comes up somewhere we won't look.
+#[cfg(windows)]
+fn strongswan_conf(dir: &Path) -> Result<PathBuf, String> {
+    let conf = dir.join("etc").join("strongswan.conf");
+    if conf.is_file() {
+        return Ok(conf);
+    }
+    Err(format!(
+        "strongswan.conf not found at {} — charon would come up on its default \
+         vici port instead of {NATIVE_VICI_ADDR}",
+        conf.display()
+    ))
+}
+
+/// Is a vici control socket accepting connections at `addr`?
+///
+/// This cannot tell *whose* daemon answers: identifying the process behind the
+/// port requires opening it, which an unelevated GUI may not do to a SYSTEM
+/// process. The broker (LocalSystem) enforces that check — see
+/// `vpn_broker::charon::is_ours` — and the dedicated port above is what keeps
+/// another vendor's charon from landing here in the first place.
 pub fn is_running(addr: &str) -> bool {
     addr.to_socket_addr()
         .and_then(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(400)).ok())
@@ -87,15 +115,26 @@ pub fn start(addr: &str) -> Result<(), String> {
     }
     let exe = charon_exe()?;
     let dir: &Path = exe.parent().ok_or("charon-svc.exe has no parent directory")?;
+    let conf = strongswan_conf(dir)?;
     let exe_ps = exe.to_string_lossy().replace('\'', "''");
     let dir_ps = dir.to_string_lossy().replace('\'', "''");
+    let conf_ps = conf.to_string_lossy().replace('\'', "''");
 
     // A non-elevated powershell issues Start-Process -Verb RunAs, which raises
     // the UAC prompt and launches charon-svc.exe elevated. Its working dir is
     // its own folder so the sibling DLLs resolve; it keeps running in the
     // background after this command returns (once the prompt is answered).
+    //
+    // charon is launched through `cmd /c set … && start` rather than directly,
+    // because it must be told where strongswan.conf is: on Windows it cannot
+    // derive the path, and STRONGSWAN_CONF is the only way to pass it. Without
+    // it charon falls back to its built-in defaults — including vici on 4502,
+    // the port we moved off of — and the app would never find it. Setting the
+    // variable inside the elevated shell (rather than in our own environment)
+    // avoids relying on it surviving the UAC elevation boundary.
     let inner = format!(
-        "Start-Process -FilePath '{exe_ps}' -WorkingDirectory '{dir_ps}' -Verb RunAs"
+        "Start-Process -FilePath 'cmd.exe' -Verb RunAs -ArgumentList '/c',\
+         'set \"STRONGSWAN_CONF={conf_ps}\" && start \"charon\" /D \"{dir_ps}\" \"{exe_ps}\"'"
     );
     let status = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &inner])
@@ -129,10 +168,16 @@ pub fn stop(addr: &str) -> Result<(), String> {
     if vpn_broker::client::available() {
         return Err("charon is managed by the VPN broker service; stop that service to stop it".to_string());
     }
-    let inner = "Start-Process -FilePath 'taskkill' -Verb RunAs \
-                 -ArgumentList @('/F','/IM','charon-svc.exe')";
+    // Kill the pid holding our vici port, never `/IM charon-svc.exe`: that image
+    // name is not ours alone (Sophos Connect ships a charon-svc too), and by
+    // name we would take down another vendor's live VPN.
+    let pid = vpn_broker::listener::owner_pid(addr)
+        .ok_or("charon is listening but its process could not be identified")?;
+    let inner = format!(
+        "Start-Process -FilePath 'taskkill' -Verb RunAs -ArgumentList @('/F','/PID','{pid}')"
+    );
     let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", inner])
+        .args(["-NoProfile", "-Command", &inner])
         .status()
         .map_err(|e| format!("failed to stop charon-svc: {e}"))?;
     if !status.success() {
