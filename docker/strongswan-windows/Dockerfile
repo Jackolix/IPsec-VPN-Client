@@ -119,3 +119,10 @@ RUN cp "${PREFIX}/bin/charon-svc.exe" /dist/ \
          find /usr/lib/gcc/${MINGW} /usr/${MINGW} -name "$dll" -exec cp {} /dist/ \; 2>/dev/null || true; \
        done \
     && ls -1 /dist
+
+# strongswan.conf belongs to the dist tree, not just to the local build script:
+# charon-svc cannot find it on Windows by itself (STRONGSWAN_CONF points at it),
+# and it is what puts vici on our own port. Ship it with the daemon so every
+# consumer — the release workflow included — gets it, instead of charon silently
+# falling back to its built-in defaults on the shared default port.
+COPY docker/strongswan-windows/strongswan.conf /dist/etc/strongswan.conf
