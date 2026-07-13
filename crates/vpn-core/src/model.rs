@@ -60,6 +60,19 @@ impl EncAlg {
             EncAlg::Aes256 => "aes256",
         }
     }
+
+    /// Inverse of [`EncAlg::swanctl_name`] — parses the name a UI round-trips.
+    pub fn from_swanctl_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "aes128" => EncAlg::Aes128,
+            "aes192" => EncAlg::Aes192,
+            "aes256" => EncAlg::Aes256,
+            _ => return None,
+        })
+    }
+
+    /// Every value, in the order a picker should offer them.
+    pub const ALL: [EncAlg; 3] = [EncAlg::Aes128, EncAlg::Aes192, EncAlg::Aes256];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +92,23 @@ impl IntegAlg {
             IntegAlg::Sha512 => "sha512",
         }
     }
+
+    pub fn from_swanctl_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "sha1" => IntegAlg::Sha1,
+            "sha256" => IntegAlg::Sha256,
+            "sha384" => IntegAlg::Sha384,
+            "sha512" => IntegAlg::Sha512,
+            _ => return None,
+        })
+    }
+
+    pub const ALL: [IntegAlg; 4] = [
+        IntegAlg::Sha1,
+        IntegAlg::Sha256,
+        IntegAlg::Sha384,
+        IntegAlg::Sha512,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +128,18 @@ impl PrfAlg {
             PrfAlg::Sha512 => "prfsha512",
         }
     }
+
+    pub fn from_swanctl_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "prfsha1" => PrfAlg::Sha1,
+            "prfsha256" => PrfAlg::Sha256,
+            "prfsha384" => PrfAlg::Sha384,
+            "prfsha512" => PrfAlg::Sha512,
+            _ => return None,
+        })
+    }
+
+    pub const ALL: [PrfAlg; 4] = [PrfAlg::Sha1, PrfAlg::Sha256, PrfAlg::Sha384, PrfAlg::Sha512];
 }
 
 /// IKE Diffie-Hellman groups, named by their IANA transform ID.
@@ -137,6 +179,29 @@ impl DhGroup {
             DhGroup::Ecp384 => "ecp384",
         }
     }
+
+    pub fn from_swanctl_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "modp1024" => DhGroup::Modp1024,
+            "modp1536" => DhGroup::Modp1536,
+            "modp2048" => DhGroup::Modp2048,
+            "modp3072" => DhGroup::Modp3072,
+            "modp4096" => DhGroup::Modp4096,
+            "ecp256" => DhGroup::Ecp256,
+            "ecp384" => DhGroup::Ecp384,
+            _ => return None,
+        })
+    }
+
+    pub const ALL: [DhGroup; 7] = [
+        DhGroup::Modp1024,
+        DhGroup::Modp1536,
+        DhGroup::Modp2048,
+        DhGroup::Modp3072,
+        DhGroup::Modp4096,
+        DhGroup::Ecp256,
+        DhGroup::Ecp384,
+    ];
 }
 
 /// How the peer authenticates. Only PSK for Phase 0.
@@ -173,6 +238,35 @@ impl fmt::Display for Ipv4Net {
     }
 }
 
+/// Parses the CIDR form this type prints, so an edited traffic selector can be
+/// round-tripped through a text field. A bare address means a /32 host route.
+impl std::str::FromStr for Ipv4Net {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let (addr, len) = match s.split_once('/') {
+            Some((a, l)) => (
+                a.trim(),
+                l.trim()
+                    .parse::<u8>()
+                    .map_err(|_| format!("{s:?}: prefix length is not a number"))?,
+            ),
+            None => (s, 32),
+        };
+        if len > 32 {
+            return Err(format!("{s:?}: prefix length must be 0–32"));
+        }
+        let addr: Ipv4Addr = addr
+            .parse()
+            .map_err(|_| format!("{s:?}: not an IPv4 network"))?;
+        Ok(Ipv4Net {
+            addr,
+            prefix_len: len,
+        })
+    }
+}
+
 /// The IKE identity type declared by a profile. Maps to an IANA IKEv2 ID
 /// type; we use it to emit a strongSwan-typed identity so charon presents the
 /// exact type the peer expects instead of inferring it from the string.
@@ -186,6 +280,36 @@ pub enum IkeIdType {
     Rfc822,
     /// IANA 11 — an opaque key id (`keyid:`).
     KeyId,
+}
+
+impl IkeIdType {
+    /// The strongSwan identity prefix, which doubles as this type's stable name
+    /// in the profile-override file and the UI.
+    pub fn name(self) -> &'static str {
+        match self {
+            IkeIdType::Ipv4 => "ipv4",
+            IkeIdType::Fqdn => "fqdn",
+            IkeIdType::Rfc822 => "rfc822",
+            IkeIdType::KeyId => "keyid",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "ipv4" => IkeIdType::Ipv4,
+            "fqdn" => IkeIdType::Fqdn,
+            "rfc822" => IkeIdType::Rfc822,
+            "keyid" => IkeIdType::KeyId,
+            _ => return None,
+        })
+    }
+
+    pub const ALL: [IkeIdType; 4] = [
+        IkeIdType::Ipv4,
+        IkeIdType::Fqdn,
+        IkeIdType::Rfc822,
+        IkeIdType::KeyId,
+    ];
 }
 
 /// The internal, importer-independent connection configuration.
