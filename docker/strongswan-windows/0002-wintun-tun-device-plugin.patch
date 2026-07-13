@@ -1,0 +1,1039 @@
+diff --git a/configure.ac b/configure.ac
+index 7bca05a83..b27146176 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -226,6 +226,7 @@ ARG_ENABL_SET([xauth-eap],      [enable XAuth backend using EAP methods to verif
+ ARG_ENABL_SET([xauth-pam],      [enable XAuth backend using PAM to verify passwords.])
+ ARG_ENABL_SET([xauth-noauth],   [enable XAuth pseudo-backend that does not actually verify or even request any credentials.])
+ # kernel interfaces / sockets
++ARG_ENABL_SET([wintun],         [enables the Windows TUN device plugin.])
+ ARG_DISBL_SET([kernel-netlink], [disable the netlink kernel interface.])
+ ARG_ENABL_SET([kernel-pfkey],   [enable the PF_KEY kernel interface.])
+ ARG_ENABL_SET([kernel-pfroute], [enable the PF_ROUTE kernel interface.])
+@@ -1587,6 +1588,7 @@ ADD_PLUGIN([winhttp],              [s charon pki scripts])
+ ADD_PLUGIN([soup],                 [s charon pki scripts nm cmd])
+ ADD_PLUGIN([mysql],                [s charon pool manager medsrv attest])
+ ADD_PLUGIN([sqlite],               [s charon pool manager medsrv attest])
++ADD_PLUGIN([wintun],               [s charon])
+ ADD_PLUGIN([attr],                 [c charon])
+ ADD_PLUGIN([attr-sql],             [c charon])
+ ADD_PLUGIN([load-tester],          [c charon])
+@@ -1750,6 +1752,7 @@ AM_CONDITIONAL(USE_NTRU, test x$ntru = xtrue)
+ AM_CONDITIONAL(USE_NEWHOPE, test x$newhope = xtrue)
+ AM_CONDITIONAL(USE_BLISS, test x$bliss = xtrue)
+ AM_CONDITIONAL(USE_DRBG, test x$drbg = xtrue)
++AM_CONDITIONAL(USE_WINTUN, test x$wintun = xtrue)
+ 
+ #  charon plugins
+ # ----------------
+@@ -2034,6 +2037,7 @@ AC_CONFIG_FILES([
+ 	src/libstrongswan/plugins/newhope/Makefile
+ 	src/libstrongswan/plugins/newhope/tests/Makefile
+ 	src/libstrongswan/plugins/test_vectors/Makefile
++	src/libstrongswan/plugins/wintun/Makefile
+ 	src/libstrongswan/tests/Makefile
+ 	src/libipsec/Makefile
+ 	src/libipsec/tests/Makefile
+diff --git a/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c b/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c
+index 0b25518f4..a58e762ee 100644
+--- a/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c
++++ b/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c
+@@ -127,7 +127,7 @@ plugin_t *kernel_libipsec_plugin_create()
+ 		return NULL;
+ 	}
+ 
+-	this->tun = tun_device_create("ipsec%d");
++	this->tun = lib->tun->create(lib->tun, "ipsec%d");
+ 	if (!this->tun)
+ 	{
+ 		DBG1(DBG_KNL, "failed to create TUN device");
+diff --git a/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_router.c b/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_router.c
+index 884616345..476eb2bc7 100644
+--- a/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_router.c
++++ b/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_router.c
+@@ -307,6 +307,7 @@ METHOD(kernel_libipsec_router_t, destroy, void,
+ 	free(this);
+ }
+ 
++#ifndef WIN32
+ /**
+  * Set O_NONBLOCK on the given socket.
+  */
+@@ -315,6 +316,7 @@ static bool set_nonblock(int socket)
+ 	int flags = fcntl(socket, F_GETFL);
+ 	return flags != -1 && fcntl(socket, F_SETFL, flags | O_NONBLOCK) != -1;
+ }
++#endif
+ 
+ /*
+  * See header file
+@@ -322,6 +324,9 @@ static bool set_nonblock(int socket)
+ kernel_libipsec_router_t *kernel_libipsec_router_create()
+ {
+ 	private_kernel_libipsec_router_t *this;
++#ifdef WIN32
++	u_long on = 1;
++#endif
+ 
+ 	INIT(this,
+ 		.public = {
+@@ -336,8 +341,13 @@ kernel_libipsec_router_t *kernel_libipsec_router_create()
+ 		}
+ 	);
+ 
++#ifdef WIN32
++	if (socketpair(AF_INET, SOCK_STREAM, 0, this->notify) != 0 ||
++		ioctlsocket(this->notify[0], FIONBIO, &on) != 0)
++#else /* !WIN32 */
+ 	if (pipe(this->notify) != 0 ||
+ 		!set_nonblock(this->notify[0]) || !set_nonblock(this->notify[1]))
++#endif /* !WIN332 */
+ 	{
+ 		DBG1(DBG_KNL, "creating notify pipe for kernel-libipsec router failed");
+ 		free(this);
+diff --git a/src/libcharon/plugins/kernel_pfroute/kernel_pfroute_net.c b/src/libcharon/plugins/kernel_pfroute/kernel_pfroute_net.c
+index acc22902c..f7690655c 100644
+--- a/src/libcharon/plugins/kernel_pfroute/kernel_pfroute_net.c
++++ b/src/libcharon/plugins/kernel_pfroute/kernel_pfroute_net.c
+@@ -1235,7 +1235,7 @@ METHOD(kernel_net_t, add_ip, status_t,
+ 		return SUCCESS;
+ 	}
+ 
+-	tun = tun_device_create(NULL);
++	tun = lib->tun->create(lib->tun, NULL);
+ 	if (!tun)
+ 	{
+ 		return FAILED;
+diff --git a/src/libstrongswan/Android.mk b/src/libstrongswan/Android.mk
+index 12f26f346..d6d2da9f4 100644
+--- a/src/libstrongswan/Android.mk
++++ b/src/libstrongswan/Android.mk
+@@ -35,9 +35,10 @@ database/database_factory.c fetcher/fetcher.c fetcher/fetcher_manager.c eap/eap.
+ ipsec/ipsec_types.c \
+ metadata/metadata_factory.c metadata/metadata_int.c metadata/metadata_set.c \
+ networking/host.c networking/host_resolver.c networking/packet.c \
+-networking/tun_device.c networking/streams/stream_manager.c \
+-networking/streams/stream.c networking/streams/stream_service.c \
+-networking/streams/stream_tcp.c networking/streams/stream_service_tcp.c \
++networking/tun_device.c networking/tun_device_manager.c \
++networking/streams/stream_manager.c networking/streams/stream.c \
++networking/streams/stream_service.c networking/streams/stream_tcp.c \
++networking/streams/stream_service_tcp.c \
+ pen/pen.c plugins/plugin_loader.c plugins/plugin_feature.c processing/jobs/job.c \
+ processing/jobs/callback_job.c processing/processor.c processing/scheduler.c \
+ processing/watcher.c resolver/resolver_manager.c resolver/rr_set.c \
+diff --git a/src/libstrongswan/Makefile.am b/src/libstrongswan/Makefile.am
+index f118c723a..f3a9c3e0f 100644
+--- a/src/libstrongswan/Makefile.am
++++ b/src/libstrongswan/Makefile.am
+@@ -33,9 +33,10 @@ database/database_factory.c fetcher/fetcher.c fetcher/fetcher_manager.c eap/eap.
+ ipsec/ipsec_types.c \
+ metadata/metadata_factory.c metadata/metadata_int.c metadata/metadata_set.c \
+ networking/host.c networking/host_resolver.c networking/packet.c \
+-networking/tun_device.c networking/streams/stream_manager.c \
+-networking/streams/stream.c networking/streams/stream_service.c \
+-networking/streams/stream_tcp.c networking/streams/stream_service_tcp.c \
++networking/tun_device.c networking/tun_device_manager.c \
++networking/streams/stream_manager.c networking/streams/stream.c \
++networking/streams/stream_service.c networking/streams/stream_tcp.c \
++networking/streams/stream_service_tcp.c \
+ pen/pen.c plugins/plugin_loader.c plugins/plugin_feature.c processing/jobs/job.c \
+ processing/jobs/callback_job.c processing/processor.c processing/scheduler.c \
+ processing/watcher.c resolver/resolver_manager.c resolver/rr_set.c \
+@@ -105,7 +106,7 @@ fetcher/fetcher_manager.h eap/eap.h pen/pen.h ipsec/ipsec_types.h \
+ metadata/metadata.h metadata/metadata_factory.h metadata/metadata_int.h \
+ metadata/metadata_set.h \
+ networking/host.h networking/host_resolver.h networking/packet.h \
+-networking/tun_device.h networking/streams/stream.h \
++networking/tun_device.h networking/tun_device_manager.h networking/streams/stream.h \
+ networking/streams/stream_unix.h networking/streams/stream_service_unix.h \
+ networking/streams/stream_service_systemd.h \
+ networking/streams/stream_tcp.h networking/streams/stream_service_tcp.h \
+@@ -696,6 +697,13 @@ if MONOLITHIC
+ endif
+ endif
+ 
++if USE_WINTUN
++  SUBDIRS += plugins/wintun
++if MONOLITHIC
++  libstrongswan_la_LIBADD += plugins/wintun/libstrongswan-wintun.la
++endif
++endif
++
+ if MONOLITHIC
+   SUBDIRS += .
+ endif
+diff --git a/src/libstrongswan/library.c b/src/libstrongswan/library.c
+index f2ece6ca9..a84545c5b 100644
+--- a/src/libstrongswan/library.c
++++ b/src/libstrongswan/library.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright (C) 2009-2018 Tobias Brunner
+  * Copyright (C) 2008 Martin Willi
++ * Copyright (C) 2023 Andreas Steffen
+  *
+  * Copyright (C) secunet Security Networks AG
+  *
+@@ -177,6 +178,7 @@ void library_deinit()
+ 	this->public.proposal->destroy(this->public.proposal);
+ 	this->public.fetcher->destroy(this->public.fetcher);
+ 	this->public.resolver->destroy(this->public.resolver);
++	this->public.tun->destroy(this->public.tun);
+ 	this->public.db->destroy(this->public.db);
+ 	this->public.printf_hook->destroy(this->public.printf_hook);
+ 	this->objects->destroy(this->objects);
+@@ -404,6 +406,7 @@ bool library_init(char *settings, const char *namespace)
+ 	this->public.metadata = metadata_factory_create();
+ 	this->public.fetcher = fetcher_manager_create();
+ 	this->public.resolver = resolver_manager_create();
++	this->public.tun = tun_device_manager_create();
+ 	this->public.db = database_factory_create();
+ 	this->public.processor = processor_create();
+ 	this->public.scheduler = scheduler_create();
+diff --git a/src/libstrongswan/library.h b/src/libstrongswan/library.h
+index 9b8a26c1c..34ed3856a 100644
+--- a/src/libstrongswan/library.h
++++ b/src/libstrongswan/library.h
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright (C) 2010-2018 Tobias Brunner
+  * Copyright (C) 2008 Martin Willi
++ * Copyright (C) 2023 Andreas Steffen
+  *
+  * Copyright (C) secunet Security Networks AG
+  *
+@@ -109,6 +110,7 @@
+ #include "crypto/proposal/proposal_keywords.h"
+ #include "fetcher/fetcher_manager.h"
+ #include "resolver/resolver_manager.h"
++#include "networking/tun_device_manager.h"
+ #include "database/database_factory.h"
+ #include "credentials/credential_factory.h"
+ #include "credentials/credential_manager.h"
+@@ -204,7 +206,12 @@ struct library_t {
+ 	/**
+ 	 * Manager for DNS resolvers
+ 	 */
+-	 resolver_manager_t *resolver;
++	resolver_manager_t *resolver;
++
++	/**
++	 * Manager for TUN devices
++	 */
++	tun_device_manager_t *tun;
+ 
+ 	/**
+ 	 * database construction factory
+diff --git a/src/libstrongswan/networking/tun_device.h b/src/libstrongswan/networking/tun_device.h
+index 36ece0e6a..6533fe2b6 100644
+--- a/src/libstrongswan/networking/tun_device.h
++++ b/src/libstrongswan/networking/tun_device.h
+@@ -114,6 +114,8 @@ struct tun_device_t {
+ 
+ };
+ 
++typedef tun_device_t *(*tun_device_constructor_t)(const char *name_tmpl);
++
+ /**
+  * Create a TUN device using the given name template.
+  *
+diff --git a/src/libstrongswan/networking/tun_device_manager.c b/src/libstrongswan/networking/tun_device_manager.c
+new file mode 100644
+index 000000000..8e9c2760c
+--- /dev/null
++++ b/src/libstrongswan/networking/tun_device_manager.c
+@@ -0,0 +1,93 @@
++/*
++ * Copyright (C) 2023 Andreas Steffen
++ *
++ * Copyright (C) secunet Security Networks AG
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include "tun_device_manager.h"
++
++#include <utils/debug.h>
++
++typedef struct private_tun_device_manager_t private_tun_device_manager_t;
++
++/**
++ * private data of tun_device_manager
++ */
++struct private_tun_device_manager_t {
++
++	/**
++	 * public functions
++	 */
++	tun_device_manager_t public;
++
++	/**
++	 * constructor function to create tun_device instances
++	 */
++	tun_device_constructor_t constructor;
++};
++
++METHOD(tun_device_manager_t, add_tun_device, void,
++	private_tun_device_manager_t *this, tun_device_constructor_t constructor)
++{
++	if (!this->constructor)
++	{
++		this->constructor = constructor;
++	}
++}
++
++METHOD(tun_device_manager_t, remove_tun_device, void,
++	private_tun_device_manager_t *this, tun_device_constructor_t constructor)
++{
++	if (this->constructor == constructor)
++	{
++		this->constructor = NULL;
++	}
++}
++
++METHOD(tun_device_manager_t, create, tun_device_t*,
++	private_tun_device_manager_t *this, const char *name_tmpl)
++{
++	if (this->constructor)
++	{
++		return this->constructor(name_tmpl);
++	}
++	else
++	{
++		return tun_device_create(name_tmpl);
++	}
++}
++
++METHOD(tun_device_manager_t, destroy, void,
++	private_tun_device_manager_t *this)
++{
++	free(this);
++}
++
++/*
++ * See header
++ */
++tun_device_manager_t *tun_device_manager_create()
++{
++	private_tun_device_manager_t *this;
++
++	INIT(this,
++			.public = {
++				.add_tun_device = _add_tun_device,
++				.remove_tun_device = _remove_tun_device,
++				.create = _create,
++				.destroy = _destroy,
++			},
++	);
++
++	return &this->public;
++}
+diff --git a/src/libstrongswan/networking/tun_device_manager.h b/src/libstrongswan/networking/tun_device_manager.h
+new file mode 100644
+index 000000000..72446263e
+--- /dev/null
++++ b/src/libstrongswan/networking/tun_device_manager.h
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2023 Andreas Steffen
++ *
++ * Copyright (C) secunet Security Networks AG
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++/**
++* @defgroup tun_device_manager tun_device_manager
++* @{ @ingroup tun_device
++*/
++
++#ifndef TUN_DEVICE_MANAGER_H_
++#define TUN_DEVICE_MANAGER_H_
++
++typedef struct tun_device_manager_t tun_device_manager_t;
++
++#include <networking/tun_device.h>
++
++/**
++ * The tun_device_manager manages the TUN device implementations and
++ * creates instances of them.
++ *
++ * A tun device plugin is registered by providing its constructor function
++ * to the manager. The manager creates instances of the tun device plugin
++ * using the registered constructor function.
++ *
++ * Currently the default POSIX TUN device is not a plugin, but hard-coded
++ * into libstrongswan. If no third party TUN device plugin is registered, then
++ * the built-in POSIX tun device is used.
++ */
++struct tun_device_manager_t {
++
++	/**
++	 * Register a TUN_device implementation.
++	 *
++	 * @param constructor	tun_device constructor function
++	 */
++	void (*add_tun_device)(tun_device_manager_t *this,
++						   tun_device_constructor_t constructor);
++
++	/**
++	 * Unregister a previously registered tun_device implementation.
++	 *
++	 * @param constructor tun_device constructor function to unregister
++	 */
++	void (*remove_tun_device)(tun_device_manager_t *this,
++							  tun_device_constructor_t constructor);
++
++	/**
++	 * Get a new tun_device instance.
++	 *
++	 * @param name_tmpl		name template, defaults to "tun%d" if not given
++	 * @return 				tun_device instance.
++	 */
++	tun_device_t* (*create)(tun_device_manager_t *this, const char *name_tmpl);
++
++	/**
++	 * Destroy a tun_device_manager instance.
++	 */
++	void (*destroy)(tun_device_manager_t *this);
++};
++
++/**
++ * Create a tun_device_manager instance.
++ */
++tun_device_manager_t *tun_device_manager_create();
++
++#endif /** TUN_DEVICE_MANAGER_H_ @}*/
+diff --git a/src/libstrongswan/plugins/plugin_feature.c b/src/libstrongswan/plugins/plugin_feature.c
+index 96bbb9a89..2337c331e 100644
+--- a/src/libstrongswan/plugins/plugin_feature.c
++++ b/src/libstrongswan/plugins/plugin_feature.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2016-2019 Andreas Steffen
++ * Copyright (C) 2016-2023 Andreas Steffen
+  * Copyright (C) 2012-2015 Tobias Brunner
+  * Copyright (C) 2011 Martin Willi
+  *
+@@ -54,6 +54,7 @@ ENUM(plugin_feature_names, FEATURE_NONE, FEATURE_CUSTOM,
+ 	"DATABASE",
+ 	"FETCHER",
+ 	"RESOLVER",
++	"TUN_DEVICE",
+ 	"CUSTOM",
+ );
+ 
+@@ -72,6 +73,7 @@ uint32_t plugin_feature_hash(plugin_feature_t *feature)
+ 		case FEATURE_DATABASE:
+ 		case FEATURE_FETCHER:
+ 		case FEATURE_RESOLVER:
++		case FEATURE_TUN_DEVICE:
+ 			/* put these special cases in their (type-specific) buckets */
+ 			data = chunk_empty;
+ 			break;
+@@ -184,6 +186,7 @@ bool plugin_feature_matches(plugin_feature_t *a, plugin_feature_t *b)
+ 				return a->arg.rng_quality <= b->arg.rng_quality;
+ 			case FEATURE_NONCE_GEN:
+ 			case FEATURE_RESOLVER:
++			case FEATURE_TUN_DEVICE:
+ 				return TRUE;
+ 			case FEATURE_PRIVKEY:
+ 			case FEATURE_PRIVKEY_GEN:
+@@ -242,6 +245,7 @@ bool plugin_feature_equals(plugin_feature_t *a, plugin_feature_t *b)
+ 			case FEATURE_KE:
+ 			case FEATURE_NONCE_GEN:
+ 			case FEATURE_RESOLVER:
++			case FEATURE_TUN_DEVICE:
+ 			case FEATURE_PRIVKEY:
+ 			case FEATURE_PRIVKEY_GEN:
+ 			case FEATURE_PUBKEY:
+@@ -363,6 +367,7 @@ char* plugin_feature_get_string(plugin_feature_t *feature)
+ 			break;
+ 		case FEATURE_NONCE_GEN:
+ 		case FEATURE_RESOLVER:
++		case FEATURE_TUN_DEVICE:
+ 			if (asprintf(&str, "%N", plugin_feature_names, feature->type) > 0)
+ 			{
+ 				return str;
+@@ -574,6 +579,8 @@ bool plugin_feature_load(plugin_t *plugin, plugin_feature_t *feature,
+ 			break;
+ 		case FEATURE_RESOLVER:
+ 			lib->resolver->add_resolver(lib->resolver, reg->arg.reg.f);
++		case FEATURE_TUN_DEVICE:
++			lib->tun->add_tun_device(lib->tun, reg->arg.reg.f);
+ 			break;
+ 	}
+ 	return TRUE;
+@@ -668,6 +675,9 @@ bool plugin_feature_unload(plugin_t *plugin, plugin_feature_t *feature,
+ 		case FEATURE_RESOLVER:
+ 			lib->resolver->remove_resolver(lib->resolver, reg->arg.reg.f);
+ 			break;
++		case FEATURE_TUN_DEVICE:
++			lib->tun->remove_tun_device(lib->tun, reg->arg.reg.f);
++			break;
+ 	}
+ 	return TRUE;
+ }
+diff --git a/src/libstrongswan/plugins/plugin_feature.h b/src/libstrongswan/plugins/plugin_feature.h
+index 12ea78a63..bc522d8ee 100644
+--- a/src/libstrongswan/plugins/plugin_feature.h
++++ b/src/libstrongswan/plugins/plugin_feature.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2016-2019 Andreas Steffen
++ * Copyright (C) 2016-2023 Andreas Steffen
+  * Copyright (C) 2012-2015 Tobias Brunner
+  * Copyright (C) 2011 Martin Willi
+  *
+@@ -158,6 +158,8 @@ struct plugin_feature_t {
+ 		FEATURE_FETCHER,
+ 		/** resolver_t */
+ 		FEATURE_RESOLVER,
++		/** tun_device_t */
++		FEATURE_TUN_DEVICE,
+ 		/** custom feature, described with a string */
+ 		FEATURE_CUSTOM,
+ 	} type;
+@@ -314,6 +316,7 @@ struct plugin_feature_t {
+ #define _PLUGIN_FEATURE_DATABASE(kind, type)				__PLUGIN_FEATURE(kind, DATABASE, .database = type)
+ #define _PLUGIN_FEATURE_FETCHER(kind, type)					__PLUGIN_FEATURE(kind, FETCHER, .fetcher = type)
+ #define _PLUGIN_FEATURE_RESOLVER(kind, ...)					__PLUGIN_FEATURE(kind, RESOLVER, .custom = NULL)
++#define _PLUGIN_FEATURE_TUN_DEVICE(kind, ...)				__PLUGIN_FEATURE(kind, TUN_DEVICE, .custom = NULL)
+ #define _PLUGIN_FEATURE_CUSTOM(kind, name)					__PLUGIN_FEATURE(kind, CUSTOM, .custom = name)
+ #define _PLUGIN_FEATURE_XAUTH_SERVER(kind, name)			__PLUGIN_FEATURE(kind, XAUTH_SERVER, .xauth = name)
+ #define _PLUGIN_FEATURE_XAUTH_PEER(kind, name)				__PLUGIN_FEATURE(kind, XAUTH_PEER, .xauth = name)
+@@ -341,6 +344,7 @@ struct plugin_feature_t {
+ #define _PLUGIN_FEATURE_REGISTER_DATABASE(type, f)			__PLUGIN_FEATURE_REGISTER(type, f)
+ #define _PLUGIN_FEATURE_REGISTER_FETCHER(type, f)			__PLUGIN_FEATURE_REGISTER(type, f)
+ #define _PLUGIN_FEATURE_REGISTER_RESOLVER(type, f)			__PLUGIN_FEATURE_REGISTER(type, f)
++#define _PLUGIN_FEATURE_REGISTER_TUN_DEVICE(type, f)		__PLUGIN_FEATURE_REGISTER(type, f)
+ 
+ #define _PLUGIN_FEATURE_CALLBACK(_cb, _data) (plugin_feature_t){ FEATURE_CALLBACK, FEATURE_NONE, .arg.cb = { .f = _cb, .data = _data } }
+ 
+diff --git a/src/libstrongswan/plugins/wintun/Makefile.am b/src/libstrongswan/plugins/wintun/Makefile.am
+new file mode 100644
+index 000000000..2a80d010f
+--- /dev/null
++++ b/src/libstrongswan/plugins/wintun/Makefile.am
+@@ -0,0 +1,19 @@
++AM_CPPFLAGS = \
++	-I$(top_srcdir)/src/libstrongswan
++
++AM_CFLAGS = \
++	$(PLUGIN_CFLAGS)
++
++noinst_LTLIBRARIES =
++if MONOLITHIC
++noinst_LTLIBRARIES += libstrongswan-wintun.la
++else
++plugin_LTLIBRARIES = libstrongswan-wintun.la
++endif
++
++libstrongswan_wintun_la_SOURCES = \
++	wintun_plugin.h wintun_plugin.c \
++	wintun_device.h wintun_device.c
++
++libstrongswan_wintun_la_LDFLAGS = -module -avoid-version
++
+diff --git a/src/libstrongswan/plugins/wintun/wintun_device.c b/src/libstrongswan/plugins/wintun/wintun_device.c
+new file mode 100644
+index 000000000..8b35fd1ea
+--- /dev/null
++++ b/src/libstrongswan/plugins/wintun/wintun_device.c
+@@ -0,0 +1,275 @@
++/*
++ * Copyright (C) 2023 Andreas Steffen
++ *
++ * Copyright (C) secunet Security Networks AG
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#ifdef WIN32
++#include <wintun.h>
++#endif
++
++#include "wintun_device.h"
++
++#include <utils/debug.h>
++
++#ifndef WIN32
++
++wintun_device_t *wintun_device_create(const char *name_tmpl)
++{
++	DBG1(DBG_LIB, "Wintun devices not supported");
++	return NULL;
++}
++
++bool wintun_library_init()
++{
++	DBG1(DBG_LIB, "Wintun library not supported");
++ 	return TRUE;
++}
++
++void wintun_library_deinit()
++{
++}
++
++#else /* WIN32 */
++
++/**
++  * Functions offered by the Wintun dynamic library
++  */
++static WINTUN_CREATE_ADAPTER_FUNC *WintunCreateAdapter;
++static WINTUN_CLOSE_ADAPTER_FUNC *WintunCloseAdapter;
++static WINTUN_OPEN_ADAPTER_FUNC *WintunOpenAdapter;
++static WINTUN_GET_ADAPTER_LUID_FUNC *WintunGetAdapterLUID;
++static WINTUN_GET_RUNNING_DRIVER_VERSION_FUNC *WintunGetRunningDriverVersion;
++static WINTUN_DELETE_DRIVER_FUNC *WintunDeleteDriver;
++static WINTUN_SET_LOGGER_FUNC *WintunSetLogger;
++static WINTUN_START_SESSION_FUNC *WintunStartSession;
++static WINTUN_END_SESSION_FUNC *WintunEndSession;
++static WINTUN_GET_READ_WAIT_EVENT_FUNC *WintunGetReadWaitEvent;
++static WINTUN_RECEIVE_PACKET_FUNC *WintunReceivePacket;
++static WINTUN_RELEASE_RECEIVE_PACKET_FUNC *WintunReleaseReceivePacket;
++static WINTUN_ALLOCATE_SEND_PACKET_FUNC *WintunAllocateSendPacket;
++static WINTUN_SEND_PACKET_FUNC *WintunSendPacket;
++
++static HMODULE Wintun;
++
++#define IFNAMSIZ         16
++#define TUN_DEFAULT_MTU  1500
++
++typedef struct private_wintun_device_t private_wintun_device_t;
++
++struct private_wintun_device_t {
++
++	/**
++	 * Public interface
++	 */
++	wintun_device_t public;
++
++	/**
++	 * The Wintun device's file descriptor
++	 */
++	int tunfd;
++
++	/**
++	 * Name of the Wintun device
++	 */
++	char if_name[IFNAMSIZ];
++
++	/**
++	 * The current MTU
++	 */
++	int mtu;
++
++	/**
++	 * Associated address
++	 */
++	host_t *address;
++
++	/**
++	 * Netmask for address
++	 */
++	uint8_t netmask;
++
++	/*
++	 * Wintun adapter handle
++	 */
++    WINTUN_ADAPTER_HANDLE Adapter;
++
++};
++
++METHOD(tun_device_t, set_address, bool,
++	private_wintun_device_t *this, host_t *addr, uint8_t netmask)
++{
++	this->address = addr->clone(addr);
++	this->netmask = netmask;
++
++	return TRUE;
++}
++
++METHOD(tun_device_t, get_address, host_t*,
++	private_wintun_device_t *this, uint8_t *netmask)
++{
++	if (netmask && this->address)
++	{
++		*netmask = this->netmask;
++	}
++	return this->address;
++}
++
++METHOD(tun_device_t, up, bool,
++	private_wintun_device_t *this)
++{
++	return TRUE;
++}
++
++METHOD(tun_device_t, set_mtu, bool,
++	private_wintun_device_t *this, int mtu)
++{
++	this->mtu = mtu;
++
++	return TRUE;
++}
++
++METHOD(tun_device_t, get_mtu, int,
++	private_wintun_device_t *this)
++{
++	return this->mtu;
++}
++
++METHOD(tun_device_t, get_name, char*,
++	private_wintun_device_t *this)
++{
++	return this->if_name;
++}
++
++METHOD(tun_device_t, get_fd, int,
++	private_wintun_device_t *this)
++{
++	return this->tunfd;
++}
++
++METHOD(tun_device_t, write_packet, bool,
++	private_wintun_device_t *this, chunk_t packet)
++{
++	return TRUE;
++}
++
++METHOD(tun_device_t, read_packet, bool,
++	private_wintun_device_t *this, chunk_t *packet)
++{
++	return TRUE;
++}
++
++METHOD(tun_device_t, destroy, void,
++	private_wintun_device_t *this)
++{
++	WintunCloseAdapter(this->Adapter);
++	free(this);
++}
++
++/**
++ * Initialize the Windows TUN device
++ */
++static bool init_wintun(private_wintun_device_t *this, const char *name_tmpl)
++{
++	DWORD Version;
++	GUID Guid;
++
++	Guid = { 0xdeadbabe, 0xcafe, 0xbeef, { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef } };
++	this->Adapter = WintunCreateAdapter(L"strongSwan", L"Wintun", &Guid);
++	if (!Adapter)
++	{
++		DBG1(DBG_LIB,"could not create Wintun adapter");
++		return FALSE;
++	}
++	this->ifname = "strongSwan";
++	Version = WintunGetRunningDriverVersion();
++	DBG1(DBG_LIB, "Wintun adapter v%u.%u loaded",
++		(Version >> 16) & 0xff, (Version >> 0) & 0xff);
++    return TRUE;
++}
++
++/*
++ * Described in header
++ */
++wintun_device_t *wintun_device_create(const char *name_tmpl)
++{
++	private_wintun_device_t *this;
++
++	INIT(this,
++		.public = {
++			.tun = {
++				.read_packet = _read_packet,
++				.write_packet = _write_packet,
++				.get_mtu = _get_mtu,
++				.set_mtu = _set_mtu,
++				.get_name = _get_name,
++				.get_fd = _get_fd,
++				.set_address = _set_address,
++				.get_address = _get_address,
++				.up = _up,
++				.destroy = _destroy,
++			},
++		},
++	);
++
++	if (!init_wintun(this, name_tmpl))
++	{
++		free(this);
++		return NULL;
++	}
++	DBG1(DBG_LIB, "created Wintun device: %s", this->if_name);
++
++	return &this->public;
++}
++
++/*
++ * Described in header
++ */
++bool wintun_library_init()
++{
++	Wintun = LoadLibraryExW(L"wintun.dll", NULL,
++				LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
++				LOAD_LIBRARY_SEARCH_SYSTEM32);
++	if (!Wintun)
++	{
++		DBG1(DBG_LIB, "failed to load Wintun library");
++		return FALSE;
++	}
++
++#define X(Name) ((*(FARPROC *)&Name = GetProcAddress(Wintun, #Name)) == NULL)
++	if (X(WintunCreateAdapter)           || X(WintunCloseAdapter)         ||
++		X(WintunOpenAdapter)             || X(WintunGetAdapterLUID)       ||
++		X(WintunGetRunningDriverVersion) || X(WintunDeleteDriver)         ||
++		X(WintunSetLogger)               || X(WintunStartSession)         ||
++		X(WintunEndSession)              || X(WintunGetReadWaitEvent)     ||
++		X(WintunReceivePacket)           || X(WintunReleaseReceivePacket) ||
++		X(WintunAllocateSendPacket)      || X(WintunSendPacket))
++#undef X
++	{
++		FreeLibrary(Wintun);
++		DBG1(DBG_LIB, "failed to initialize Wintun library");
++		return FALSE;
++	}
++	DBG1(DBG_LIB, "Wintun library loaded and initialized");
++ 	return TRUE;
++}
++
++/*
++ * Described in header
++ */
++void wintun_library_deinit()
++{
++	FreeLibrary(Wintun);
++}
++
++#endif /* WIN32 */
+diff --git a/src/libstrongswan/plugins/wintun/wintun_device.h b/src/libstrongswan/plugins/wintun/wintun_device.h
+new file mode 100644
+index 000000000..871c5b439
+--- /dev/null
++++ b/src/libstrongswan/plugins/wintun/wintun_device.h
+@@ -0,0 +1,60 @@
++/*
++ * Copyright (C) 2023 Andreas Steffen
++ *
++ * Copyright (C) secunet Security Networks AG
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++/**
++ * @defgroup wintun_device wintun_device
++ * @{ @ingroup wintun_p
++ */
++
++#ifndef WINTUN_DEVICE_H_
++#define WINTUN_DEVICE_H_
++
++#include <networking/tun_device.h>
++
++typedef struct wintun_device_t wintun_device_t;
++
++/**
++ * Windows TUN device implementation
++  */
++struct wintun_device_t {
++
++	/**
++	 * Generic tun_device_t interface.
++	 */
++	tun_device_t tun;
++};
++
++/**
++ * Create a Windows TUN device using the given name template.
++ *
++ * @param name_tmpl         name template, defaults to "tun%d" if not given
++ * @return                  Windows TUN device
++ */
++wintun_device_t *wintun_device_create(const char *name_tmpl);
++
++/**
++ * Initialize wintun library.
++ *
++ * @return              FALSE if library initialization failed
++ */
++bool wintun_library_init();
++
++/**
++ * Deinitialize wintun library.
++ */
++void wintun_library_deinit();
++
++#endif /** WINTUN_DEVICE_H_ @}*/
+diff --git a/src/libstrongswan/plugins/wintun/wintun_plugin.c b/src/libstrongswan/plugins/wintun/wintun_plugin.c
+new file mode 100644
+index 000000000..479a885ff
+--- /dev/null
++++ b/src/libstrongswan/plugins/wintun/wintun_plugin.c
+@@ -0,0 +1,83 @@
++/*
++ * Copyright (C) 2023 Andreas Steffen
++ *
++ * Copyright (C) secunet Security Networks AG
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include "wintun_plugin.h"
++#include "wintun_device.h"
++
++#include <library.h>
++
++typedef struct private_wintun_plugin_t private_wintun_plugin_t;
++
++/**
++ * Private data of a wintun_plugin_t object.
++ */
++struct private_wintun_plugin_t {
++
++	/**
++	 * Public interface.
++	 */
++	wintun_plugin_t public;
++};
++
++METHOD(plugin_t, get_name, char*,
++	private_wintun_plugin_t *this)
++{
++	return "wintun";
++}
++
++METHOD(plugin_t, get_features, int,
++	private_wintun_plugin_t *this, plugin_feature_t *features[])
++{
++	static plugin_feature_t f[] = {
++		PLUGIN_REGISTER(TUN_DEVICE, wintun_device_create),
++			PLUGIN_PROVIDE(TUN_DEVICE),
++	};
++	*features = f;
++	return countof(f);
++}
++
++METHOD(plugin_t, destroy, void,
++	private_wintun_plugin_t *this)
++{
++	wintun_library_deinit();
++	free(this);
++}
++
++/*
++ * see header file
++ */
++plugin_t *wintun_plugin_create(void)
++{
++	private_wintun_plugin_t *this;
++
++	if (!wintun_library_init())
++	{
++		return NULL;
++	}
++
++	INIT(this,
++		.public = {
++			.plugin = {
++				.get_name = _get_name,
++				.get_features = _get_features,
++				.destroy = _destroy,
++			},
++		},
++	);
++
++	return &this->public.plugin;
++}
++
+diff --git a/src/libstrongswan/plugins/wintun/wintun_plugin.h b/src/libstrongswan/plugins/wintun/wintun_plugin.h
+new file mode 100644
+index 000000000..ea693fc0e
+--- /dev/null
++++ b/src/libstrongswan/plugins/wintun/wintun_plugin.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 2023 Andreas Steffen
++ *
++ * Copyright (C) secunet Security Networks AG
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.  See <http://www.fsf.org/copyleft/gpl.txt>.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++/**
++ * @defgroup wintun_p wintun
++ * @ingroup plugins
++ *
++ * @defgroup wintun_plugin wintun_plugin
++ * @{ @ingroup wintun_p
++ */
++
++#ifndef WINTUN_PLUGIN_H_
++#define WINTUN_PLUGIN_H_
++
++#include <plugins/plugin.h>
++
++typedef struct wintun_plugin_t wintun_plugin_t;
++
++/**
++ * Plugin providing a Windows TUN device
++ */
++struct wintun_plugin_t {
++
++	/**
++	 * Implements plugin interface.
++	 */
++	plugin_t plugin;
++};
++
++#endif /** WINTUN_PLUGIN_H_ @}*/

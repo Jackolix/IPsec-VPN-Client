@@ -1,0 +1,109 @@
+# EXPERIMENT: the same native Windows charon, but with a datapath that can
+# actually carry a tunnel from behind NAT.
+#
+# The default build (../Dockerfile) uses kernel-wfp, which hands ESP to the
+# Windows IPsec engine. That engine drops UDP-encapsulated ESP with
+# STATUS_INTERNAL_ERROR (0xc00000e5) — a limitation strongSwan documents and has
+# no workaround for. Behind NAT, UDP encapsulation is not optional, so kernel-wfp
+# is a dead end for a road-warrior client.
+#
+# So do ESP in userland instead, and give it a virtual adapter to own — which is
+# exactly what Sophos Connect's strongSwan build does (libipsec + a TAP adapter),
+# and it demonstrably works against this gateway:
+#
+#   kernel-libipsec  ESP in userland; the Windows IPsec engine is not involved.
+#   wintun           TUN device. Upstream's `wintun` branch (Feb 2023) implements
+#                    it; the plugin LoadLibrary's wintun.dll at runtime, and that
+#                    DLL carries its own signed driver, so nothing to install.
+#                    Wintun is layer 3, so unlike TAP there is no Ethernet/ARP
+#                    emulation to write.
+#   kernel-iph       still the network backend (addresses + routes), patched to
+#                    install virtual IPs — the address lands on the Wintun adapter.
+#
+# Build + export:
+#   docker build -t ss-win-tun -f docker/strongswan-windows/Dockerfile.wintun .
+#   docker create --name x ss-win-tun && docker cp x:/dist ./out/strongswan-wintun && docker rm x
+
+FROM debian:bookworm AS build
+
+ARG MINGW=x86_64-w64-mingw32
+ARG OPENSSL_VER=3.0.16
+ARG STRONGSWAN_VER=5.9.14
+ARG WINTUN_VER=0.14.1
+ENV PREFIX=/opt/win
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64-tools \
+        build-essential wget ca-certificates perl pkg-config file bzip2 xz-utils \
+        patch unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# ---- OpenSSL (MinGW cross build) ----
+RUN wget -q "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz" \
+    && tar xf "openssl-${OPENSSL_VER}.tar.gz"
+RUN cd "openssl-${OPENSSL_VER}" \
+    && ./Configure mingw64 shared no-asm no-tests \
+        --prefix="${PREFIX}" --libdir=lib --cross-compile-prefix="${MINGW}-" \
+    && make -j"$(nproc)" \
+    && make install_sw
+
+# ---- Wintun: header to build against, DLL to ship ----
+# wintun.dll is loaded at runtime by the plugin (LoadLibraryExW), so the header
+# is all the build needs; the DLL goes into /dist next to charon-svc.exe.
+RUN wget -q "https://www.wintun.net/builds/wintun-${WINTUN_VER}.zip" \
+    && unzip -q "wintun-${WINTUN_VER}.zip" \
+    && cp wintun/include/wintun.h "${PREFIX}/include/" \
+    && mkdir -p /dist && cp wintun/bin/amd64/wintun.dll /dist/
+
+# ---- strongSwan ----
+RUN wget -q "https://download.strongswan.org/strongswan-${STRONGSWAN_VER}.tar.bz2" \
+    && tar xf "strongswan-${STRONGSWAN_VER}.tar.bz2"
+
+# 0001: kernel-iph can't install virtual IPs upstream (NOT_SUPPORTED stubs).
+# 0002: the Wintun TUN device plugin, taken from upstream's `wintun` branch
+#       (based on ~5.9.9, so it may need fuzz against 5.9.14).
+COPY docker/strongswan-windows/0001-kernel-iph-install-virtual-ips.patch /src/
+COPY docker/strongswan-windows/0002-wintun-tun-device-plugin.patch /src/
+RUN cd "strongswan-${STRONGSWAN_VER}" \
+    && patch -p1 --fuzz=0 < /src/0001-kernel-iph-install-virtual-ips.patch \
+    && patch -p1 --fuzz=3 < /src/0002-wintun-tun-device-plugin.patch
+
+# The wintun patch touches configure.ac/Makefile.am, so regenerate the build
+# system (the release tarball ships pre-generated ones).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        autoconf automake libtool gettext \
+    && rm -rf /var/lib/apt/lists/*
+RUN cd "strongswan-${STRONGSWAN_VER}" && autoreconf -fi
+
+RUN cd "strongswan-${STRONGSWAN_VER}" \
+    && ./configure --host="${MINGW}" --prefix="${PREFIX}" \
+        --disable-defaults \
+        --enable-monolithic \
+        --enable-svc \
+        --enable-ikev2 \
+        --enable-socket-win --enable-kernel-iph --enable-winhttp \
+        --enable-libipsec --enable-kernel-libipsec --enable-wintun \
+        --enable-openssl \
+        --enable-pem --enable-pkcs1 --enable-pkcs8 --enable-pubkey --enable-x509 \
+        --enable-constraints --enable-revocation \
+        --enable-nonce --enable-hmac --enable-kdf \
+        --enable-vici --enable-updown \
+        openssl_CFLAGS="-I${PREFIX}/include" \
+        openssl_LIBS="-L${PREFIX}/lib -lssl -lcrypto" \
+        CFLAGS="-I${PREFIX}/include -O2" \
+        LDFLAGS="-L${PREFIX}/lib" \
+    && sed -i 's|^\(ipseclib_LTLIBRARIES *=\).*|\1|' src/libcharon/plugins/vici/Makefile \
+    && make -j"$(nproc)" \
+    && make install
+
+# ---- flat dist tree (charon-svc.exe loads DLLs from its own directory) ----
+RUN cp "${PREFIX}/bin/charon-svc.exe" /dist/ \
+    && find "${PREFIX}" -name 'libcharon-*.dll' -o -name 'libstrongswan-*.dll' \
+         | xargs -r -I{} cp {} /dist/ \
+    && cp "${PREFIX}"/bin/libcrypto-*.dll "${PREFIX}"/bin/libssl-*.dll /dist/ \
+    && for dll in libgcc_s_seh-1.dll libwinpthread-1.dll libstdc++-6.dll; do \
+         find /usr/lib/gcc/${MINGW} /usr/${MINGW} -name "$dll" -exec cp {} /dist/ \; 2>/dev/null || true; \
+       done \
+    && ls -1 /dist
