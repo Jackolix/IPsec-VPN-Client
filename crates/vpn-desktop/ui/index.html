@@ -613,6 +613,8 @@
     renderCompactStatus();
   }
 
+  // Returns a promise that settles once the window matches the view, so the
+  // startup path can wait for the size before showing the window.
   function setView(mode) {
     var compact = mode === "compact";
     document.body.classList.toggle("compact", compact);
@@ -620,8 +622,8 @@
     t.textContent = compact ? "⤢ Full view" : "▭ Compact";
     t.title = compact ? "Switch to the full dashboard" : "Switch to a compact view";
     try { localStorage.setItem("viewMode", mode); } catch (e) {}
-    resizeWindow(compact);
     if (compact) { renderCompact(); }
+    return resizeWindow(compact);
   }
   // Best-effort: shrink/restore the OS window to match the view. Harmless if the
   // window API/permission isn't present — the layout toggle stands on its own.
@@ -629,18 +631,28 @@
     try {
       var wapi = window.__TAURI__ && window.__TAURI__.window;
       var dpi = window.__TAURI__ && window.__TAURI__.dpi;
-      if (!wapi || !dpi || !wapi.getCurrentWindow || !dpi.LogicalSize) { return; }
+      if (!wapi || !dpi || !wapi.getCurrentWindow || !dpi.LogicalSize) { return Promise.resolve(); }
       var win = wapi.getCurrentWindow();
       // tauri.conf.json's minHeight (520) is sized for the full dashboard and
       // would otherwise clamp the compact window back up on every resize.
       var minSize = compact ? new dpi.LogicalSize(360, 310) : new dpi.LogicalSize(380, 520);
       var size = compact ? new dpi.LogicalSize(400, 330) : new dpi.LogicalSize(1180, 840);
-      Promise.resolve(win.setMinSize(minSize)).catch(function () {}).then(function () {
+      var sized = Promise.resolve(win.setMinSize(minSize)).then(function () {
         return win.setSize(size);
       }).catch(function () {});
       // The compact card is sized to its content — free resizing just leaves
       // empty space or clips it, so lock the window while compact.
       Promise.resolve(win.setResizable(!compact)).catch(function () {});
+      return sized;
+    } catch (e) { return Promise.resolve(); }
+  }
+  // The window starts hidden (tauri.conf.json) so it is only ever painted at the
+  // size of the view we restore — no full dashboard flashing before it shrinks.
+  function showWindow() {
+    try {
+      var wapi = window.__TAURI__ && window.__TAURI__.window;
+      if (!wapi || !wapi.getCurrentWindow) { return; }
+      Promise.resolve(wapi.getCurrentWindow().show()).catch(function () {});
     } catch (e) {}
   }
 
@@ -1159,11 +1171,17 @@
   // Keep the backend indicator live (it can be started/stopped out-of-band).
   if (TAURI) { setInterval(function () { if (!daemonBusy) { refreshDaemon(); } }, 4000); }
 
-  // Restore the last-used view once profiles are loaded so the compact panel
-  // has a current profile to show.
+  // Restore the last-used view up front — before profiles are loaded — so the
+  // window is sized and laid out for it by the time it becomes visible. The
+  // compact panel starts empty and is filled in as soon as profiles land.
   var savedView = "full";
   try { savedView = localStorage.getItem("viewMode") || "full"; } catch (e) {}
-  refresh().then(function () { setView(savedView); });
+  Promise.resolve(setView(savedView)).then(showWindow, showWindow);
+  // Safety net: never leave the window hidden if the view/resize path misbehaves.
+  setTimeout(showWindow, 2000);
+  refresh().then(function () {
+    if (savedView === "compact") { renderCompact(); }
+  });
 })();
 </script>
 </body>
