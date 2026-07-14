@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX fragment for the MSI: registers the privileged broker as a Windows service,
+  the same thing installer-hooks.nsh does for the NSIS installer. NSIS hooks are
+  an NSIS-only feature, so without this the MSI would lay vpn-broker.exe down
+  next to the app but never register it — and the app, finding no broker, would
+  fall back to elevating charon-svc itself on every connect (a UAC prompt and a
+  console window; see daemon.rs).
+
+  The actions are deferred and non-impersonated, so they run as LocalSystem from
+  the MSI's elevated execution script — creating a service needs that. Both
+  ignore their exit code, matching the NSIS hook: a broker that fails to register
+  leaves the app in its (working, if noisier) elevate-charon fallback rather than
+  failing the whole install.
+
+  Pulled into the package by bundle.windows.wix.componentGroupRefs in
+  tauri.windows.conf.json; the marker component below is what that reference
+  hangs on, which is what drags the custom actions and their sequencing in.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <ComponentGroup Id="BrokerServiceGroup" Directory="INSTALLDIR">
+      <Component Id="BrokerServiceMarker" Guid="0f1c9d9e-6a2b-4a41-9a5f-3a8d5c1f7b42">
+        <RegistryValue Root="HKLM"
+                       Key="Software\dev.jackolix.ipsecvpn"
+                       Name="BrokerService"
+                       Type="string"
+                       Value="registered-by-installer"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- `install` creates the auto-start LocalSystem service and starts it, so no
+         reboot is needed; `uninstall` stops it (letting it revert DNS and kill
+         charon) and deletes it. -->
+    <CustomAction Id="RegisterVpnBroker"
+                  Directory="INSTALLDIR"
+                  ExeCommand="&quot;[INSTALLDIR]vpn-broker.exe&quot; install"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+    <CustomAction Id="UnregisterVpnBroker"
+                  Directory="INSTALLDIR"
+                  ExeCommand="&quot;[INSTALLDIR]vpn-broker.exe&quot; uninstall"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- After the files are on disk (vpn-broker.exe has to exist to run it). -->
+      <Custom Action="RegisterVpnBroker" After="InstallFiles">NOT REMOVE</Custom>
+      <!-- Before they are taken away again, and only on a real uninstall — on an
+           upgrade the outgoing version's uninstall does this, then the incoming
+           one re-registers. -->
+      <Custom Action="UnregisterVpnBroker" Before="RemoveFiles">REMOVE~="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>
