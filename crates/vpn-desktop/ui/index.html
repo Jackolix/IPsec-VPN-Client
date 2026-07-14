@@ -52,13 +52,39 @@
   .side-head h2 { margin: 0; font-family: var(--mono); font-weight: 600; font-size: var(--fs-xs); letter-spacing: .14em; text-transform: uppercase; color: var(--faint); }
   .btn-import { font-family: var(--mono); font-size: var(--fs-xs); color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: 7px; padding: 4px 9px; cursor: pointer; }
   .btn-import:hover { background: rgba(74,158,255,.22); }
+  .side-search { padding: 0 12px 8px; }
+  .side-search input {
+    width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: var(--fs-xs); color: var(--text);
+    background: rgba(0,0,0,.22); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px;
+  }
+  .side-search input::placeholder { color: var(--faint); }
+  .side-search input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .profiles { list-style: none; margin: 0; padding: 6px 10px; overflow-y: auto; flex: 1; }
+  .profiles li { position: relative; }
   .profile { display: block; width: 100%; text-align: left; background: transparent; border: 1px solid transparent; border-radius: var(--r); padding: 11px 12px; margin-bottom: 4px; cursor: pointer; color: inherit; font: inherit; transition: background .12s, border-color .12s; }
   .profile:hover { background: rgba(255,255,255,.03); }
   .profile.active { background: var(--surface); border-color: var(--line); }
   .profile-top { display: flex; align-items: center; gap: 8px; }
   .profile-name { font-family: var(--mono); font-size: var(--fs-base); font-weight: 600; }
   .profile-gw { font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .side-empty { color: var(--faint); font-family: var(--mono); font-size: var(--fs-xs); padding: 10px 12px; line-height: 1.5; }
+
+  /* right-click menu (the WebView's own menu is suppressed) */
+  .ctxmenu {
+    position: fixed; z-index: 60; min-width: 210px; padding: 5px;
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 20px 48px -22px rgba(0,0,0,.85);
+  }
+  .ctxmenu[hidden] { display: none; }
+  .ctx-item {
+    display: block; width: 100%; text-align: left; cursor: pointer; color: var(--text);
+    background: transparent; border: 0; border-radius: 6px; padding: 7px 10px;
+    font-family: var(--mono); font-size: var(--fs-sm);
+  }
+  .ctx-item:hover, .ctx-item:focus-visible { background: rgba(255,255,255,.06); outline: none; }
+  .ctx-item.danger { color: var(--crit); }
+  .ctx-item.danger:hover, .ctx-item.danger:focus-visible { background: var(--crit-soft); }
+  .ctx-sep { height: 1px; margin: 4px 2px; background: var(--line-soft); }
   .side-foot { padding: 11px 16px; border-top: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); display: flex; align-items: center; gap: 7px; }
   #daemon-btn { margin-left: auto; }
   #daemon-btn.busy { opacity: .6; pointer-events: none; }
@@ -78,6 +104,9 @@
   .btn-primary:hover { background: #62adff; }
   .btn-ghost { background: transparent; color: var(--text); border-color: var(--line); }
   .btn-ghost:hover { border-color: var(--muted); background: rgba(255,255,255,.03); }
+  .btn-danger { background: var(--crit); color: #1a0803; }
+  .btn-danger:hover { background: #f4795a; }
+  .btn-danger.busy { opacity: .6; pointer-events: none; }
   .btn-warn { background: var(--warn-soft); color: var(--warn); border-color: rgba(217,165,49,.42); }
   .btn:disabled { cursor: not-allowed; opacity: .5; }
   .btn:focus-visible, .profile:focus-visible, .btn-import:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -215,10 +244,40 @@
   .cpanel-head .spacer { flex: 1; }
   .cstatus { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
   .compact-select {
-    width: 100%; font-family: var(--mono); font-size: var(--fs-base); color: var(--text);
+    width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: var(--fs-base); color: var(--text);
     background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; padding: 7px 11px; cursor: pointer;
+    display: flex; align-items: center; gap: 8px; text-align: left;
   }
+  .compact-select:disabled { color: var(--faint); cursor: default; }
   .compact-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .cpick { position: relative; }
+  .cpick-caret { margin-left: auto; color: var(--faint); }
+  #cpick-current { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cpick-pop {
+    position: absolute; left: 0; right: 0; top: calc(100% + 5px); z-index: 30;
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 6px;
+    box-shadow: 0 18px 44px -20px rgba(0,0,0,.8); display: flex; flex-direction: column; gap: 6px;
+  }
+  .cpick-pop[hidden] { display: none; }
+  .cpick-search {
+    width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: var(--fs-sm); color: var(--text);
+    background: rgba(0,0,0,.25); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px;
+  }
+  .cpick-search::placeholder { color: var(--faint); }
+  .cpick-search:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .cpick-list { list-style: none; margin: 0; padding: 0; max-height: 210px; overflow-y: auto; }
+  .cpick-opt {
+    width: 100%; display: flex; align-items: center; gap: 8px; text-align: left; cursor: pointer;
+    background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 6px 8px; color: inherit; font: inherit;
+  }
+  .cpick-opt:hover, .cpick-opt.hi { background: rgba(255,255,255,.06); }
+  .cpick-opt.sel { border-color: var(--line); }
+  .cpick-opt .copt-name { font-family: var(--mono); font-size: var(--fs-sm); font-weight: 600; }
+  .cpick-opt .copt-gw {
+    margin-left: auto; max-width: 48%; font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cpick-none { padding: 8px; font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); }
   .cident { display: flex; flex-direction: column; gap: 2px; }
   .cname { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.01em; word-break: break-word; }
   .cgw { font-size: var(--fs-sm); color: var(--muted); word-break: break-all; }
@@ -242,6 +301,10 @@
   <div class="body">
     <aside class="sidebar">
       <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import .ini</button></div>
+      <div class="side-search" id="side-search" style="display:none">
+        <input id="profile-filter" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Filter by name or gateway…" aria-label="Filter profiles" aria-controls="profile-list">
+      </div>
       <ul class="profiles" id="profile-list"></ul>
       <div class="side-foot"><span id="foot-led" class="led"></span><span id="foot-text">connecting to vici…</span><button id="daemon-btn" class="btn-sm" style="display:none">Start</button></div>
     </aside>
@@ -291,7 +354,19 @@
         <span class="spacer"></span>
         <span class="cstatus"><span id="c-led" class="led"></span><span id="c-status">disconnected</span></span>
       </div>
-      <select id="compact-select" class="compact-select" aria-label="Profile"></select>
+      <!-- Reads as a plain dropdown, but a folder of 30 profiles needs to be
+           searchable, so the popup carries a filter at the top. A native
+           <select> can't do that, hence the hand-rolled listbox. -->
+      <div class="cpick" id="cpick">
+        <button type="button" id="cpick-btn" class="compact-select" aria-haspopup="listbox" aria-expanded="false">
+          <span id="cpick-current">—</span><span class="cpick-caret" aria-hidden="true">▾</span>
+        </button>
+        <div class="cpick-pop" id="cpick-pop" hidden>
+          <input id="cpick-search" class="cpick-search" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Search profiles…" aria-label="Search profiles">
+          <ul class="cpick-list" id="cpick-list" role="listbox" aria-label="Profiles"></ul>
+        </div>
+      </div>
       <div class="cident">
         <div class="cname mono" id="c-name">—</div>
         <div class="cgw mono" id="c-gw">—</div>
@@ -312,6 +387,18 @@
       memory only when you connect, never copied to disk.
     </div>
     <div class="mfoot"><button class="btn btn-ghost" id="modal-cancel">Close</button><button class="btn btn-primary" id="modal-refresh">Rescan now</button></div>
+  </div>
+</div>
+
+<div class="ctxmenu" id="ctxmenu" role="menu" hidden></div>
+
+<!-- Deleting a profile is not undoable and takes its stored PSK with it, so it
+     goes through a confirmation naming exactly what is about to be removed. -->
+<div class="overlay" id="del-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="del-title">
+    <h3 id="del-title" class="mono">Delete <span id="del-name">profile</span>?</h3>
+    <div class="mbody" id="del-body"></div>
+    <div class="mfoot"><button class="btn btn-ghost" id="del-cancel">Cancel</button><button class="btn btn-danger" id="del-confirm">Delete profile</button></div>
   </div>
 </div>
 
@@ -428,6 +515,8 @@
   var profiles = [];
   var state = {};          // id -> 'disconnected' | 'connecting' | 'established'
   var current = null;
+  var filter = "";         // sidebar filter text (never touches the backend)
+  var pendingDelete = null;
   var PROFILE_DIR = null;  // filled from the backend once known
   var pollTimer = null, upTimer = null, connectAt = 0, prevTotal = 0;
   var samples = [];
@@ -458,16 +547,38 @@
   }
 
   /* ---------- rendering ---------- */
+  // The sidebar filter. Matched against the two things a user identifies a
+  // profile by — its name and its gateway — so a folder of 30 profiles narrows
+  // by either. It only hides rows: `profiles` (and the compact picker) stay
+  // whole, so a filtered-out profile that is connected keeps its state.
+  function matches(p) {
+    if (!filter) { return true; }
+    var q = filter.toLowerCase();
+    return p.name.toLowerCase().indexOf(q) >= 0 || (p.gateway || "").toLowerCase().indexOf(q) >= 0;
+  }
+
+  function sideEmpty(html) {
+    var li = document.createElement("li");
+    li.className = "side-empty";
+    li.innerHTML = html;
+    return li;
+  }
+
   function renderList() {
     var ul = $("profile-list"); ul.innerHTML = "";
+    // A filter is only worth its space once there's a list to search.
+    $("side-search").style.display = profiles.length > 1 ? "" : "none";
     if (!profiles.length) {
-      var empty = document.createElement("li");
-      empty.style.cssText = "color:var(--faint);font-family:var(--mono);font-size:var(--fs-xs);padding:10px 12px;line-height:1.5;";
-      empty.innerHTML = 'No profiles yet. Click <b>+ Import .ini</b> or drag a profile onto the window.' +
-        (PROFILE_DIR ? '<br><span style="color:var(--faint)">Folder: ' + esc(PROFILE_DIR) + "</span>" : "");
-      ul.appendChild(empty); renderCompactSelect(); return;
+      ul.appendChild(sideEmpty('No profiles yet. Click <b>+ Import .ini</b> or drag a profile onto the window.' +
+        (PROFILE_DIR ? '<br><span style="color:var(--faint)">Folder: ' + esc(PROFILE_DIR) + "</span>" : "")));
+      renderCompactSelect(); return;
     }
-    profiles.forEach(function (p) {
+    var shown = profiles.filter(matches);
+    if (!shown.length) {
+      ul.appendChild(sideEmpty("No profile matches <b>" + esc(filter) + "</b>."));
+      renderCompactSelect(); return;
+    }
+    shown.forEach(function (p) {
       var li = document.createElement("li");
       var b = document.createElement("button");
       b.className = "profile" + (current && p.id === current.id ? " active" : "");
@@ -480,6 +591,11 @@
       b.querySelector(".profile-name").textContent = p.name;
       b.querySelector(".profile-gw").textContent = p.gateway;
       b.addEventListener("click", function () { current = p; renderAll(); });
+      b.addEventListener("contextmenu", function (e) {
+        e.preventDefault();
+        openCtx(p, e.clientX, e.clientY);
+      });
+
       li.appendChild(b); ul.appendChild(li);
     });
     renderCompactSelect();
@@ -564,22 +680,88 @@
   /* ---------- compact view ---------- */
   // The compact panel mirrors the essentials — profile picker, status, and the
   // one action — and is fed from the same state as the full dashboard.
+  // The compact picker: a dropdown whose popup is searchable. `cpickQuery` only
+  // narrows what the popup shows — `profiles` and the selection are untouched,
+  // so a filtered-out profile that is connected keeps its state.
+  var cpickOpen = false, cpickQuery = "", cpickHits = [], cpickHi = 0;
+
+  function cpickMatches(p) {
+    if (!cpickQuery) { return true; }
+    var q = cpickQuery.toLowerCase();
+    return p.name.toLowerCase().indexOf(q) >= 0 || (p.gateway || "").toLowerCase().indexOf(q) >= 0;
+  }
+
   function renderCompactSelect() {
-    var sel = $("compact-select"); if (!sel) { return; }
-    sel.innerHTML = "";
-    if (!profiles.length) {
-      var o = document.createElement("option"); o.textContent = "No profiles imported"; o.disabled = true;
-      sel.appendChild(o); sel.disabled = true; return;
+    var btn = $("cpick-btn"), list = $("cpick-list");
+    if (!btn || !list) { return; }
+    btn.disabled = !profiles.length;
+    $("cpick-current").textContent = profiles.length ? (current ? current.name : "Select a profile") : "No profiles imported";
+
+    list.innerHTML = "";
+    cpickHits = profiles.filter(cpickMatches);
+    if (!cpickHits.length) {
+      var none = document.createElement("li");
+      none.className = "cpick-none";
+      none.textContent = profiles.length ? "No profile matches “" + cpickQuery + "”." : "Import a profile first.";
+      list.appendChild(none);
+      return;
     }
-    sel.disabled = false;
-    profiles.forEach(function (p) {
-      var opt = document.createElement("option"); opt.value = p.id;
+    if (cpickHi >= cpickHits.length) { cpickHi = 0; }
+    cpickHits.forEach(function (p, i) {
+      var li = document.createElement("li");
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "cpick-opt" + (i === cpickHi ? " hi" : "") + (current && p.id === current.id ? " sel" : "");
+      b.setAttribute("role", "option");
+      b.setAttribute("aria-selected", current && p.id === current.id ? "true" : "false");
       var st = state[p.id];
-      var dot = st === "established" ? "● " : st === "connecting" ? "◐ " : "○ ";
-      opt.textContent = dot + p.name;
-      if (current && p.id === current.id) { opt.selected = true; }
-      sel.appendChild(opt);
+      var led = st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
+      b.innerHTML = '<span class="' + led + '"></span><span class="copt-name"></span><span class="copt-gw"></span>';
+      b.querySelector(".copt-name").textContent = p.name;
+      b.querySelector(".copt-gw").textContent = p.gateway;
+      b.addEventListener("click", function () { cpickChoose(p); });
+      b.addEventListener("mousemove", function () {
+        if (cpickHi === i) { return; }
+        cpickHi = i;
+        list.querySelectorAll(".cpick-opt").forEach(function (el, j) { el.classList.toggle("hi", j === i); });
+      });
+      li.appendChild(b); list.appendChild(li);
     });
+  }
+
+  function cpickChoose(p) {
+    current = p;
+    closeCpick();
+    renderAll();
+  }
+
+  function openCpick() {
+    if (!profiles.length) { return; }
+    cpickOpen = true; cpickQuery = ""; cpickHi = 0;
+    $("cpick-search").value = "";
+    // Open on the current selection, so Enter re-picks it rather than jumping.
+    var at = current ? profiles.map(function (p) { return p.id; }).indexOf(current.id) : 0;
+    cpickHi = at < 0 ? 0 : at;
+    $("cpick-pop").hidden = false;
+    $("cpick-btn").setAttribute("aria-expanded", "true");
+    renderCompactSelect();
+    $("cpick-search").focus();
+  }
+
+  function closeCpick() {
+    if (!cpickOpen) { return; }
+    cpickOpen = false; cpickQuery = ""; cpickHi = 0;
+    $("cpick-pop").hidden = true;
+    $("cpick-btn").setAttribute("aria-expanded", "false");
+    renderCompactSelect();
+  }
+
+  function cpickMove(delta) {
+    if (!cpickHits.length) { return; }
+    cpickHi = (cpickHi + delta + cpickHits.length) % cpickHits.length;
+    var opts = $("cpick-list").querySelectorAll(".cpick-opt");
+    opts.forEach(function (el, i) { el.classList.toggle("hi", i === cpickHi); });
+    if (opts[cpickHi]) { opts[cpickHi].scrollIntoView({ block: "nearest" }); }
   }
   function renderCompactStatus() {
     var b = $("compact-action");
@@ -1113,14 +1295,128 @@
     }
   }
 
+  /* ---------- right-click menu ---------- */
+  // Right-clicking a row selects it and offers everything you can do to it, so
+  // the actions read `current` and reuse the same handlers as the buttons.
+  function openCtx(p, x, y) {
+    current = p;
+    renderAll();
+
+    var st = state[p.id] || "disconnected";
+    var m = $("ctxmenu");
+    m.innerHTML = "";
+    var items = [
+      [st === "disconnected" ? "Connect" : st === "connecting" ? "Cancel connecting" : "Disconnect", onAction, ""],
+      ["Edit parameters…", openEdit, ""]
+    ];
+    if (TAURI) {
+      items.push(p.stored
+        ? ["Forget stored PSK", onForgetCreds, ""]
+        : ["Save PSK to " + KEYSTORE, onSaveCreds, ""]);
+    }
+    items.push(null);
+    items.push(["Delete profile…", function () { openDelete(p); }, "danger"]);
+
+    items.forEach(function (it) {
+      if (!it) { m.appendChild(Object.assign(document.createElement("div"), { className: "ctx-sep" })); return; }
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "ctx-item" + (it[2] ? " " + it[2] : "");
+      b.setAttribute("role", "menuitem");
+      b.textContent = it[0];
+      b.addEventListener("click", function () { closeCtx(); it[1](); });
+      m.appendChild(b);
+    });
+
+    // Place it at the cursor, but never off-screen.
+    m.hidden = false;
+    m.style.left = "0px"; m.style.top = "0px";
+    var r = m.getBoundingClientRect();
+    m.style.left = Math.max(6, Math.min(x, window.innerWidth - r.width - 6)) + "px";
+    m.style.top = Math.max(6, Math.min(y, window.innerHeight - r.height - 6)) + "px";
+    var first = m.querySelector(".ctx-item");
+    if (first) { first.focus(); }
+  }
+
+  function closeCtx() { $("ctxmenu").hidden = true; }
+
+  /* ---------- delete a profile ---------- */
+  function openDelete(p) {
+    pendingDelete = p;
+    $("del-name").textContent = p.name;
+    // Spell out the consequences: the file goes, and so do the two things that
+    // trail it (saved edits, keychain PSK) — that's what makes it irreversible.
+    var extras = [];
+    if ((p.edits || []).length) { extras.push("its saved parameter edits"); }
+    if (p.stored) { extras.push("its pre-shared key in " + KEYSTORE); }
+    var body = "<b>" + esc(p.id) + ".ini</b> is deleted from the profiles folder" +
+      (extras.length ? ", along with " + extras.join(" and ") : "") + ".";
+    if (state[p.id] === "established" || state[p.id] === "connecting") {
+      body += " Its tunnel is up and will be disconnected first.";
+    }
+    body += " This cannot be undone — re-import the <b>.ini</b> to get it back.";
+    $("del-body").innerHTML = body;
+    $("del-confirm").classList.remove("busy");
+    $("del-overlay").classList.add("show");
+    $("del-cancel").focus();
+  }
+
+  function closeDelete() { $("del-overlay").classList.remove("show"); pendingDelete = null; }
+
+  async function onDeleteConfirm() {
+    var p = pendingDelete;
+    if (!p) { return; }
+    $("del-confirm").classList.add("busy");
+    try {
+      if (TAURI) { await TAURI.invoke("delete_profile", { id: p.id }); }
+      else { DEMO = DEMO.filter(function (d) { return d.id !== p.id; }); }
+    } catch (e) {
+      $("del-confirm").classList.remove("busy");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+      closeDelete();
+      return;
+    }
+    delete state[p.id];
+    closeDelete();
+    await refresh();          // picks a new `current` if we just deleted it
+    log("CFG", "profile deleted: " + p.name, "");
+    showNotice('<span class="led ok" style="box-shadow:none"></span><div>Deleted <b>' + esc(p.name) + "</b>.</div>", "");
+  }
+
   $("action").addEventListener("click", onAction);
   $("compact-action").addEventListener("click", onAction);
+  $("profile-filter").addEventListener("input", function (e) { filter = e.target.value.trim(); renderList(); });
+  $("del-cancel").addEventListener("click", closeDelete);
+  $("del-confirm").addEventListener("click", onDeleteConfirm);
+  $("del-overlay").addEventListener("click", function (e) { if (e.target === $("del-overlay")) { closeDelete(); } });
   $("view-toggle").addEventListener("click", function () {
     setView(document.body.classList.contains("compact") ? "full" : "compact");
   });
-  $("compact-select").addEventListener("change", function (e) {
-    var p = profiles.filter(function (x) { return x.id === e.target.value; })[0];
-    if (p) { current = p; renderAll(); }
+  $("cpick-btn").addEventListener("click", function () { cpickOpen ? closeCpick() : openCpick(); });
+  $("cpick-search").addEventListener("input", function (e) {
+    cpickQuery = e.target.value.trim(); cpickHi = 0; renderCompactSelect();
+  });
+  $("cpick-search").addEventListener("keydown", function (e) {
+    if (e.key === "ArrowDown") { e.preventDefault(); cpickMove(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); cpickMove(-1); }
+    else if (e.key === "Enter") { e.preventDefault(); if (cpickHits[cpickHi]) { cpickChoose(cpickHits[cpickHi]); } }
+    else if (e.key === "Escape") { e.stopPropagation(); closeCpick(); $("cpick-btn").focus(); }
+  });
+  // Clicking anywhere else dismisses the popup, as a native dropdown would.
+  document.addEventListener("mousedown", function (e) {
+    if (cpickOpen && !$("cpick").contains(e.target)) { closeCpick(); }
+    if (!$("ctxmenu").hidden && !$("ctxmenu").contains(e.target)) { closeCtx(); }
+  });
+  window.addEventListener("blur", closeCtx);
+  document.addEventListener("scroll", closeCtx, true);
+
+  // The WebView's own menu (reload, inspect, back) has no place in a desktop
+  // app — profile rows get ours instead. Text fields keep theirs, so cut/copy/
+  // paste still works where someone types a gateway or a PSK.
+  document.addEventListener("contextmenu", function (e) {
+    var t = e.target;
+    var editable = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+    if (!editable) { e.preventDefault(); }
   });
   $("daemon-btn").addEventListener("click", onDaemonBtn);
   $("clear-log").addEventListener("click", clearLog);
@@ -1136,6 +1432,9 @@
   document.addEventListener("keydown", function (e) {
     if (e.key !== "Escape") { return; }
     $("overlay").classList.remove("show");
+    closeCtx();
+    closeDelete();
+    closeCpick();
     closeEdit();
   });
   window.addEventListener("resize", drawSpark);
