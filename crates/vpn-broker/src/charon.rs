@@ -119,9 +119,20 @@ pub fn start() -> Result<Option<Child>, String> {
             conf.display()
         ));
     }
-    let child = std::process::Command::new(&exe)
+    // Capture charon's own stdout/stderr. The service has no console, so without
+    // this anything charon says on its way out is lost — and when it dies before
+    // it gets as far as opening its filelog, that output is the only evidence of
+    // why.
+    let out = output_log();
+    let (stdout, stderr) = match (std::fs::File::create(&out), std::fs::File::create(&out)) {
+        (Ok(o), Ok(e)) => (std::process::Stdio::from(o), std::process::Stdio::from(e)),
+        _ => (std::process::Stdio::null(), std::process::Stdio::null()),
+    };
+    let mut child = std::process::Command::new(&exe)
         .current_dir(&dir)
         .env("STRONGSWAN_CONF", &conf)
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()
         .map_err(|e| format!("failed to launch charon-svc: {e}"))?;
 
@@ -130,9 +141,33 @@ pub fn start() -> Result<Option<Child>, String> {
         if is_running() {
             return Ok(Some(child));
         }
+        // Don't sit out the full 40s if charon is already gone: report the exit
+        // code and whatever it printed, which is the actual diagnosis.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "charon-svc exited immediately ({status}); its output: {}",
+                std::fs::read_to_string(&out)
+                    .map(|s| {
+                        let s = s.trim().to_string();
+                        if s.is_empty() { "<nothing>".to_string() } else { s }
+                    })
+                    .unwrap_or_else(|e| format!("<unreadable: {e}>")),
+            ));
+        }
         std::thread::sleep(Duration::from_millis(500));
     }
     Err("charon-svc did not start listening within 40s".to_string())
+}
+
+/// Where charon's stdout/stderr are captured — beside the broker's own log,
+/// since neither has a console to print to.
+fn output_log() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    let dir = base.join("ipsec-vpn");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("charon-stdout.log")
 }
 
 /// Stop charon. `charon-svc` detaches after launch, so the `Child` handle we
