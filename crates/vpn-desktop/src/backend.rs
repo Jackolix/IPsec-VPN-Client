@@ -218,6 +218,25 @@ fn profile_path(state: &AppState, id: &str) -> PathBuf {
     state.profile_dir.join(format!("{id}.ini"))
 }
 
+/// A profile id addresses files in the profile directory, so one that came back
+/// from the UI must not be able to name anything outside it. Ids are file stems
+/// minted by [`import_path`], which already restricts them to this charset — an
+/// id that doesn't fit is rejected rather than sanitized into a different
+/// profile's name.
+fn check_id(id: &str) -> std::result::Result<(), String> {
+    let ok = !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("\"{id}\" is not a valid profile id"))
+    }
+}
+
 /// Scan the profile directory and interpret every `.ini` file. Files that
 /// fail to parse are skipped (a real UI would flag them separately).
 pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
@@ -317,6 +336,45 @@ pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Resu
 }
 
 /// Connect the profile identified by `id` to the gateway it names.
+/// Remove an imported profile and everything that trails it: the `.ini`, its
+/// override sidecar, and any PSK it left in the keychain. All three go, or the
+/// leftovers would be silently adopted by the next profile imported under the
+/// same name.
+///
+/// If the profile's tunnel is up it is torn down first — once the `.ini` is
+/// gone nothing in the UI can name that connection, so it could not otherwise
+/// be disconnected.
+pub fn delete_profile(state: &AppState, id: String) -> std::result::Result<(), String> {
+    check_id(&id)?;
+    let path = profile_path(state, &id);
+
+    // Best-effort: a profile that no longer parses can't tell us its connection
+    // name, and a charon that isn't running can't be asked to disconnect. Losing
+    // the tunnel teardown is not a reason to refuse the delete.
+    if let Ok((imported, _)) = load(state, &id) {
+        let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
+        let up = status(state)
+            .map(|sas| sas.iter().any(|sa| sa.name == name))
+            .unwrap_or(false);
+        if up {
+            if let Err(e) = disconnect(state, name) {
+                eprintln!("disconnect before deleting {id} failed: {e}");
+            }
+        }
+    }
+
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("there is no profile named \"{id}\""))
+        }
+        Err(e) => return Err(format!("cannot delete {}: {e}", path.display())),
+    }
+    crate::overrides::clear(&state.profile_dir, &id)?;
+    crate::creds::delete(&id)?;
+    Ok(())
+}
+
 pub fn connect(
     state: &AppState,
     id: String,

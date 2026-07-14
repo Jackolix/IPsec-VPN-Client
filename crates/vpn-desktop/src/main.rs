@@ -59,6 +59,16 @@ async fn import_profile_dialog(
     .map_err(|e| e.to_string())?
 }
 
+/// Delete an imported profile: its `.ini`, its saved edits, and its stored PSK.
+#[tauri::command]
+async fn delete_profile(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::delete_profile(&s, id)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// The editable parameters of a profile, as currently in effect.
 #[tauri::command]
 async fn get_profile_edit(
@@ -218,6 +228,8 @@ fn dev(args: &[String]) {
         Some("import") => backend::import_path(&state, std::path::Path::new(args.get(1).map(String::as_str).unwrap_or("")))
             .map(|id| format!("imported {id}")),
         Some("profiles-dir") => Ok(backend::profiles_dir(&state)),
+        Some("delete") => backend::delete_profile(&state, args.get(1).cloned().unwrap_or_default())
+            .map(|_| "deleted".to_string()),
         Some("get-edit") => backend::get_profile_edit(&state, args.get(1).cloned().unwrap_or_default())
             .map(|e| serde_json::to_string_pretty(&e).expect("serialize edit")),
         // Takes the same JSON `get-edit` prints (its `edit` object), so a test
@@ -279,6 +291,7 @@ fn main() {
             list_profiles,
             profiles_dir,
             import_profile_dialog,
+            delete_profile,
             connect,
             disconnect,
             status,
