@@ -20,7 +20,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The daemon is a pure function of docker/strongswan-windows/** (the
+      # Dockerfile pins every version it downloads), and that directory changes
+      # about once a release cycle — while the cross-build inside it (OpenSSL +
+      # strongSwan, from source, under MinGW) costs the better part of fifteen
+      # minutes on every run. So key a cache on those inputs and skip the build
+      # entirely when nothing there moved. A miss just rebuilds as before.
+      - name: Cache the cross-built daemon
+        id: daemon-cache
+        uses: actions/cache@v4
+        with:
+          path: out/strongswan-windows
+          key: strongswan-windows-${{ hashFiles('docker/strongswan-windows/**') }}
+
       - name: Cross-build strongSwan for Windows (MinGW)
+        if: steps.daemon-cache.outputs.cache-hit != 'true'
         run: |
           docker build -t ss-win -f docker/strongswan-windows/Dockerfile .
           cid=$(docker create ss-win)
@@ -105,8 +119,19 @@ jobs:
       - name: Build CLI binaries
         run: cargo build --release -p vpn-agent -p vpn-cli
 
+      # `cargo install tauri-cli` compiles the CLI from source — minutes of work
+      # to produce a binary the Tauri project already publishes for this exact
+      # target. binstall downloads that instead (tauri-cli carries the
+      # [package.metadata.binstall] to point at it). Falls back to building it
+      # if the download is ever unavailable, so this can't wedge a release.
+      - uses: cargo-bins/cargo-binstall@main
+
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2.0" --locked
+        shell: bash
+        run: |
+          cargo binstall --no-confirm --locked 'tauri-cli@^2.0' \
+            || cargo install tauri-cli --version "^2.0" --locked
+          cargo tauri --version
 
       - name: Build desktop app + installer (bundles charon-svc)
         working-directory: crates/vpn-desktop
