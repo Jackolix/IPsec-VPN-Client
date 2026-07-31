@@ -326,6 +326,7 @@
 
         <div id="notice" class="notice" role="status"></div>
         <div id="creds-bar" class="creds-bar"></div>
+        <div id="login-bar" class="creds-bar"></div>
 
         <div class="tiles">
           <div class="tile"><div class="k">Virtual IP</div><div id="t-vip" class="v dim">—</div><div class="sub" id="t-vip-sub">assigned by gateway</div></div>
@@ -402,6 +403,32 @@
     <h3 id="del-title" class="mono">Delete <span id="del-name">profile</span>?</h3>
     <div class="mbody" id="del-body"></div>
     <div class="mfoot"><button class="btn btn-ghost" id="del-cancel">Cancel</button><button class="btn btn-danger" id="del-confirm">Delete profile</button></div>
+  </div>
+</div>
+
+<!-- XAuth/EAP sign-in. Sophos gateways ask for a person's login on top of the
+     profile's pre-shared key; neither value is ever written to the profile
+     file, and "remember" puts them in the OS keychain instead. -->
+<div class="overlay" id="login-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="login-title">
+    <h3 id="login-title" class="mono">Sign in to <span id="login-name">the gateway</span></h3>
+    <div class="mbody">
+      <div id="login-why"></div>
+      <div class="field wide" style="margin-top:12px">
+        <label for="login-user">Username</label>
+        <input id="login-user" type="text" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field wide">
+        <label for="login-pass">Password</label>
+        <input id="login-pass" type="password" autocomplete="off" />
+      </div>
+      <label id="login-remember-row" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
+        <input id="login-remember" type="checkbox" />
+        <span class="hint" id="login-remember-label"></span>
+      </label>
+      <div class="hint" id="login-err" style="color:var(--bad);margin-top:8px"></div>
+    </div>
+    <div class="mfoot"><button class="btn btn-ghost" id="login-cancel">Cancel</button><button class="btn btn-primary" id="login-ok">Sign in and connect</button></div>
   </div>
 </div>
 
@@ -540,6 +567,8 @@
       format: s.format || null,
       ikeVersion: s.ike_version || null,
       userAuth: s.user_auth || null,
+      userStored: !!s.user_stored,
+      userName: s.user_name || null,
       edits: s.edits || [],
       warns: (s.warnings || []).map(function (w) { return { lvl: w.level, t: w.text, n: w.note }; })
     };
@@ -874,6 +903,26 @@
         '<button class="btn btn-ghost btn-sm" id="creds-save">Save to ' + esc(KEYSTORE) + '</button>';
       $("creds-save").addEventListener("click", onSaveCreds);
     }
+    renderLoginBar();
+  }
+
+  // Second bar, only for profiles whose gateway wants a login as well. The
+  // password is never shown or re-read — the only actions are forgetting it,
+  // or being asked again on the next connect.
+  function renderLoginBar() {
+    var bar = $("login-bar");
+    var p = current;
+    if (!TAURI || !p.userAuth) { bar.className = "creds-bar"; bar.innerHTML = ""; return; }
+    bar.className = "creds-bar show" + (p.userStored ? " on" : "");
+    if (p.userStored) {
+      bar.innerHTML = '<span class="ci"><span class="led ok" style="box-shadow:none"></span>Signed in as ' +
+        esc(p.userName || "a saved user") + ' (' + esc(p.userAuth) + ', saved in ' + esc(KEYSTORE) + ')</span>' +
+        '<button class="btn btn-ghost btn-sm" id="login-forget">Forget</button>';
+      $("login-forget").addEventListener("click", onForgetUserLogin);
+    } else {
+      bar.innerHTML = '<span class="ci"><span class="led" style="box-shadow:none"></span>' +
+        esc(p.userAuth) + ' sign-in is asked for on connect</span>';
+    }
   }
   async function onSaveCreds() {
     var p = current;
@@ -891,6 +940,71 @@
       await TAURI.invoke("forget_credentials", { id: p.id });
       p.stored = false; renderCreds();
       log("KNL", "PSK removed from " + KEYSTORE);
+    } catch (e) {
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+    }
+  }
+
+  /* ---------- XAuth/EAP sign-in ---------- */
+
+  // Resolves to {username, password, save} once the user submits, or null if
+  // they cancel. The password lives in this promise and the invoke that
+  // follows it — it is never written to `profiles` or any other kept state.
+  function askUserLogin(p) {
+    return new Promise(function (resolve) {
+      var overlay = $("login-overlay"), user = $("login-user"), pass = $("login-pass"),
+          remember = $("login-remember"), err = $("login-err");
+      $("login-name").textContent = p.name;
+      $("login-why").innerHTML = "This gateway asks for your username and password as well as the " +
+        "profile's pre-shared key (<b>" + esc(p.userAuth || "XAuth") + "</b>).";
+      user.value = p.userName || "";
+      pass.value = "";
+      err.textContent = "";
+
+      // A gateway expecting a one-time code gets no "remember": the saved
+      // password would be stale by the next connect. The backend enforces this
+      // too — this only keeps the UI from offering something that won't work.
+      var otp = /one-time/i.test(p.userAuth || "");
+      $("login-remember-row").style.display = otp ? "none" : "flex";
+      $("login-remember-label").textContent = "Remember in " + KEYSTORE;
+      remember.checked = false;
+      if (otp) {
+        $("login-why").innerHTML += " A one-time code is required, so this cannot be remembered.";
+      }
+
+      function close(result) {
+        overlay.classList.remove("show");
+        document.removeEventListener("keydown", onKey);
+        $("login-ok").removeEventListener("click", onOk);
+        $("login-cancel").removeEventListener("click", onCancel);
+        // Don't leave the typed password sitting in the DOM.
+        pass.value = "";
+        resolve(result);
+      }
+      function onOk() {
+        if (!user.value.trim()) { err.textContent = "Enter your username."; user.focus(); return; }
+        if (!pass.value) { err.textContent = "Enter your password."; pass.focus(); return; }
+        close({ username: user.value.trim(), password: pass.value, save: !otp && remember.checked });
+      }
+      function onCancel() { close(null); }
+      function onKey(e) {
+        if (e.key === "Escape") { onCancel(); }
+        if (e.key === "Enter" && overlay.classList.contains("show")) { onOk(); }
+      }
+      $("login-ok").addEventListener("click", onOk);
+      $("login-cancel").addEventListener("click", onCancel);
+      document.addEventListener("keydown", onKey);
+      overlay.classList.add("show");
+      (user.value ? pass : user).focus();
+    });
+  }
+
+  async function onForgetUserLogin() {
+    var p = current;
+    try {
+      await TAURI.invoke("forget_user_login", { id: p.id });
+      p.userStored = false; p.userName = null; renderCreds();
+      log("KNL", "sign-in removed from " + KEYSTORE + " — you'll be asked on the next connect");
     } catch (e) {
       showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
     }
@@ -1104,11 +1218,31 @@
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       return;
     }
+    // A gateway wanting a second authentication round needs a login before we
+    // can initiate. A saved one is used silently; otherwise ask, and treat
+    // cancelling as cancelling the connect.
+    var login = null;
+    if (p.userAuth && !p.userStored) {
+      login = await askUserLogin(p);
+      if (!login) {
+        state[p.id] = "disconnected"; setPill(); setAction(); renderList();
+        log("IKE", "sign-in cancelled — not connecting");
+        return;
+      }
+    }
+
     log("KNL", "load-conn + load-shared via vici (" + (p.stored ? "PSK from " + KEYSTORE : "PSK held in memory") + ")");
+    if (p.userAuth) {
+      log("CFG", p.userAuth + " sign-in as " + ((login && login.username) || p.userName || "the saved user") +
+        (login ? "" : " (from " + KEYSTORE + ")"));
+    }
     log("IKE", "initiating IKE_SA " + p.name + " to " + p.gateway);
     var out;
     try {
-      out = await TAURI.invoke("connect", { id: p.id });
+      out = await TAURI.invoke("connect", { id: p.id, login: login });
+      if (login && login.save) {
+        p.userStored = true; p.userName = login.username; renderCreds();
+      }
     } catch (e) {
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       log("IKE", String(e), "bad");
@@ -1120,7 +1254,14 @@
       var reason = (out && out.error) || "the handshake did not complete";
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       log("IKE", reason, "bad");
-      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(reason) + "</div>", "bad");
+      var extra = "";
+      // A saved login the gateway won't accept can only be fixed by replacing
+      // it, and nothing else in the UI says where that is done.
+      if (p.userAuth && p.userStored) {
+        extra = '<div class="hint" style="margin-top:6px">If your password changed, choose ' +
+          '<b>Forget</b> beside the saved sign-in and connect again to be asked for it.</div>';
+      }
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(reason) + extra + "</div>", "bad");
       return;
     }
     state[p.id] = "established"; connectAt = Date.now(); prevTotal = 0; samples = [];

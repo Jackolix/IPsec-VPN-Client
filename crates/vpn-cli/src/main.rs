@@ -136,21 +136,13 @@ fn print_summary(imported: &ImportedProfile) {
             if ua.otp { ", one-time code" } else { "" }
         );
     }
+    // Exactly the strings handed to charon, rather than a reconstruction —
+    // IKEv1 carries no PRF term, and the summary should show that.
+    println!("IKE proposal:   {}", c.ike_proposal());
     println!(
-        "IKE proposal:   {}-{}-{}-{}",
-        c.ike_enc.swanctl_name(),
-        c.ike_integ.swanctl_name(),
-        c.ike_prf.swanctl_name(),
-        c.ike_dh.swanctl_name()
-    );
-    println!(
-        "ESP proposal:   {}-{}{}",
-        c.esp_enc.swanctl_name(),
-        c.esp_integ.swanctl_name(),
-        match c.pfs {
-            Some(g) => format!(" (PFS {})", g.swanctl_name()),
-            None => " (no PFS)".to_string(),
-        }
+        "ESP proposal:   {}{}",
+        c.esp_proposal(),
+        if c.pfs.is_some() { " (with PFS)" } else { " (no PFS)" }
     );
     print!("Remote subnets: ");
     if c.remote_subnets.is_empty() {
