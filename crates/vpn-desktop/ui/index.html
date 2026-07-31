@@ -300,7 +300,7 @@
 
   <div class="body">
     <aside class="sidebar">
-      <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import .ini</button></div>
+      <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import profile</button></div>
       <div class="side-search" id="side-search" style="display:none">
         <input id="profile-filter" type="search" autocomplete="off" spellcheck="false"
                placeholder="Filter by name or gateway…" aria-label="Filter profiles" aria-controls="profile-list">
@@ -380,11 +380,14 @@
 
 <div class="overlay" id="overlay">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-    <h3 id="modal-title" class="mono">Import NCP profile</h3>
+    <h3 id="modal-title" class="mono">Import a profile</h3>
     <div class="mbody">
-      Drop a <b>.ini</b> profile into the profiles directory and it appears here automatically. The desktop app scans
+      Drop a profile — NCP <b>.ini</b>, Sophos Connect <b>.scx</b> or legacy Sophos <b>.tgb</b> — into the profiles
+      directory and it appears here automatically. The desktop app scans
       <code id="modal-dir">the profiles folder</code> and interprets each file on the fly — the pre-shared key is read into
       memory only when you connect, never copied to disk.
+      <br><br>A Sophos <b>.pro</b> is not a profile: it points at your user portal, and you sign in there to download
+      the <b>.scx</b> to import.
     </div>
     <div class="mfoot"><button class="btn btn-ghost" id="modal-cancel">Close</button><button class="btn btn-primary" id="modal-refresh">Rescan now</button></div>
   </div>
@@ -479,7 +482,7 @@
   </div>
 </div>
 
-<div id="dropzone"><div class="dz-card">Drop NCP <b>.ini</b> profile to import<span>it's copied into your profiles folder</span></div></div>
+<div id="dropzone"><div class="dz-card">Drop a profile to import<span>it's copied into your profiles folder</span></div></div>
 
 <script>
 (function () {
@@ -533,6 +536,10 @@
       stored: !!s.stored,
       dns: (s.dns && s.dns.length) ? s.dns.join(", ") : null,
       dnsDomain: s.dns_domain || null,
+      file: s.file || null,
+      format: s.format || null,
+      ikeVersion: s.ike_version || null,
+      userAuth: s.user_auth || null,
       edits: s.edits || [],
       warns: (s.warnings || []).map(function (w) { return { lvl: w.level, t: w.text, n: w.note }; })
     };
@@ -569,7 +576,7 @@
     // A filter is only worth its space once there's a list to search.
     $("side-search").style.display = profiles.length > 1 ? "" : "none";
     if (!profiles.length) {
-      ul.appendChild(sideEmpty('No profiles yet. Click <b>+ Import .ini</b> or drag a profile onto the window.' +
+      ul.appendChild(sideEmpty('No profiles yet. Click <b>+ Import profile</b> or drag one onto the window.' +
         (PROFILE_DIR ? '<br><span style="color:var(--faint)">Folder: ' + esc(PROFILE_DIR) + "</span>" : "")));
       renderCompactSelect(); return;
     }
@@ -606,13 +613,18 @@
     var n = (p.edits || []).length;
     $("sec-badge").textContent = n ? n + (n === 1 ? " field edited" : " fields edited") : "";
     var rows = [
-      ["IKE proposal", esc(p.ike)],
+      ["IKE proposal", esc(p.ike) + (p.ikeVersion ? ' <span class="badge">IKEv' + esc(p.ikeVersion) + "</span>" : "")],
       ["ESP proposal", esc(p.esp)],
       ["PFS group", p.pfs ? esc(p.pfs) : "none"],
-      ["Auth", '<span class="redacted">psk ••••••••••••</span>'],
+      // The PSK is only half the story once the gateway also wants a login.
+      ["Auth", '<span class="redacted">psk ••••••••••••</span>' +
+        (p.userAuth ? ' <span class="badge">+ ' + esc(p.userAuth) + "</span>" : "")],
       ["Local ID", esc(p.localId)],
       ["Remote subnet", esc(p.remote)]
     ];
+    if (p.format) {
+      rows.push(["Source", esc(p.format) + (p.file ? ' <span class="badge">' + esc(p.file) + "</span>" : "")]);
+    }
     if (p.dns) {
       rows.push(["DNS", esc(p.dns) + (p.dnsDomain ? ' <span class="badge">*.' + esc(p.dnsDomain) + "</span>" : "")]);
     }
@@ -1349,12 +1361,12 @@
     var extras = [];
     if ((p.edits || []).length) { extras.push("its saved parameter edits"); }
     if (p.stored) { extras.push("its pre-shared key in " + KEYSTORE); }
-    var body = "<b>" + esc(p.id) + ".ini</b> is deleted from the profiles folder" +
+    var body = "<b>" + esc(p.file || (p.id + ".ini")) + "</b> is deleted from the profiles folder" +
       (extras.length ? ", along with " + extras.join(" and ") : "") + ".";
     if (state[p.id] === "established" || state[p.id] === "connecting") {
       body += " Its tunnel is up and will be disconnected first.";
     }
-    body += " This cannot be undone — re-import the <b>.ini</b> to get it back.";
+    body += " This cannot be undone — re-import the file to get it back.";
     $("del-body").innerHTML = body;
     $("del-confirm").classList.remove("busy");
     $("del-overlay").classList.add("show");
