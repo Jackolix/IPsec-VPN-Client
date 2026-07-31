@@ -1,9 +1,10 @@
 //! Backend logic for the desktop app, kept free of any Tauri types so it can
 //! be exercised headlessly (see `--selftest` in `main.rs`).
 //!
-//! Profiles are `.ini` files in a scanned directory; each is imported with
-//! `ncp-profile` on demand, so the PSK only ever lives in memory for the
-//! duration of a connect. Connection control goes through `vpn-control`.
+//! Profiles are files in a scanned directory — NCP `.ini`, Sophos `.scx` or
+//! legacy `.tgb` — each imported on demand by the importer matching its
+//! format, so the PSK only ever lives in memory for the duration of a
+//! connect. Connection control goes through `vpn-control`.
 
 use serde::Serialize;
 use std::path::PathBuf;
@@ -117,9 +118,18 @@ pub struct ProfileSummary {
     pub dns: Vec<String>,
     /// Split-DNS domain scoping those servers, if the profile names one.
     pub dns_domain: Option<String>,
-    /// Names of the fields the user has overridden (empty = the `.ini` as-is).
+    /// Names of the fields the user has overridden (empty = the file as-is).
     /// Everything above already reflects them; this is what the UI marks up.
     pub edits: Vec<String>,
+    /// The profile's file name, extension included — profiles no longer all
+    /// end in `.ini`, and the UI names the file when it is about to delete it.
+    pub file: String,
+    /// Which importer read it, for the UI to label the profile's origin.
+    pub format: String,
+    /// IKE version the profile negotiates (`1` or `2`).
+    pub ike_version: String,
+    /// Set when the gateway wants a username and password on top of the PSK.
+    pub user_auth: Option<String>,
 }
 
 /// A profile opened for editing: its current effective values, plus which of
@@ -159,12 +169,27 @@ fn to_warn_item(raw: &str) -> WarnItem {
 
 fn summarize(
     id: &str,
+    file: &str,
     config: &vpn_core::ConnectionConfig,
-    warnings: &[ncp_profile::ImportWarning],
+    warnings: &[vpn_core::ImportWarning],
     edits: Vec<String>,
 ) -> ProfileSummary {
     ProfileSummary {
         edits,
+        file: file.to_string(),
+        format: format_label(file).to_string(),
+        ike_version: config.ike_version.swanctl_value().to_string(),
+        user_auth: config.user_auth.as_ref().map(|ua| {
+            let method = match config.ike_version {
+                vpn_core::IkeVersion::V1 => "XAuth",
+                vpn_core::IkeVersion::V2 => "EAP-MSCHAPv2",
+            };
+            if ua.otp {
+                format!("{method} + one-time code")
+            } else {
+                method.to_string()
+            }
+        }),
         id: id.to_string(),
         name: config.name.clone(),
         gateway: config.gateway.clone(),
@@ -182,9 +207,56 @@ fn summarize(
     }
 }
 
-fn parse(path: &std::path::Path) -> std::result::Result<ncp_profile::ImportedProfile, String> {
+/// File extensions a profile may have, in the order [`profile_path`] resolves
+/// them. Ids stay bare file stems, so an override sidecar or a keychain entry
+/// written before Sophos profiles existed still addresses the same profile.
+const PROFILE_EXTENSIONS: [&str; 3] = ["ini", "scx", "tgb"];
+
+/// Human-readable origin of a profile, from its extension. The importers pick
+/// by content, but the extension is what survived the copy into the profile
+/// directory and is what the user sees in the folder.
+fn format_label(file: &str) -> &'static str {
+    match file.rsplit('.').next().unwrap_or_default() {
+        "scx" => "Sophos Connect",
+        "tgb" => "Sophos (legacy)",
+        _ => "NCP",
+    }
+}
+
+/// Interpret a profile file, whichever format it is in.
+///
+/// Dispatch is on content, not extension: these files are routinely renamed on
+/// the way to a user, and a file that claims one format while being another
+/// should be read as what it actually is.
+fn parse(path: &std::path::Path) -> std::result::Result<vpn_core::ImportedProfile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    ncp_profile::import_profile(&text).map_err(|e| format!("{}: {e}", path.display()))
+    parse_text(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse_text(text: &str) -> std::result::Result<vpn_core::ImportedProfile, String> {
+    match sophos_profile::detect(text) {
+        Some(sophos_profile::Format::Provisioning) => Err(provisioning_message(text)),
+        Some(_) => sophos_profile::import_profile(text).map_err(|e| e.to_string()),
+        None => ncp_profile::import_profile(text).map_err(|e| e.to_string()),
+    }
+}
+
+/// A `.pro` holds no connection to import — it names the user portal the real
+/// profile is downloaded from. Say which portal, so the message is actionable
+/// rather than just a rejection.
+fn provisioning_message(text: &str) -> String {
+    let portal = sophos_profile::pro::parse(text)
+        .ok()
+        .and_then(|entries| entries.first().and_then(|e| e.portal_url()));
+    match portal {
+        Some(url) => format!(
+            "this is a Sophos provisioning file, not a profile — sign in at {url}, download the \
+             .scx profile from the portal, and import that file instead"
+        ),
+        None => "this is a Sophos provisioning file, not a profile — it names a user portal to \
+                 download the real profile from"
+            .to_string(),
+    }
 }
 
 /// A profile as it is actually used: the `.ini` re-parsed from disk, with the
@@ -197,7 +269,7 @@ fn parse(path: &std::path::Path) -> std::result::Result<ncp_profile::ImportedPro
 fn load(
     state: &AppState,
     id: &str,
-) -> std::result::Result<(ncp_profile::ImportedProfile, Vec<String>), String> {
+) -> std::result::Result<(vpn_core::ImportedProfile, Vec<String>), String> {
     let mut imported = parse(&profile_path(state, id))?;
     let base = crate::overrides::Edit::from_config(&imported.config);
     let (edited, mut names) = crate::overrides::load(&state.profile_dir, id).overlay(&base);
@@ -205,7 +277,7 @@ fn load(
         if let Err(e) = edited.apply_to(&mut imported.config) {
             // Phrased for `to_warn_item`, which splits a trailing parenthetical
             // off as the note.
-            imported.warnings.push(ncp_profile::ImportWarning(format!(
+            imported.warnings.push(vpn_core::ImportWarning(format!(
                 "saved edits were not applied; using the profile file as imported ({e})"
             )));
             names.clear();
@@ -214,8 +286,25 @@ fn load(
     Ok((imported, names))
 }
 
+/// The file backing a profile id. The id is the file stem, so the extension is
+/// whichever one is actually on disk; [`import_path`] refuses a second file
+/// with the same stem, so at most one can match.
 fn profile_path(state: &AppState, id: &str) -> PathBuf {
-    state.profile_dir.join(format!("{id}.ini"))
+    PROFILE_EXTENSIONS
+        .iter()
+        .map(|ext| state.profile_dir.join(format!("{id}.{ext}")))
+        .find(|p| p.is_file())
+        // Nothing on disk: name the .ini so "cannot read ...ini" still reads
+        // sensibly for the overwhelmingly common case.
+        .unwrap_or_else(|| state.profile_dir.join(format!("{id}.ini")))
+}
+
+/// Is this a file extension we import profiles from?
+fn is_profile_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| PROFILE_EXTENSIONS.iter().any(|k| ext.eq_ignore_ascii_case(k)))
+        .unwrap_or(false)
 }
 
 /// A profile id addresses files in the profile directory, so one that came back
@@ -237,8 +326,9 @@ fn check_id(id: &str) -> std::result::Result<(), String> {
     }
 }
 
-/// Scan the profile directory and interpret every `.ini` file. Files that
-/// fail to parse are skipped (a real UI would flag them separately).
+/// Scan the profile directory and interpret every profile file, in any of the
+/// formats we import. Files that fail to parse are skipped (a real UI would
+/// flag them separately).
 pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&state.profile_dir) else {
@@ -246,14 +336,25 @@ pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("ini") {
+        if !is_profile_extension(&path) {
             continue;
         }
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        let file = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or_default()
+            .to_string();
         if let Ok((imported, edits)) = load(state, id) {
-            out.push(summarize(id, &imported.config, &imported.warnings, edits));
+            out.push(summarize(
+                id,
+                &file,
+                &imported.config,
+                &imported.warnings,
+                edits,
+            ));
         }
     }
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -302,33 +403,64 @@ pub fn profiles_dir(state: &AppState) -> String {
     state.profile_dir.display().to_string()
 }
 
-/// Import a `.ini` file into the profile directory so it shows up in the list.
-/// Validates the extension and that it parses as an NCP profile (so junk is
-/// rejected), then copies it in under a sanitized name. Returns the new
-/// profile id (its file stem).
+/// Import a profile file into the profile directory so it shows up in the
+/// list. Validates that it parses (so junk is rejected), then copies it in
+/// under a sanitized name, keeping the extension so the format stays evident
+/// on disk. Returns the new profile id (its file stem).
+///
+/// A Sophos `.pro` is refused here on purpose: it holds no connection, and
+/// storing it would put an entry in the list that can never be connected.
 pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Result<String, String> {
-    if src.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("ini")) != Some(true) {
-        return Err("only .ini profiles can be imported".to_string());
+    // Accept the provisioning extension so the file gets the explanation from
+    // `parse_text` rather than a flat "unsupported file type".
+    let known = is_profile_extension(src)
+        || src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("pro"))
+            .unwrap_or(false);
+    if !known {
+        return Err(format!(
+            "only {} profiles can be imported",
+            PROFILE_EXTENSIONS
+                .iter()
+                .map(|e| format!(".{e}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     let text = std::fs::read_to_string(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
-    // Parse to reject files that aren't valid NCP profiles.
-    ncp_profile::import_profile(&text).map_err(|e| format!("not a valid NCP profile: {e}"))?;
+    // Parse to reject files that aren't valid profiles in any format we read.
+    parse_text(&text)?;
 
+    let sanitize = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .collect::<String>()
+    };
     let stem = src
         .file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| {
-            s.chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
-                .collect::<String>()
-        })
+        .map(sanitize)
         .filter(|s| !s.is_empty())
         .ok_or("the file needs a name")?;
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| sanitize(&e.to_ascii_lowercase()))
+        .filter(|e| !e.is_empty())
+        .ok_or("the file needs an extension")?;
 
     std::fs::create_dir_all(&state.profile_dir).map_err(|e| e.to_string())?;
-    let dest = state.profile_dir.join(format!("{stem}.ini"));
-    // Don't silently overwrite a different existing profile.
-    if dest.exists() && std::fs::canonicalize(&dest).ok() != std::fs::canonicalize(src).ok() {
+    let dest = state.profile_dir.join(format!("{stem}.{ext}"));
+    // Don't silently overwrite a different existing profile — including one in
+    // another format, since a profile id is the stem alone and two files
+    // sharing a stem would be one profile with two backing files.
+    let taken = PROFILE_EXTENSIONS
+        .iter()
+        .map(|e| state.profile_dir.join(format!("{stem}.{e}")))
+        .find(|p| p.exists() && std::fs::canonicalize(p).ok() != std::fs::canonicalize(src).ok());
+    if taken.is_some() {
         return Err(format!("a profile named \"{stem}\" already exists"));
     }
     std::fs::write(&dest, text).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
