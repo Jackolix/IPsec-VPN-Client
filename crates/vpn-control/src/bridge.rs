@@ -7,7 +7,40 @@
 //! Pure data mapping, so it is unit-tested on any platform.
 
 use vici::Message;
-use vpn_core::{AuthMethod, ConnectionConfig, IkeVersion, Secret};
+use vpn_core::{AuthMethod, ConnectionConfig, IkeVersion, Ipv4Net, Secret};
+
+/// The CHILD_SA configurations a connection needs, as `(name, remote subnets)`.
+///
+/// IKEv2 carries several traffic selectors in one CHILD_SA, so every subnet
+/// fits in a single child. IKEv1 quick mode negotiates exactly one selector
+/// pair per SA: a child offering three subnets is narrowed by the gateway to
+/// the first, and the rest are silently unreachable. So under IKEv1 each
+/// subnet gets its own child, named `<conn>-1`, `<conn>-2`, … — verified
+/// against a real gateway, which installs one SA per subnet.
+///
+/// A connection with no subnets (or one, or IKEv2) keeps the single child
+/// named after the connection, which is what the disconnect path and the
+/// existing status output expect.
+pub fn child_selectors(config: &ConnectionConfig, name: &str) -> Vec<(String, Vec<Ipv4Net>)> {
+    let split = config.ike_version == IkeVersion::V1 && config.remote_subnets.len() > 1;
+    if !split {
+        return vec![(name.to_string(), config.remote_subnets.clone())];
+    }
+    config
+        .remote_subnets
+        .iter()
+        .enumerate()
+        .map(|(i, net)| (format!("{name}-{}", i + 1), vec![*net]))
+        .collect()
+}
+
+/// Just the child names, in the order they must be initiated.
+pub fn child_names(config: &ConnectionConfig, name: &str) -> Vec<String> {
+    child_selectors(config, name)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect()
+}
 
 /// Build the `load-conn` argument: a message with a single section named
 /// after the connection, holding the IKE/child configuration. Contains no
@@ -22,21 +55,21 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
     // Auto-reconnect: on a dead peer (DPD) or the peer closing the SA,
     // `restart` makes charon re-establish it; otherwise it just clears.
     let on_fail = if config.dpd.auto_reconnect { "restart" } else { "clear" };
-    let mut child = Message::new()
-        .list("esp_proposals", [config.esp_proposal()])
-        .str("start_action", "none")
-        .str("dpd_action", on_fail)
-        .str("close_action", if config.dpd.auto_reconnect { "restart" } else { "none" });
-    if config.compression {
-        child = child.str("ipcomp", "yes");
+    let mut children = Message::new();
+    for (child_name, subnets) in child_selectors(config, name) {
+        let mut child = Message::new()
+            .list("esp_proposals", [config.esp_proposal()])
+            .str("start_action", "none")
+            .str("dpd_action", on_fail)
+            .str("close_action", if config.dpd.auto_reconnect { "restart" } else { "none" });
+        if config.compression {
+            child = child.str("ipcomp", "yes");
+        }
+        if !subnets.is_empty() {
+            child = child.list("remote_ts", subnets.iter().map(|n| n.to_string()));
+        }
+        children = children.section(&child_name, child);
     }
-    if !config.remote_subnets.is_empty() {
-        child = child.list(
-            "remote_ts",
-            config.remote_subnets.iter().map(|n| n.to_string()),
-        );
-    }
-    let children = Message::new().section(name, child);
 
     let mut conn = Message::new()
         .str("version", config.ike_version.swanctl_value())
@@ -265,6 +298,79 @@ pub(crate) mod tests {
         let second = conn.get_section("local-2").unwrap();
         assert_eq!(second.get_str("auth").as_deref(), Some("xauth"));
         assert_eq!(second.get_str("xauth_id").as_deref(), Some("vpnuser"));
+    }
+
+    fn nets(list: &[(&str, u8)]) -> Vec<Ipv4Net> {
+        list.iter()
+            .map(|(a, p)| Ipv4Net {
+                addr: a.parse().unwrap(),
+                prefix_len: *p,
+            })
+            .collect()
+    }
+
+    /// IKEv2 carries several selectors in one CHILD_SA, so the single child
+    /// named after the connection keeps all the subnets.
+    #[test]
+    fn ikev2_keeps_one_child_for_every_subnet() {
+        let mut cfg = sample();
+        cfg.remote_subnets = nets(&[("10.0.0.0", 24), ("172.21.108.0", 24), ("52.5.76.173", 32)]);
+        assert_eq!(child_names(&cfg, "c"), ["c"]);
+
+        let msg = load_conn_message(&cfg, "c");
+        let children = msg.get_section("c").unwrap().get_section("children").unwrap();
+        let child = children.get_section("c").expect("one child named after the conn");
+        assert_eq!(
+            child.get_list("remote_ts"),
+            Some(vec![
+                "10.0.0.0/24".to_string(),
+                "172.21.108.0/24".to_string(),
+                "52.5.76.173/32".to_string()
+            ])
+        );
+    }
+
+    /// IKEv1 quick mode negotiates one selector pair per SA — offering three
+    /// subnets in one child gets narrowed to the first, leaving the rest
+    /// silently unreachable. Each subnet therefore needs its own child.
+    #[test]
+    fn ikev1_splits_each_subnet_into_its_own_child() {
+        let mut cfg = sample();
+        cfg.ike_version = IkeVersion::V1;
+        cfg.remote_subnets = nets(&[("172.21.108.0", 24), ("10.98.49.0", 24), ("52.5.76.173", 32)]);
+        assert_eq!(child_names(&cfg, "c"), ["c-1", "c-2", "c-3"]);
+
+        let msg = load_conn_message(&cfg, "c");
+        let children = msg.get_section("c").unwrap().get_section("children").unwrap();
+        for (child, expected) in [
+            ("c-1", "172.21.108.0/24"),
+            ("c-2", "10.98.49.0/24"),
+            ("c-3", "52.5.76.173/32"),
+        ] {
+            assert_eq!(
+                children.get_section(child).unwrap().get_list("remote_ts"),
+                Some(vec![expected.to_string()]),
+                "{child}"
+            );
+        }
+        // Every child still carries the ESP proposal and reconnect policy.
+        let first = children.get_section("c-1").unwrap();
+        assert_eq!(
+            first.get_list("esp_proposals"),
+            Some(vec!["aes256-sha256-modp3072".to_string()])
+        );
+        assert_eq!(first.get_str("dpd_action").as_deref(), Some("restart"));
+    }
+
+    /// A single subnet under IKEv1 needs no splitting, and must keep the
+    /// connection's own name — that is what the status and disconnect paths
+    /// have always seen.
+    #[test]
+    fn ikev1_with_one_subnet_keeps_the_plain_child_name() {
+        let mut cfg = sample();
+        cfg.ike_version = IkeVersion::V1;
+        cfg.remote_subnets = nets(&[("0.0.0.0", 0)]);
+        assert_eq!(child_names(&cfg, "c"), ["c"]);
     }
 
     #[test]
