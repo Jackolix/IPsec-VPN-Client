@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::time::Duration;
 use thiserror::Error;
 use vici::{Client, Message};
-use vpn_core::ConnectionConfig;
+use vpn_core::{ConnectionConfig, Secret};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -58,6 +58,8 @@ pub enum ControlError {
     Rejected(&'static str, String),
     #[error("the Unix vici socket is not available on this platform; use a TCP transport")]
     NoUnixTransport,
+    #[error("this profile's gateway asks for a username and password, which were not supplied")]
+    MissingUserPassword,
 }
 
 pub type Result<T> = std::result::Result<T, ControlError>;
@@ -153,7 +155,15 @@ pub fn connect_logged(
     transport: &Transport,
     config: &ConnectionConfig,
     name: &str,
+    user_password: Option<&Secret>,
 ) -> Result<ConnectOutcome> {
+    // A profile whose gateway wants a second round cannot authenticate without
+    // the password, and charon would fail somewhere deep in the exchange with
+    // a message that doesn't say what is missing. Refuse up front instead.
+    if config.user_auth.is_some() && user_password.is_none() {
+        return Err(ControlError::MissingUserPassword);
+    }
+
     let mut client = open(transport)?;
     check(
         client.request("load-conn", bridge::load_conn_message(config, name))?,
@@ -163,6 +173,15 @@ pub fn connect_logged(
         client.request("load-shared", bridge::load_shared_message(config, name))?,
         "load-shared",
     )?;
+    if let Some(password) = user_password.filter(|_| config.user_auth.is_some()) {
+        check(
+            client.request(
+                "load-shared",
+                bridge::load_shared_user_auth_message(config, name, password),
+            )?,
+            "load-shared (user auth)",
+        )?;
+    }
 
     let (events, response) = client.stream_request(
         "initiate",
@@ -190,8 +209,13 @@ pub fn connect_logged(
 /// Load the connection + PSK and initiate the tunnel, returning only success
 /// or failure. Thin wrapper over [`connect_logged`] for the CLI, which prints
 /// charon's log itself rather than collecting it.
-pub fn connect(transport: &Transport, config: &ConnectionConfig, name: &str) -> Result<()> {
-    let outcome = connect_logged(transport, config, name)?;
+pub fn connect(
+    transport: &Transport,
+    config: &ConnectionConfig,
+    name: &str,
+    user_password: Option<&Secret>,
+) -> Result<()> {
+    let outcome = connect_logged(transport, config, name, user_password)?;
     if outcome.connected {
         Ok(())
     } else {
@@ -228,4 +252,30 @@ pub fn disconnect(transport: &Transport, name: &str) -> Result<()> {
         client.request("terminate", Message::new().str("ike", name))?,
         "terminate",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A profile that needs a login must be refused before any connection is
+    /// opened — the point of the guard is that charon never sees a half-built
+    /// credential set, so this must not depend on a reachable daemon. The
+    /// transport below points at a port nothing listens on: if the check ever
+    /// moves after `open`, this fails with a connection error instead.
+    #[test]
+    fn refuses_to_connect_without_the_user_password() {
+        let mut config = bridge::tests::sample();
+        config.user_auth = Some(vpn_core::UserAuth {
+            username: Some("vpnuser".to_string()),
+            can_save: true,
+            otp: false,
+        });
+        let transport = Transport::Tcp("127.0.0.1:1".to_string());
+        let err = connect_logged(&transport, &config, "c", None).unwrap_err();
+        assert!(
+            matches!(err, ControlError::MissingUserPassword),
+            "expected the missing-password guard, got: {err}"
+        );
+    }
 }

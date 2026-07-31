@@ -49,6 +49,9 @@ pub struct Scx {
     run_logon_script: bool,
     #[serde(default)]
     proposals: Vec<String>,
+    /// Written as a number by SFOS 21 and as a padded string (`"60 "`) by
+    /// SFOS 18.5, so it is read either way.
+    #[serde(default, deserialize_with = "flexible_u32")]
     dpd_delay: Option<u32>,
     #[serde(default)]
     local_auth: LocalAuth,
@@ -100,6 +103,21 @@ struct Child {
     proposals: Vec<String>,
     #[serde(default)]
     remote_ts: Vec<String>,
+}
+
+/// Read a number that different SFOS versions write differently: `60`, `"60"`
+/// or `"60 "` all mean the same thing. A value that is neither is treated as
+/// absent rather than failing the whole import — the field it guards has a
+/// sane default, and one odd timer is no reason to reject a profile.
+fn flexible_u32<'de, D>(de: D) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde::Deserialize::deserialize(de)? {
+        serde_json::Value::Number(n) => n.as_u64().map(|v| v as u32),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })
 }
 
 /// Does this look like an `.scx` rather than one of the other JSON formats?
@@ -156,10 +174,17 @@ pub fn import(input: &str) -> Result<ImportedProfile, ImportError> {
             "a profile without a pre-shared key (certificate authentication)".to_string(),
         ))?;
 
-    // The gateway's own PSK identity; `%any` (the usual value) means it does
-    // not pin one, and there is nothing for us to carry.
+    if is_private(&gateway) {
+        warn.warn(format!(
+            "the profile dials {gateway}, a private address — it will only connect from inside \
+             that network, or over another tunnel that reaches it"
+        ));
+    }
+
+    // The gateway's own PSK identity; `%any` and `0.0.0.0` (the usual values)
+    // mean it does not pin one, and there is nothing for us to carry.
     let remote_id = scx.remote_auth.psk.id.trim();
-    if !remote_id.is_empty() && remote_id != "%any" {
+    if !remote_id.is_empty() && remote_id != "%any" && remote_id != "0.0.0.0" {
         warn.warn(format!(
             "the profile pins the gateway's identity to {remote_id:?}; we do not check the \
              responder's identity yet"
@@ -308,7 +333,11 @@ fn first_proposal<'a>(
 /// up on the wire as an FQDN when the gateway expects something else.
 fn local_identity(id: &str, warn: &mut Warnings) -> (Option<String>, Option<IkeIdType>) {
     let id = id.trim();
-    if id.is_empty() || id == "%any" {
+    // `0.0.0.0` is how these profiles spell "no identity pinned" — SFOS writes
+    // it for both ends when the gateway matches on %any. Sending it literally
+    // would present an IPv4 identity of 0.0.0.0, which no gateway expects, so
+    // treat it as unset and let charon use the local address.
+    if id.is_empty() || id == "%any" || id == "0.0.0.0" || id == "::" {
         return (None, None);
     }
     let kind = if id.parse::<std::net::Ipv4Addr>().is_ok() {
@@ -323,6 +352,15 @@ fn local_identity(id: &str, warn: &mut Warnings) -> (Option<String>, Option<IkeI
         IkeIdType::Fqdn
     };
     (Some(id.to_string()), Some(kind))
+}
+
+/// Is the gateway an address that only answers from inside its own network?
+/// Shared with the `.tgb` importer's identical check.
+fn is_private(gateway: &str) -> bool {
+    gateway
+        .parse::<std::net::Ipv4Addr>()
+        .map(|a| a.is_private() || a.is_loopback() || a.is_link_local())
+        .unwrap_or(false)
 }
 
 /// Same conservative charset the NCP importer enforces: the gateway string

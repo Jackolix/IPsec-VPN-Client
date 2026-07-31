@@ -149,13 +149,28 @@ to any of them. Before the first real connect, two things need checking:
   the new `libcharon-0.dll` and in none of the old one — but **the currently
   shipped `charon-svc.exe` predates this**, and until it is replaced a `.tgb`
   or any user-auth profile fails at negotiation.
-- **The second auth round is a guess.** Both formats say the gateway wants a
-  username and password on top of the PSK, but not which method carries it.
-  We negotiate XAuth under IKEv1 and EAP-MSCHAPv2 under IKEv2, and every such
-  profile imports with a warning saying so. Collecting those credentials is
-  not wired up yet: `vpn_control::bridge::load_shared_user_auth_message`
-  builds the message, but nothing prompts for the password or stores it in
-  the keychain.
+- **The second auth round's method is a guess.** Both formats say the gateway
+  wants a username and password on top of the PSK, but not which method
+  carries it. We negotiate XAuth under IKEv1 and EAP-MSCHAPv2 under IKEv2,
+  and every such profile imports with a warning saying so.
+
+Collecting those credentials *is* wired up. A profile whose gateway wants a
+login prompts for one on connect (`login-overlay` in the UI), and the
+username and password go to charon as a `load-shared` of type `XAUTH`/`EAP`
+with its own credential id, never through `ConnectionConfig` and never into
+the profile file. "Remember" puts both in the OS keychain under a
+`<id>#userauth` entry, separate from the PSK entry, so forgetting one leaves
+the other; deleting a profile removes both. A gateway that says its
+credentials may not be saved — or that expects a one-time code — is not
+offered the checkbox, and the backend refuses to store them even if asked.
+Without a password, a connect is refused before any socket is opened rather
+than failing deep in the exchange.
+
+Drive it headlessly with
+`vpn-desktop --dev connect <id> <user> <password> [save]`,
+`--dev set-user-login <id> <user> <password>`, `--dev needs-user-login <id>`
+and `--dev forget-user-login <id>`; `vpn-agent connect --username U` prompts
+for the password without echoing it.
 
 Two things the real exports taught us, both encoded in the importers. The
 identity these profiles tell the client to present is the *gateway's own
