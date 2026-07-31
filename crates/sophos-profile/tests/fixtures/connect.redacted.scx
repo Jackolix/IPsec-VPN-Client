@@ -1,0 +1,52 @@
+{
+	"name":	"ExampleIPsec",
+	"display_name":	"Example IPsec",
+	"domain_suffix":	"",
+	"type":	"xg",
+	"managed":	false,
+	"version":	1,
+	"gateway":	"203.0.113.10",
+	"vip":	"0.0.0.0",
+	"auto_connect":	{
+		"required":	false,
+		"enabled":	false
+	},
+	"run_logon_script":	false,
+	"proposals":	[
+		"aes256-sha2_256-modp2048"
+	],
+	"dpd_delay":	60,
+	"rekey_time":	15300,
+	"start_action":	"none",
+	"local_auth":	{
+		"psk":	{
+			"id":	"203.0.113.10"
+		},
+		"xauth":	{
+			"can_save":	true
+		},
+		"otp":	false
+	},
+	"remote_auth":	{
+		"otp":	false,
+		"psk":	{
+			"id":	"%any",
+			"secret":	"REDACTED-NOT-A-REAL-KEY"
+		}
+	},
+	"child":	{
+		"proposals":	[
+			"aes256-sha2_256-modp2048"
+		],
+		"rekey_time":	3060,
+		"remote_ts":	[
+			"10.168.111.0/24",
+			"198.51.100.7/32"
+		]
+	},
+	"history":	{
+		"connect_time":	0,
+		"connect_result":	0
+	},
+	"favicon":	""
+}
