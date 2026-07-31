@@ -210,6 +210,66 @@ pub enum AuthMethod {
     PresharedKey(Secret),
 }
 
+/// Which IKE version a profile speaks.
+///
+/// NCP exports and Sophos `.scx` are IKEv2. The legacy Sophos/Cyberoam `.tgb`
+/// export is IKEv1 — it describes a main-mode phase 1 (`ID_PROT`) and a
+/// quick-mode phase 2 — so the version cannot be assumed any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IkeVersion {
+    V1,
+    V2,
+}
+
+impl IkeVersion {
+    /// The value strongSwan expects for `version` (`1` or `2`).
+    pub fn swanctl_value(self) -> &'static str {
+        match self {
+            IkeVersion::V1 => "1",
+            IkeVersion::V2 => "2",
+        }
+    }
+
+    /// Stable name for the override file and the UI.
+    pub fn name(self) -> &'static str {
+        match self {
+            IkeVersion::V1 => "ikev1",
+            IkeVersion::V2 => "ikev2",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "ikev1" => IkeVersion::V1,
+            "ikev2" => IkeVersion::V2,
+            _ => return None,
+        })
+    }
+
+    pub const ALL: [IkeVersion; 2] = [IkeVersion::V2, IkeVersion::V1];
+}
+
+/// A second, interactive authentication round layered on top of the PSK.
+///
+/// Sophos fronts its remote-access tunnels with one: under IKEv1 it is XAuth,
+/// under IKEv2 the equivalent EAP exchange. The profile only ever carries
+/// *whether* it is required (and whether the client may remember the answer) —
+/// the username and password belong to the person connecting, so they are
+/// collected at connect time and kept in the OS keychain, never in the profile
+/// file.
+#[derive(Debug, Clone, Default)]
+pub struct UserAuth {
+    /// Username, when one is known (from the keychain, or typed by the user).
+    /// `None` means the UI must ask before the tunnel can come up.
+    pub username: Option<String>,
+    /// Whether the gateway told us the client may save these credentials.
+    /// `false` means prompt on every connect and never write to the keychain.
+    pub can_save: bool,
+    /// The gateway expects a one-time password appended to (or in place of)
+    /// the fixed one, so a saved password alone will not authenticate.
+    pub otp: bool,
+}
+
 /// An IPv4 network in CIDR terms (address + prefix length).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv4Net {
@@ -328,6 +388,10 @@ pub struct ConnectionConfig {
     /// [`ConnectionConfig::local_id_wire`]). `None` = let charon infer.
     pub local_id_type: Option<IkeIdType>,
     pub auth: AuthMethod,
+    /// IKE version to negotiate.
+    pub ike_version: IkeVersion,
+    /// Second authentication round (XAuth/EAP), when the gateway demands one.
+    pub user_auth: Option<UserAuth>,
     /// IKE (phase 1) proposal.
     pub ike_enc: EncAlg,
     pub ike_integ: IntegAlg,
