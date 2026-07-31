@@ -146,6 +146,17 @@ pub fn import(input: &str) -> Result<ImportedProfile, ImportError> {
             otp: false,
         }
     });
+    if !xauth {
+        // Seen on a real SFOS gateway: the export says Xauth = 0 while the
+        // gateway advertises the XAuth vendor ID and rejects phase 1 outright
+        // without it. The failure is an unexplained AUTHENTICATION_FAILED, so
+        // say where to look.
+        warn.warn(
+            "the profile says XAuth is not required, which these exports get wrong — if the \
+             gateway rejects the pre-shared key, turn the username/password round on in the \
+             profile's parameters and try again",
+        );
+    }
 
     let dpd = doc
         .section("General")
@@ -183,9 +194,13 @@ pub fn import(input: &str) -> Result<ImportedProfile, ImportError> {
         esp_integ,
         pfs,
         remote_subnets,
-        // IKEv1 has no configuration payload of its own; an address is handed
-        // out by mode config, which we do not drive, so ask for nothing.
-        request_virtual_ip: false,
+        // These are remote-access profiles: the gateway hands out the address
+        // the tunnel is sourced from, over IKEv1 mode config, and expects it
+        // as the phase 2 local selector. Verified against a real SFOS
+        // gateway — without this the quick mode is answered with
+        // INVALID_ID_INFORMATION, because the client proposes its own LAN
+        // address instead of the one the gateway assigned.
+        request_virtual_ip: true,
         compression: false,
         dpd: DpdConfig {
             delay_secs: dpd.unwrap_or(30),

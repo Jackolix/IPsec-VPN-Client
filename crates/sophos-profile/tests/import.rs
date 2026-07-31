@@ -166,3 +166,29 @@ fn aggressive_mode_is_refused() {
         Err(ImportError::Unsupported(_))
     ));
 }
+
+/// A `.tgb` must ask for a mode-config address: the gateway assigns the phase 2
+/// local selector, and proposing our own LAN address instead is answered with
+/// INVALID_ID_INFORMATION.
+#[test]
+fn tgb_requests_a_virtual_ip() {
+    let imported = import_profile(TGB).unwrap();
+    assert!(imported.config.request_virtual_ip);
+}
+
+/// `Xauth = 0` has been seen on an export whose gateway demands XAuth anyway,
+/// so the import has to point at the fix rather than leave an unexplained
+/// AUTHENTICATION_FAILED.
+#[test]
+fn tgb_without_xauth_says_it_may_be_wrong() {
+    let imported = import_profile(TGB).unwrap();
+    assert!(imported.config.user_auth.is_none(), "the fixture has Xauth = 0");
+    assert!(
+        imported
+            .warnings
+            .iter()
+            .any(|w| w.0.contains("XAuth is not required") && w.0.contains("parameters")),
+        "got: {:?}",
+        imported.warnings
+    );
+}
