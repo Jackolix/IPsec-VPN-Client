@@ -1,6 +1,6 @@
 //! Render a [`ConnectionConfig`] as a strongSwan `swanctl.conf`.
 
-use crate::model::{AuthMethod, ConnectionConfig};
+use crate::model::{AuthMethod, ConnectionConfig, IkeVersion};
 use std::fmt::Write;
 
 /// Whether the rendered config contains the real PSK or a redaction marker.
@@ -62,18 +62,42 @@ pub fn render(config: &ConnectionConfig, secrets: SecretRendering) -> String {
 
     writeln!(out, "connections {{").unwrap();
     writeln!(out, "    {name} {{").unwrap();
-    writeln!(out, "        version = 2").unwrap();
+    writeln!(
+        out,
+        "        version = {}",
+        config.ike_version.swanctl_value()
+    )
+    .unwrap();
     writeln!(out, "        remote_addrs = {}", config.gateway).unwrap();
     if config.request_virtual_ip {
         writeln!(out, "        vips = 0.0.0.0").unwrap();
     }
     writeln!(out, "        proposals = {ike_proposal}").unwrap();
-    writeln!(out, "        local {{").unwrap();
+    // With a second (XAuth/EAP) round the local sections are numbered; without
+    // one the single `local` section stays as it was.
+    let local_section = if config.user_auth.is_some() {
+        "local-1"
+    } else {
+        "local"
+    };
+    writeln!(out, "        {local_section} {{").unwrap();
     writeln!(out, "            auth = psk").unwrap();
     if let Some(id) = config.local_id_wire() {
         writeln!(out, "            id = {}", quote(&id)).unwrap();
     }
     writeln!(out, "        }}").unwrap();
+    if let Some(ua) = &config.user_auth {
+        let (method, id_key) = match config.ike_version {
+            IkeVersion::V1 => ("xauth", "xauth_id"),
+            IkeVersion::V2 => ("eap-mschapv2", "eap_id"),
+        };
+        writeln!(out, "        local-2 {{").unwrap();
+        writeln!(out, "            auth = {method}").unwrap();
+        if let Some(user) = &ua.username {
+            writeln!(out, "            {id_key} = {}", quote(user)).unwrap();
+        }
+        writeln!(out, "        }}").unwrap();
+    }
     writeln!(out, "        remote {{").unwrap();
     writeln!(out, "            auth = psk").unwrap();
     writeln!(out, "        }}").unwrap();
