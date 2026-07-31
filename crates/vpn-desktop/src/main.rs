@@ -31,7 +31,7 @@ async fn profiles_dir(state: tauri::State<'_, AppState>) -> Result<String, Strin
         .map_err(|e| e.to_string())?
 }
 
-/// Open a native file picker and import the chosen `.ini`. Returns the new
+/// Open a native file picker and import the chosen profile. Returns the new
 /// profile id, or `None` if the dialog was cancelled.
 #[tauri::command]
 async fn import_profile_dialog(
@@ -44,8 +44,14 @@ async fn import_profile_dialog(
         let picked = app
             .dialog()
             .file()
+            // One combined filter first so the default view shows everything
+            // importable, then per-vendor ones for a user who knows what they
+            // are looking for. `.pro` is offered so picking one produces the
+            // explanation about the user portal rather than a greyed-out file.
+            .add_filter("VPN profile", &["ini", "scx", "tgb", "pro"])
             .add_filter("NCP profile", &["ini"])
-            .set_title("Import NCP profile")
+            .add_filter("Sophos profile", &["scx", "tgb", "pro"])
+            .set_title("Import VPN profile")
             .blocking_pick_file();
         match picked {
             Some(fp) => {
@@ -316,7 +322,7 @@ fn main() {
                 let _ = window.hide();
                 api.prevent_close();
             }
-            // Dragging .ini files onto the window imports them; Enter/Leave
+            // Dragging profile files onto the window imports them; Enter/Leave
             // drive a drop-zone highlight in the UI.
             tauri::WindowEvent::DragDrop(drag) => {
                 use tauri::{Emitter, Manager};

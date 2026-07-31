@@ -4311,6 +4311,7 @@ dependencies = [
  "ncp-profile",
  "serde",
  "serde_json",
+ "sophos-profile",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
