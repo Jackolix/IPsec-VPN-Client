@@ -155,6 +155,15 @@ bidirectional traffic into the remote LAN. What that run settled:
   proposes its own LAN address as the phase 2 selector instead of the one the
   gateway assigned.
 
+- **A profile's own proposal cannot be trusted.** The SFOS 21.0 gateway
+  states `aes256-sha2_256-modp2048` in its `.scx` and accepts only SHA2-512;
+  the mismatch surfaces as a bare `NO_PROPOSAL_CHOSEN` that names nothing, and
+  it took a twelve-combination sweep to find what it wanted. Connections now
+  offer the profile's proposal first and then stronger variants of it, so the
+  gateway picks — that unmodified profile negotiates on its own. The
+  alternatives only ever raise the hash and the DH group and never touch the
+  cipher, so this cannot be used to negotiate anything weaker than the profile
+  asked for.
 - **Every remote subnet needs its own CHILD_SA under IKEv1.** Quick mode
   negotiates one traffic-selector pair per SA, so a child offering three
   subnets is narrowed by the gateway to the first and the rest are silently
@@ -185,9 +194,20 @@ Before the first connect on any machine, two things still need checking:
   shipped `charon-svc.exe` predates this**, and until it is replaced a `.tgb`
   or any user-auth profile fails at negotiation.
 - **XAuth under IKEv1 is confirmed; EAP under IKEv2 is not.** The IKEv1 half
-  authenticated against a real gateway. No gateway has yet accepted the IKEv2
-  path, so `eap-mschapv2` remains the unverified guess for what carries the
-  round there, and such profiles import with a warning saying so.
+  authenticated against a real gateway. On a second, newer gateway (SFOS
+  21.0) the IKEv2 IKE_SA_INIT succeeds but IKE_AUTH is refused with
+  `AUTHENTICATION_FAILED` — with the profile's PSK, with no identity, with
+  the username as an RFC822 or FQDN identity, and with EAP-only client auth
+  (a well-formed `IDi` and no `AUTH` payload). The gateway rejects before the
+  username is ever exchanged, so this is its policy or a stale key rather
+  than the client's config. `eap-mschapv2` therefore remains the unverified
+  guess for what carries the round, and such profiles import with a warning.
+
+**The two gateways want opposite IKE versions**, which is why the version is
+an editable field. The SFOS 18.5 firewall carries a tunnel over IKEv1 and
+answers IKEv2 with `NO_PROPOSAL_CHOSEN`; the SFOS 21.0 one never answers
+IKEv1 at all (six retransmits, nothing back) and negotiates IKEv2 happily.
+So the firmware generation decides, and neither export says which.
 
 Collecting those credentials *is* wired up. A profile whose gateway wants a
 login prompts for one on connect (`login-overlay` in the UI), and the
