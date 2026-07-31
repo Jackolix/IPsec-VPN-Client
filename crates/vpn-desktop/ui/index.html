@@ -442,7 +442,11 @@
         <legend>Connection</legend>
         <div class="fgrid">
           <div class="field" id="f-name"><label for="e-name">Name</label><input id="e-name" type="text" spellcheck="false" /></div>
-          <div class="field" id="f-gateway"><label for="e-gateway">Gateway</label><input id="e-gateway" type="text" spellcheck="false" /></div>
+          <div class="field" id="f-gateway"><label for="e-gateway">Gateway</label><input id="e-gateway" type="text" spellcheck="false" /><span class="hint">Sophos exports name the firewall's internal address; replace it with the public one.</span></div>
+          <div class="field" id="f-ike_version"><label for="e-ike_version">IKE version</label><select id="e-ike_version"></select><span class="hint">The two Sophos exports for one gateway can disagree; only the gateway settles it.</span></div>
+          <div class="field" id="f-user_auth"><label for="e-user_auth">Username/password round</label>
+            <select id="e-user_auth"><option value="false">not required</option><option value="true">required (XAuth / EAP)</option></select>
+            <span class="hint">Turn on if the gateway rejects the pre-shared key despite it being correct.</span></div>
         </div>
       </fieldset>
 
@@ -1023,9 +1027,9 @@
   var DH = ["modp1024", "modp1536", "modp2048", "modp3072", "modp4096", "ecp256", "ecp384"];
   var ID_TYPES = [["", "auto (charon infers)"], ["ipv4", "ipv4"], ["fqdn", "fqdn"], ["rfc822", "rfc822 (user FQDN)"], ["keyid", "keyid"]];
   // Every field the dialog edits, in the order the backend names them.
-  var FIELDS = ["name", "gateway", "local_id", "local_id_type", "ike_enc", "ike_integ", "ike_prf",
-    "ike_dh", "esp_enc", "esp_integ", "pfs", "remote", "request_virtual_ip", "compression",
-    "dns", "dns_domain", "dpd_delay", "auto_reconnect"];
+  var FIELDS = ["name", "gateway", "ike_version", "user_auth", "local_id", "local_id_type",
+    "ike_enc", "ike_integ", "ike_prf", "ike_dh", "esp_enc", "esp_integ", "pfs", "remote",
+    "request_virtual_ip", "compression", "dns", "dns_domain", "dpd_delay", "auto_reconnect"];
 
   function fillSelect(id, values) {
     var sel = $(id); sel.innerHTML = "";
@@ -1034,6 +1038,7 @@
       var o = document.createElement("option"); o.value = value; o.textContent = label; sel.appendChild(o);
     });
   }
+  fillSelect("e-ike_version", [["ikev2", "IKEv2"], ["ikev1", "IKEv1 (legacy .tgb profiles)"]]);
   fillSelect("e-local_id_type", ID_TYPES);
   fillSelect("e-ike_enc", ENC); fillSelect("e-ike_integ", INTEG);
   fillSelect("e-ike_prf", PRF); fillSelect("e-ike_dh", DH);
@@ -1046,6 +1051,8 @@
     var ike = (p.ike || "").split("-"), esp = (p.esp || "").split("-");
     return {
       name: p.name, gateway: p.gateway,
+      ike_version: p.ikeVersion === "1" ? "ikev1" : "ikev2",
+      user_auth: !!p.userAuth,
       local_id: p.localId === "—" ? "" : p.localId, local_id_type: "rfc822",
       ike_enc: ike[0] || "aes256", ike_integ: ike[1] || "sha256",
       ike_prf: ike[2] || "prfsha256", ike_dh: ike[3] || "modp3072",
@@ -1079,6 +1086,8 @@
       else if (f === "remote" || f === "dns") {
         edit[f] = el.value.split(/[\n,]/).map(function (s) { return s.trim(); }).filter(Boolean);
       } else if (f === "dpd_delay") { edit[f] = parseInt(el.value, 10) || 0; }
+      // A <select> standing in for a bool: the backend wants the real thing.
+      else if (f === "user_auth") { edit[f] = el.value === "true"; }
       else { edit[f] = el.value.trim(); }
     });
     return edit;
