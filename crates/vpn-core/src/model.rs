@@ -461,14 +461,26 @@ impl Default for DpdConfig {
 impl ConnectionConfig {
     /// IKE (phase 1) proposal string, e.g. `aes256-sha256-prfsha256-modp3072`.
     /// Shared by the swanctl renderer and the vici bridge.
+    ///
+    /// IKEv1 has no separate PRF transform — it derives the PRF from the
+    /// negotiated hash — so the term is left out there, matching the form
+    /// strongSwan documents for IKEv1 (`aes256-sha256-modp2048`).
     pub fn ike_proposal(&self) -> String {
-        format!(
-            "{}-{}-{}-{}",
-            self.ike_enc.swanctl_name(),
-            self.ike_integ.swanctl_name(),
-            self.ike_prf.swanctl_name(),
-            self.ike_dh.swanctl_name()
-        )
+        match self.ike_version {
+            IkeVersion::V1 => format!(
+                "{}-{}-{}",
+                self.ike_enc.swanctl_name(),
+                self.ike_integ.swanctl_name(),
+                self.ike_dh.swanctl_name()
+            ),
+            IkeVersion::V2 => format!(
+                "{}-{}-{}-{}",
+                self.ike_enc.swanctl_name(),
+                self.ike_integ.swanctl_name(),
+                self.ike_prf.swanctl_name(),
+                self.ike_dh.swanctl_name()
+            ),
+        }
     }
 
     /// The local IKE identity as strongSwan should parse it: a typed prefix

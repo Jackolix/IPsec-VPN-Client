@@ -1,7 +1,8 @@
 # cross-platform-vpn
 
-Desktop IPsec (IKEv2) VPN client wrapping strongSwan. Imports NCP-style
-`.ini` profiles. See `ipsec-vpn-client-plan.md` for the full build plan;
+Desktop IPsec VPN client wrapping strongSwan. Imports NCP-style `.ini`
+profiles and Sophos `.scx` / `.tgb` exports. See
+`ipsec-vpn-client-plan.md` for the full build plan;
 this repo is at **Phase 2** — a Tauri desktop app whose Rust backend parses
 profiles natively and drives charon over the vici control protocol
 (connect / status / disconnect). Verified end-to-end against a LANCOM
@@ -9,10 +10,13 @@ vRouter, including from a native Windows build over a TCP vici socket.
 
 ## Security rules (read first)
 
-- NCP `.ini` profile exports contain a **live pre-shared key in plaintext**.
-  `*.ini` is gitignored; never commit one, never log the `Secret` value.
-  The only exception is the redacted test fixture
-  (`crates/ncp-profile/tests/fixtures/*.redacted.ini`).
+- Profile exports contain a **live pre-shared key in plaintext** — NCP `.ini`
+  in `Secret=`, Sophos `.scx` in `remote_auth.psk.secret`, Sophos `.tgb` in
+  the peer's `Authentication`. `*.ini`, `*.scx`, `*.tgb` and `*.pro` are
+  gitignored, as is `Sophos-configs/` where customer-supplied files land;
+  never commit one, never log the `Secret` value. The only exceptions are the
+  redacted test fixtures (`crates/*/tests/fixtures/*.redacted.*`), whose
+  keys and addresses are replaced.
 - Generated `*.swanctl.conf` files (in `out/`) contain the PSK too and are
   gitignored as well.
 - **Connect dials the gateway named in the profile.** The desktop app connects
@@ -26,7 +30,8 @@ vRouter, including from a native Windows build over a TCP vici socket.
 | Crate | Purpose |
 |---|---|
 | `crates/vpn-core` | Internal config model (importer-independent) + `swanctl.conf` rendering. `Secret` type redacts itself in all Debug/Display output. |
-| `crates/ncp-profile` | NCP ini parser + the documented numeric code tables (`src/codes.rs`, each mapping carries a confidence level) + importer that warns on every unconfirmed mapping. |
+| `crates/ncp-profile` | NCP ini importer + the documented numeric code tables (`src/codes.rs`, each mapping carries a confidence level); warns on every unconfirmed mapping. The ini parser it is built on lives in `vpn-core`, shared with the `.tgb` importer. |
+| `crates/sophos-profile` | Sophos importers: `.scx` (Sophos Connect — JSON, close to a serialised swanctl connection), `.tgb` (legacy Cyberoam/TheGreenBow — ini-shaped, IKEv1, algorithms reached through a chain of section references) and `.pro` (a pointer to a user portal, not a connection). Same policy as the NCP importer: hard error on anything safety-critical it cannot map, warning on anything merely unconfirmed. |
 | `crates/vici` | Hand-rolled client for strongSwan's vici control protocol: a cross-platform message codec plus packet framing and a blocking request/event client (Unix and TCP transports). |
 | `crates/vpn-control` | Shared connection logic used by both the CLI and the GUI: the config→vici bridge, `list-sa` status parsing, and the connect/status/disconnect flows over a `Transport` (Unix socket or TCP). `connect_logged` registers for charon's `log` event around `initiate` and returns the captured handshake transcript. |
 | `crates/vpn-desktop` | Tauri desktop app. Rust backend interprets profiles natively and calls `vpn-control`; the web UI (`ui/`) drives it via `invoke`. Native file-picker + drag-drop import, system tray, DNS-over-tunnel (NRPT), PSK in the OS keychain (`src/creds.rs`, `keyring`) taking precedence over the plaintext `.ini`. Run headlessly with `--selftest`; drive the backend flows with `--dev <cmd>`. |
@@ -54,8 +59,11 @@ cargo run -p vpn-agent -- --tcp 127.0.0.1:45022 connect --profile .\TEST-1.ini
 cargo run -p vpn-agent -- --tcp 127.0.0.1:45022 status
 cargo run -p vpn-agent -- --tcp 127.0.0.1:45022 disconnect --name vRouter-TEST-1
 
-# Inspect how a profile is interpreted (secret stays redacted):
+# Inspect how a profile is interpreted (secret stays redacted). The format is
+# picked from the file's contents, so this works for .ini, .scx and .tgb alike;
+# a .pro prints the user portal to sign in to instead.
 cargo run -p vpn-cli -- show .\TEST-1.ini
+cargo run -p vpn-cli -- show .\Sophos-configs\example.scx
 
 # Tests (run on any platform; the vici/control logic is cross-platform):
 cargo test --workspace
@@ -117,10 +125,51 @@ The responder side (test gateway) must accept: IKEv2, PSK, the profile's
 identity, IKE `aes256-sha256-prfsha256-modp3072`, ESP `aes256-sha256` with
 PFS group 15 (modp3072), and assign a virtual IP.
 
+## Sophos profiles
+
+A Sophos firewall hands out three files, all of them plaintext:
+
+| File | What it is | Status |
+|---|---|---|
+| `.scx` | Sophos Connect. JSON; since Sophos Connect is itself built on strongSwan it is close to a serialised swanctl connection, proposals and all. | Imports. |
+| `.tgb` | Legacy Cyberoam/TheGreenBow client profile. Ini-shaped, IKEv1. | Imports. |
+| `.pro` | Provisioning pointer: names a user portal to sign in to, from which the real `.scx` is downloaded. | Recognised, and the app says which portal. Fetching the profile is **not** implemented — it needs an authenticated HTTPS session against the customer's portal. |
+
+**Importing is verified; connecting is not.** Three real customer exports
+import correctly with the key redacted, and no connection was ever attempted
+to any of them. Before the first real connect, two things need checking:
+
+- **The daemon needs the plugins, so it must be rebuilt and re-shipped.**
+  `docker/strongswan-windows/Dockerfile` builds charon with
+  `--disable-defaults`, so it could do IKEv2 and nothing else.
+  `--enable-ikev1`, `--enable-xauth-generic` and `--enable-eap-mschapv2`
+  (plus the built-in md4/des, which OpenSSL 3 has moved to its legacy
+  provider) are now in the list. The cross-build succeeds and the plugins are
+  in the result — `ikev1`, `xauth-generic` and `eap-mschapv2` all appear in
+  the new `libcharon-0.dll` and in none of the old one — but **the currently
+  shipped `charon-svc.exe` predates this**, and until it is replaced a `.tgb`
+  or any user-auth profile fails at negotiation.
+- **The second auth round is a guess.** Both formats say the gateway wants a
+  username and password on top of the PSK, but not which method carries it.
+  We negotiate XAuth under IKEv1 and EAP-MSCHAPv2 under IKEv2, and every such
+  profile imports with a warning saying so. Collecting those credentials is
+  not wired up yet: `vpn_control::bridge::load_shared_user_auth_message`
+  builds the message, but nothing prompts for the password or stores it in
+  the keychain.
+
+Two things the real exports taught us, both encoded in the importers. The
+identity these profiles tell the client to present is the *gateway's own
+public address* — the `.scx` and the `.tgb` state it independently and agree.
+And a `.tgb` is generated against whichever interface the admin exported it
+from, so its gateway may be a private address that will never answer from
+outside; the import warns rather than leaving the user with a connection that
+only times out.
+
 ## Code-mapping caveat
 
 The NCP format is proprietary; every numeric-code interpretation in
 `crates/ncp-profile/src/codes.rs` is documented with a confidence level and
 surfaces as an import warning until confirmed against a real NCP client or
 gateway. Unknown codes for anything security-relevant are a hard import
-error — the importer never guesses silently.
+error — the importer never guesses silently. The Sophos formats are
+undocumented too and follow the same rule.
