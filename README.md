@@ -135,9 +135,40 @@ A Sophos firewall hands out three files, all of them plaintext:
 | `.tgb` | Legacy Cyberoam/TheGreenBow client profile. Ini-shaped, IKEv1. | Imports. |
 | `.pro` | Provisioning pointer: names a user portal to sign in to, from which the real `.scx` is downloaded. | Recognised, and the app says which portal. Fetching the profile is **not** implemented — it needs an authenticated HTTPS session against the customer's portal. |
 
-**Importing is verified; connecting is not.** Three real customer exports
-import correctly with the key redacted, and no connection was ever attempted
-to any of them. Before the first real connect, two things need checking:
+**A Sophos tunnel has been carried end to end.** Against a real SFOS gateway
+(with its owner's authorization), a `.tgb` profile imported, authenticated
+with XAuth, took a mode-config virtual IP, established a CHILD_SA and passed
+bidirectional traffic into the remote LAN. What that run settled:
+
+- **The gateway wanted IKEv1 + XAuth, not IKEv2.** Its `.scx` describes IKEv2
+  and every IKEv2 proposal we offered — five different algorithm sets — came
+  back `NO_PROPOSAL_CHOSEN`, which is what a strongSwan responder says when
+  no connection policy matches at all, version included. The `.tgb` from the
+  same firewall negotiated first time.
+- **`Xauth = 0` in a `.tgb` cannot be trusted.** That gateway advertises the
+  XAuth vendor ID and rejects phase 1 with `AUTHENTICATION_FAILED` unless
+  XAuth is actually offered — so the IKE version and the user-auth round are
+  both editable in the UI, and the `.tgb` importer warns when it sees
+  `Xauth = 0`.
+- **A `.tgb` must request a mode-config address.** Without it the gateway
+  answers quick mode with `INVALID_ID_INFORMATION`, because the client
+  proposes its own LAN address as the phase 2 selector instead of the one the
+  gateway assigned.
+
+Remaining gaps for that path:
+
+- **One remote subnet per connection.** IKEv1 quick mode narrows to a single
+  traffic-selector pair, so a profile listing three subnets installs a
+  CHILD_SA for the first only. Reaching all of them needs one CHILD_SA per
+  subnet, which the bridge does not build yet.
+- **Gateway-assigned DNS is dropped.** charon logs `handling INTERNAL_IP4_DNS
+  attribute failed` — the servers arrive over mode config, but the DNS path
+  only applies servers named in the profile.
+- **The exported gateway address is the internal one**, every time; it has to
+  be replaced with the public address before the profile will connect from
+  outside. The importer warns and the field is editable.
+
+Before the first connect on any machine, two things still need checking:
 
 - **The daemon needs the plugins, so it must be rebuilt and re-shipped.**
   `docker/strongswan-windows/Dockerfile` builds charon with
@@ -149,10 +180,10 @@ to any of them. Before the first real connect, two things need checking:
   the new `libcharon-0.dll` and in none of the old one — but **the currently
   shipped `charon-svc.exe` predates this**, and until it is replaced a `.tgb`
   or any user-auth profile fails at negotiation.
-- **The second auth round's method is a guess.** Both formats say the gateway
-  wants a username and password on top of the PSK, but not which method
-  carries it. We negotiate XAuth under IKEv1 and EAP-MSCHAPv2 under IKEv2,
-  and every such profile imports with a warning saying so.
+- **XAuth under IKEv1 is confirmed; EAP under IKEv2 is not.** The IKEv1 half
+  authenticated against a real gateway. No gateway has yet accepted the IKEv2
+  path, so `eap-mschapv2` remains the unverified guess for what carries the
+  round there, and such profiles import with a warning saying so.
 
 Collecting those credentials *is* wired up. A profile whose gateway wants a
 login prompts for one on connect (`login-overlay` in the UI), and the
