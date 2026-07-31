@@ -66,6 +66,8 @@ fn imports_the_legacy_tgb_profile() {
     assert_eq!(c.esp_enc, EncAlg::Aes256);
     assert_eq!(c.esp_integ, IntegAlg::Sha256);
     assert_eq!(c.pfs, Some(DhGroup::Modp2048), "PFSGRP14 in phase 2");
+    // IKEv1 derives the PRF from the hash, so the proposal carries no PRF term.
+    assert_eq!(c.ike_proposal(), "aes256-sha256-modp2048");
 
     // 0.0.0.0/0.0.0.0 is how these profiles say "full tunnel".
     assert_eq!(c.remote_subnets.len(), 1);
