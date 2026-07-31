@@ -44,21 +44,9 @@ pub enum ImportError {
     UnsupportedAuth,
 }
 
-/// A non-fatal finding the UI must surface before first connect.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportWarning(pub String);
-
-impl std::fmt::Display for ImportWarning {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Debug)]
-pub struct ImportedProfile {
-    pub config: ConnectionConfig,
-    pub warnings: Vec<ImportWarning>,
-}
+/// Both types are shared with the other importers — re-exported here so this
+/// crate's callers keep their existing paths.
+pub use vpn_core::import::{ImportWarning, ImportedProfile};
 
 struct Ctx {
     warnings: Vec<ImportWarning>,
