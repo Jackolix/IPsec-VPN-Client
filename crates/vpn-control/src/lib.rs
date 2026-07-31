@@ -183,22 +183,56 @@ pub fn connect_logged(
         )?;
     }
 
-    let (events, response) = client.stream_request(
-        "initiate",
-        "log",
-        Message::new().str("child", name).str("ike", name),
-    )?;
-    let log = events.iter().take(MAX_LOG_LINES).map(parse_log_line).collect();
-    let connected = response.get_str("success").as_deref() == Some("yes");
-    let error = if connected {
-        None
-    } else {
-        Some(
-            response
+    // Under IKEv1 a profile's subnets become one CHILD_SA each (quick mode
+    // negotiates a single selector pair), so there may be several to bring up.
+    let children = bridge::child_names(config, name);
+    let mut log: Vec<LogLine> = Vec::new();
+    let mut established = 0usize;
+    let mut first_error: Option<String> = None;
+
+    for child in &children {
+        let (events, response) = client.stream_request(
+            "initiate",
+            "log",
+            Message::new().str("child", child).str("ike", name),
+        )?;
+        for event in events.iter() {
+            if log.len() >= MAX_LOG_LINES {
+                break;
+            }
+            log.push(parse_log_line(event));
+        }
+        if response.get_str("success").as_deref() == Some("yes") {
+            established += 1;
+        } else {
+            let err = response
                 .get_str("errmsg")
-                .unwrap_or_else(|| "charon declined to initiate the connection".to_string()),
-        )
-    };
+                .unwrap_or_else(|| "charon declined to initiate the connection".to_string());
+            // Which subnet failed matters when the others came up: the tunnel
+            // looks fine but part of the remote network is unreachable.
+            if children.len() > 1 {
+                log.push(note(name, format!("{child} did not come up: {err}")));
+            }
+            first_error.get_or_insert(err);
+        }
+    }
+
+    // One established CHILD_SA means the tunnel carries traffic, so that is
+    // what "connected" means; a partial failure is reported in the log rather
+    // than by throwing away a working tunnel.
+    let connected = established > 0;
+    if connected && established < children.len() {
+        log.push(note(
+            name,
+            format!(
+                "{established} of {} remote networks came up; the rest are not reachable over \
+                 this tunnel",
+                children.len()
+            ),
+        ));
+    }
+    let error = if connected { None } else { first_error };
+
     Ok(ConnectOutcome {
         connected,
         error,
@@ -223,6 +257,17 @@ pub fn connect(
             "initiate",
             outcome.error.unwrap_or_default(),
         ))
+    }
+}
+
+/// A line of our own in the handshake transcript, phrased like charon's so the
+/// UI renders it the same way.
+fn note(ike: &str, msg: String) -> LogLine {
+    LogLine {
+        group: "CFG".to_string(),
+        level: 0,
+        ikesa: Some(ike.to_string()),
+        msg,
     }
 }
 

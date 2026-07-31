@@ -155,12 +155,16 @@ bidirectional traffic into the remote LAN. What that run settled:
   proposes its own LAN address as the phase 2 selector instead of the one the
   gateway assigned.
 
+- **Every remote subnet needs its own CHILD_SA under IKEv1.** Quick mode
+  negotiates one traffic-selector pair per SA, so a child offering three
+  subnets is narrowed by the gateway to the first and the rest are silently
+  unreachable. The bridge now emits one child per subnet (`<conn>-1`,
+  `<conn>-2`, …) and initiates each; verified with three subnets up at once on
+  one virtual IP, two of them passing traffic. IKEv2 carries all selectors in
+  a single CHILD_SA and is left alone.
+
 Remaining gaps for that path:
 
-- **One remote subnet per connection.** IKEv1 quick mode narrows to a single
-  traffic-selector pair, so a profile listing three subnets installs a
-  CHILD_SA for the first only. Reaching all of them needs one CHILD_SA per
-  subnet, which the bridge does not build yet.
 - **Gateway-assigned DNS is dropped.** charon logs `handling INTERNAL_IP4_DNS
   attribute failed` — the servers arrive over mode config, but the DNS path
   only applies servers named in the profile.
