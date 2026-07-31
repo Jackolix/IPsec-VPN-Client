@@ -2,6 +2,17 @@
 *.ini
 !crates/*/tests/fixtures/*.redacted.ini
 
+# Sophos exports carry the same live PSK: .scx / .tgb hold it in plaintext,
+# .pro names a customer's user portal. Customer-supplied files land in
+# Sophos-configs/; only redacted fixtures may be committed.
+*.scx
+*.tgb
+*.pro
+/Sophos-configs/
+!crates/*/tests/fixtures/*.redacted.scx
+!crates/*/tests/fixtures/*.redacted.tgb
+!crates/*/tests/fixtures/*.redacted.pro
+
 # Generated connection configs contain the PSK.
 /out/
 *.swanctl.conf
