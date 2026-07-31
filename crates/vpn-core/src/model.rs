@@ -109,6 +109,33 @@ impl IntegAlg {
         IntegAlg::Sha384,
         IntegAlg::Sha512,
     ];
+
+    /// The modern algorithms, strongest first — the pool a proposal fallback
+    /// may draw on. SHA-1 is deliberately absent: an alternative must never
+    /// let a gateway pick something weaker than the profile asked for.
+    pub const AT_LEAST_SHA256: [IntegAlg; 3] =
+        [IntegAlg::Sha512, IntegAlg::Sha384, IntegAlg::Sha256];
+
+    /// Ordering for "is this alternative at least as strong?" — output size is
+    /// the honest proxy here, and it is only ever compared within this enum.
+    pub fn strength(self) -> u16 {
+        match self {
+            IntegAlg::Sha1 => 160,
+            IntegAlg::Sha256 => 256,
+            IntegAlg::Sha384 => 384,
+            IntegAlg::Sha512 => 512,
+        }
+    }
+
+    /// The PRF conventionally paired with this hash.
+    pub fn matching_prf(self) -> PrfAlg {
+        match self {
+            IntegAlg::Sha1 => PrfAlg::Sha1,
+            IntegAlg::Sha256 => PrfAlg::Sha256,
+            IntegAlg::Sha384 => PrfAlg::Sha384,
+            IntegAlg::Sha512 => PrfAlg::Sha512,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +229,21 @@ impl DhGroup {
         DhGroup::Ecp256,
         DhGroup::Ecp384,
     ];
+
+    /// Rough comparable strength, so an offered alternative is never weaker
+    /// than what the profile asked for. Elliptic-curve groups are placed at
+    /// their commonly cited equivalent modp size.
+    pub fn strength(self) -> u16 {
+        match self {
+            DhGroup::Modp1024 => 1024,
+            DhGroup::Modp1536 => 1536,
+            DhGroup::Modp2048 => 2048,
+            DhGroup::Ecp256 => 3072,
+            DhGroup::Modp3072 => 3072,
+            DhGroup::Ecp384 => 4096,
+            DhGroup::Modp4096 => 4096,
+        }
+    }
 }
 
 /// How the peer authenticates. Only PSK for Phase 0.
@@ -483,6 +525,78 @@ impl ConnectionConfig {
         }
     }
 
+    /// Everything to offer for the IKE SA: the profile's own proposal first,
+    /// then stronger variants of it.
+    ///
+    /// A Sophos `.scx` has been seen stating `aes256-sha2_256-modp2048` for a
+    /// gateway that accepts only SHA2-512 — its own export does not match its
+    /// own policy, and the result is a bare `NO_PROPOSAL_CHOSEN` that says
+    /// nothing about what was wanted. Offering a handful of alternatives lets
+    /// the gateway pick, which is what the proposal list is for.
+    ///
+    /// SECURITY: the alternatives only ever *raise* the integrity algorithm
+    /// and the DH group, never lower either, and never change the cipher. So
+    /// a gateway (or something posing as one) cannot use this to negotiate
+    /// anything weaker than the profile already asked for.
+    pub fn ike_proposals(&self) -> Vec<String> {
+        let mut out = vec![self.ike_proposal()];
+        for integ in IntegAlg::AT_LEAST_SHA256 {
+            for dh in [self.ike_dh, DhGroup::Modp3072, DhGroup::Modp2048] {
+                if integ == self.ike_integ && dh == self.ike_dh {
+                    continue; // already offered, exactly as the profile wrote it
+                }
+                if dh.strength() < self.ike_dh.strength() || integ.strength() < self.ike_integ.strength() {
+                    continue;
+                }
+                let prf = integ.matching_prf();
+                let p = match self.ike_version {
+                    IkeVersion::V1 => format!(
+                        "{}-{}-{}",
+                        self.ike_enc.swanctl_name(),
+                        integ.swanctl_name(),
+                        dh.swanctl_name()
+                    ),
+                    IkeVersion::V2 => format!(
+                        "{}-{}-{}-{}",
+                        self.ike_enc.swanctl_name(),
+                        integ.swanctl_name(),
+                        prf.swanctl_name(),
+                        dh.swanctl_name()
+                    ),
+                };
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// The same idea for the CHILD_SA: the profile's ESP proposal, then
+    /// stronger integrity variants. The PFS group is left alone — changing it
+    /// changes what the gateway must also have configured for rekeying.
+    pub fn esp_proposals(&self) -> Vec<String> {
+        let mut out = vec![self.esp_proposal()];
+        for integ in IntegAlg::AT_LEAST_SHA256 {
+            if integ == self.esp_integ || integ.strength() < self.esp_integ.strength() {
+                continue;
+            }
+            let p = match self.pfs {
+                Some(g) => format!(
+                    "{}-{}-{}",
+                    self.esp_enc.swanctl_name(),
+                    integ.swanctl_name(),
+                    g.swanctl_name()
+                ),
+                None => format!("{}-{}", self.esp_enc.swanctl_name(), integ.swanctl_name()),
+            };
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
     /// The local IKE identity as strongSwan should parse it: a typed prefix
     /// forces the ID type so a bare token like `efa_mdt_42` is presented as
     /// RFC822 (what the gateway expects) rather than an inferred FQDN. Returns
@@ -514,6 +628,94 @@ impl ConnectionConfig {
                 self.esp_enc.swanctl_name(),
                 self.esp_integ.swanctl_name()
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod proposal_tests {
+    use super::*;
+
+    fn cfg(integ: IntegAlg, dh: DhGroup) -> ConnectionConfig {
+        ConnectionConfig {
+            name: "c".to_string(),
+            gateway: "gw.example.test".to_string(),
+            local_id: None,
+            local_id_type: None,
+            auth: AuthMethod::PresharedKey(Secret::new("x".to_string())),
+            ike_version: IkeVersion::V2,
+            user_auth: None,
+            ike_enc: EncAlg::Aes256,
+            ike_integ: integ,
+            ike_prf: integ.matching_prf(),
+            ike_dh: dh,
+            esp_enc: EncAlg::Aes256,
+            esp_integ: integ,
+            pfs: Some(dh),
+            remote_subnets: Vec::new(),
+            request_virtual_ip: true,
+            compression: false,
+            dpd: DpdConfig::default(),
+            dns: DnsConfig::default(),
+        }
+    }
+
+    /// The exact proposal the profile asked for must be offered first, so a
+    /// gateway that agrees with its own export negotiates it unchanged.
+    #[test]
+    fn the_profiles_own_proposal_comes_first() {
+        let c = cfg(IntegAlg::Sha256, DhGroup::Modp2048);
+        assert_eq!(c.ike_proposals()[0], c.ike_proposal());
+        assert_eq!(c.esp_proposals()[0], c.esp_proposal());
+    }
+
+    /// The case this exists for: a gateway that rejects the profile's
+    /// sha2_256 and wants sha2_512 finds it in the same offer.
+    #[test]
+    fn a_stronger_hash_is_offered_alongside() {
+        let c = cfg(IntegAlg::Sha256, DhGroup::Modp2048);
+        let p = c.ike_proposals();
+        assert!(
+            p.iter().any(|s| s == "aes256-sha512-prfsha512-modp2048"),
+            "{p:?}"
+        );
+    }
+
+    /// Nothing weaker than the profile may ever be offered — otherwise this
+    /// becomes a downgrade the gateway gets to choose.
+    #[test]
+    fn alternatives_are_never_weaker() {
+        for integ in [IntegAlg::Sha256, IntegAlg::Sha384, IntegAlg::Sha512] {
+            for dh in [DhGroup::Modp2048, DhGroup::Modp3072, DhGroup::Modp4096] {
+                let c = cfg(integ, dh);
+                for offered in c.ike_proposals().iter().chain(c.esp_proposals().iter()) {
+                    assert!(!offered.contains("sha1"), "{offered} offers SHA-1");
+                    for weaker in IntegAlg::ALL.iter().filter(|a| a.strength() < integ.strength()) {
+                        assert!(
+                            !offered.contains(weaker.swanctl_name()),
+                            "{offered} is weaker than the profile's {}",
+                            integ.swanctl_name()
+                        );
+                    }
+                    for weaker in DhGroup::ALL.iter().filter(|g| g.strength() < dh.strength()) {
+                        assert!(
+                            !offered.contains(weaker.swanctl_name()),
+                            "{offered} uses a weaker group than {}",
+                            dh.swanctl_name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The cipher is the profile's business; alternatives only vary the hash
+    /// and the group.
+    #[test]
+    fn the_cipher_is_never_substituted() {
+        let c = cfg(IntegAlg::Sha256, DhGroup::Modp2048);
+        for offered in c.ike_proposals() {
+            assert!(offered.starts_with("aes256-"), "{offered}");
         }
     }
 }
