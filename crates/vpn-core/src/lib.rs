@@ -1,6 +1,8 @@
 //! Internal VPN connection config model, decoupled from any import format
-//! (NCP ini, manual entry, ...), plus generation of strongSwan `swanctl.conf`.
+//! (NCP ini, Sophos .scx/.tgb, manual entry, ...), plus generation of
+//! strongSwan `swanctl.conf`.
 
+pub mod ini;
 pub mod model;
 pub mod swanctl;
 
