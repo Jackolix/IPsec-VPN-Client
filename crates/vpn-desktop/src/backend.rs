@@ -130,6 +130,11 @@ pub struct ProfileSummary {
     pub ike_version: String,
     /// Set when the gateway wants a username and password on top of the PSK.
     pub user_auth: Option<String>,
+    /// Whether that login is saved in the keychain (so connect won't prompt).
+    pub user_stored: bool,
+    /// The username saved for it, to prefill the prompt when re-entering a
+    /// password. Not a secret — the password never leaves the keychain.
+    pub user_name: Option<String>,
 }
 
 /// A profile opened for editing: its current effective values, plus which of
@@ -179,6 +184,12 @@ fn summarize(
         file: file.to_string(),
         format: format_label(file).to_string(),
         ike_version: config.ike_version.swanctl_value().to_string(),
+        user_stored: config.user_auth.is_some() && crate::creds::has_user(id),
+        user_name: config
+            .user_auth
+            .as_ref()
+            .and_then(|_| crate::creds::load_user(id).ok().flatten())
+            .map(|c| c.username),
         user_auth: config.user_auth.as_ref().map(|ua| {
             let method = match config.ike_version {
                 vpn_core::IkeVersion::V1 => "XAuth",
@@ -467,11 +478,10 @@ pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Resu
     Ok(stem)
 }
 
-/// Connect the profile identified by `id` to the gateway it names.
-/// Remove an imported profile and everything that trails it: the `.ini`, its
-/// override sidecar, and any PSK it left in the keychain. All three go, or the
-/// leftovers would be silently adopted by the next profile imported under the
-/// same name.
+/// Remove an imported profile and everything that trails it: the profile file,
+/// its override sidecar, and both keychain entries it may have left (the PSK
+/// and the XAuth/EAP login). All of it goes, or the leftovers would be
+/// silently adopted by the next profile imported under the same name.
 ///
 /// If the profile's tunnel is up it is torn down first — once the `.ini` is
 /// gone nothing in the UI can name that connection, so it could not otherwise
@@ -504,20 +514,42 @@ pub fn delete_profile(state: &AppState, id: String) -> std::result::Result<(), S
     }
     crate::overrides::clear(&state.profile_dir, &id)?;
     crate::creds::delete(&id)?;
+    // The XAuth/EAP login is a second keychain entry and would otherwise be
+    // inherited by the next profile imported under the same name.
+    crate::creds::delete_user(&id)?;
     Ok(())
+}
+
+/// A username and password typed into the connect prompt, and whether the
+/// user asked to keep them. Only reaches [`connect`]; never stored on the
+/// profile.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct UserLogin {
+    pub username: String,
+    pub password: String,
+    /// Save to the OS keychain so the next connect doesn't prompt.
+    #[serde(default)]
+    pub save: bool,
 }
 
 pub fn connect(
     state: &AppState,
     id: String,
+    login: Option<UserLogin>,
 ) -> std::result::Result<vpn_control::ConnectOutcome, String> {
     let (mut imported, _) = load(state, &id)?;
     // Prefer a PSK saved in the OS keychain over the one parsed from the
-    // (plaintext-on-disk) .ini, so saved credentials are what actually
+    // (plaintext-on-disk) profile file, so saved credentials are what actually
     // authenticate the tunnel.
     if let Some(psk) = crate::creds::load(&id)? {
         imported.config.auth = vpn_core::AuthMethod::PresharedKey(psk);
     }
+
+    // Second authentication round: the gateway wants a person's login on top
+    // of the PSK. Take what was just typed, else what was saved; the username
+    // goes into the config (charon sends it as the XAuth/EAP identity) while
+    // the password is passed separately and never stored on the profile.
+    let user_password = resolve_user_login(&id, &mut imported.config, login)?;
     let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
 
     // charon's `initiate` is unconditional: called against a connection that is
@@ -544,8 +576,13 @@ pub fn connect(
         return Ok(outcome);
     }
 
-    let mut outcome =
-        vpn_control::connect_logged(&state.transport, &imported.config, &name).map_err(|e| e.to_string())?;
+    let mut outcome = vpn_control::connect_logged(
+        &state.transport,
+        &imported.config,
+        &name,
+        user_password.as_ref(),
+    )
+    .map_err(|e| e.to_string())?;
 
     // An established CHILD_SA does not mean the tunnel carries traffic yet: the
     // assigned virtual IP still has to land on an OS interface first.
@@ -560,6 +597,96 @@ pub fn connect(
         apply_dns(state, &name, &imported.config.dns, &mut outcome);
     }
     Ok(outcome)
+}
+
+/// Settle the XAuth/EAP login for a connect, writing the username into the
+/// config and returning the password for the caller to hand to charon.
+///
+/// Returns `None` for a profile that needs no second round — including when a
+/// login was passed anyway, so a stale prompt can never bolt user auth onto a
+/// profile whose gateway doesn't ask for it.
+fn resolve_user_login(
+    id: &str,
+    config: &mut vpn_core::ConnectionConfig,
+    login: Option<UserLogin>,
+) -> std::result::Result<Option<vpn_core::Secret>, String> {
+    let Some(user_auth) = config.user_auth.as_mut() else {
+        return Ok(None);
+    };
+
+    let (username, password) = match login {
+        Some(l) => {
+            let username = l.username.trim().to_string();
+            if username.is_empty() {
+                return Err("the username cannot be empty".to_string());
+            }
+            if l.password.is_empty() {
+                return Err("the password cannot be empty".to_string());
+            }
+            // Honour the profile: a gateway that says its credentials must not
+            // be kept (typically because it expects a one-time code) doesn't
+            // get them written to the keychain whatever the checkbox said.
+            if l.save && user_auth.can_save && !user_auth.otp {
+                crate::creds::store_user(
+                    id,
+                    &crate::creds::UserCreds {
+                        username: username.clone(),
+                        password: vpn_core::Secret::new(l.password.clone()),
+                    },
+                )?;
+            }
+            (username, vpn_core::Secret::new(l.password))
+        }
+        None => {
+            let saved = crate::creds::load_user(id)?.ok_or_else(|| {
+                "this profile's gateway asks for a username and password".to_string()
+            })?;
+            (saved.username, saved.password)
+        }
+    };
+
+    user_auth.username = Some(username);
+    Ok(Some(password))
+}
+
+/// Whether a profile still needs to be asked for a login before it can
+/// connect: its gateway wants one and nothing usable is saved.
+pub fn needs_user_login(state: &AppState, id: &str) -> bool {
+    load(state, id)
+        .map(|(imported, _)| {
+            imported.config.user_auth.is_some() && !crate::creds::has_user(id)
+        })
+        .unwrap_or(false)
+}
+
+/// Forget a profile's saved XAuth/EAP login. The PSK entry is separate and
+/// stays put.
+pub fn forget_user_login(_state: &AppState, id: String) -> std::result::Result<(), String> {
+    crate::creds::delete_user(&id)
+}
+
+/// Save a login without connecting. The GUI stores credentials as a
+/// side-effect of a successful prompt; this is the same store on its own, for
+/// the headless harness.
+pub fn set_user_login(
+    _state: &AppState,
+    id: String,
+    username: String,
+    password: String,
+) -> std::result::Result<(), String> {
+    if username.trim().is_empty() {
+        return Err("the username cannot be empty".to_string());
+    }
+    if password.is_empty() {
+        return Err("the password cannot be empty".to_string());
+    }
+    crate::creds::store_user(
+        &id,
+        &crate::creds::UserCreds {
+            username: username.trim().to_string(),
+            password: vpn_core::Secret::new(password),
+        },
+    )
 }
 
 /// The live SA for `name`, if charon already has one carrying traffic — i.e. an

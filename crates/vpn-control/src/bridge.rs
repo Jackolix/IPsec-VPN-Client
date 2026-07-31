@@ -128,12 +128,13 @@ pub fn load_shared_message(config: &ConnectionConfig, name: &str) -> Message {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use vpn_core::{DhGroup, EncAlg, IntegAlg, Ipv4Net, PrfAlg, Secret};
 
-    fn sample() -> ConnectionConfig {
+    /// Shared with the connect-flow tests in `lib.rs`.
+    pub(crate) fn sample() -> ConnectionConfig {
         ConnectionConfig {
             name: "vRouter-TEST-1".to_string(),
             gateway: "192.168.100.10".to_string(),
