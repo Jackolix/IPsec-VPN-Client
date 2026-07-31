@@ -58,7 +58,7 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
     let mut children = Message::new();
     for (child_name, subnets) in child_selectors(config, name) {
         let mut child = Message::new()
-            .list("esp_proposals", [config.esp_proposal()])
+            .list("esp_proposals", config.esp_proposals())
             .str("start_action", "none")
             .str("dpd_action", on_fail)
             .str("close_action", if config.dpd.auto_reconnect { "restart" } else { "none" });
@@ -74,7 +74,7 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
     let mut conn = Message::new()
         .str("version", config.ike_version.swanctl_value())
         .list("remote_addrs", [config.gateway.clone()])
-        .list("proposals", [config.ike_proposal()]);
+        .list("proposals", config.ike_proposals());
 
     // A gateway that wants XAuth/EAP gets two local auth rounds: the PSK
     // first, then the interactive one. strongSwan distinguishes rounds by the
@@ -199,9 +199,14 @@ pub(crate) mod tests {
         let msg = load_conn_message(&sample(), "vRouter-TEST-1");
         let conn = msg.get_section("vRouter-TEST-1").expect("named section");
         assert_eq!(conn.get_str("version").as_deref(), Some("2"));
-        assert_eq!(
-            conn.get_list("proposals"),
-            Some(vec!["aes256-sha256-prfsha256-modp3072".to_string()])
+        // The profile's own proposal is offered first; the rest are stronger
+        // alternatives for a gateway whose export disagrees with its policy.
+        let proposals = conn.get_list("proposals").expect("proposals");
+        assert_eq!(proposals[0], "aes256-sha256-prfsha256-modp3072");
+        assert!(proposals.len() > 1, "expected fallbacks: {proposals:?}");
+        assert!(
+            !proposals.iter().any(|p| p.contains("sha1") || p.contains("modp2048")),
+            "an alternative must never be weaker than the profile: {proposals:?}"
         );
         assert_eq!(
             conn.get_section("local").unwrap().get_str("id").as_deref(),
@@ -213,8 +218,8 @@ pub(crate) mod tests {
             .get_section("vRouter-TEST-1")
             .unwrap();
         assert_eq!(
-            child.get_list("esp_proposals"),
-            Some(vec!["aes256-sha256-modp3072".to_string()])
+            child.get_list("esp_proposals").unwrap()[0],
+            "aes256-sha256-modp3072"
         );
         assert_eq!(child.get_list("remote_ts"), Some(vec!["10.0.0.0/24".to_string()]));
     }
@@ -356,8 +361,8 @@ pub(crate) mod tests {
         // Every child still carries the ESP proposal and reconnect policy.
         let first = children.get_section("c-1").unwrap();
         assert_eq!(
-            first.get_list("esp_proposals"),
-            Some(vec!["aes256-sha256-modp3072".to_string()])
+            first.get_list("esp_proposals").unwrap()[0],
+            "aes256-sha256-modp3072"
         );
         assert_eq!(first.get_str("dpd_action").as_deref(), Some("restart"));
     }
