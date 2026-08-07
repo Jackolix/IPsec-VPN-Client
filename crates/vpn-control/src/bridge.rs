@@ -22,7 +22,19 @@ use vpn_core::{AuthMethod, ConnectionConfig, IkeVersion, Ipv4Net, Secret};
 /// named after the connection, which is what the disconnect path and the
 /// existing status output expect.
 pub fn child_selectors(config: &ConnectionConfig, name: &str) -> Vec<(String, Vec<Ipv4Net>)> {
-    let split = config.ike_version == IkeVersion::V1 && config.remote_subnets.len() > 1;
+    child_selectors_for(config, name, config.ike_version)
+}
+
+/// As [`child_selectors`], but for an explicit IKE version rather than the
+/// profile's own. The connect flow uses this to retry a profile under the other
+/// version when the gateway rejects the one it guessed, without cloning the
+/// (non-`Clone`) config and its secret.
+pub fn child_selectors_for(
+    config: &ConnectionConfig,
+    name: &str,
+    version: IkeVersion,
+) -> Vec<(String, Vec<Ipv4Net>)> {
+    let split = version == IkeVersion::V1 && config.remote_subnets.len() > 1;
     if !split {
         return vec![(name.to_string(), config.remote_subnets.clone())];
     }
@@ -36,7 +48,12 @@ pub fn child_selectors(config: &ConnectionConfig, name: &str) -> Vec<(String, Ve
 
 /// Just the child names, in the order they must be initiated.
 pub fn child_names(config: &ConnectionConfig, name: &str) -> Vec<String> {
-    child_selectors(config, name)
+    child_names_for(config, name, config.ike_version)
+}
+
+/// [`child_names`] for an explicit IKE version.
+pub fn child_names_for(config: &ConnectionConfig, name: &str, version: IkeVersion) -> Vec<String> {
+    child_selectors_for(config, name, version)
         .into_iter()
         .map(|(n, _)| n)
         .collect()
@@ -46,6 +63,19 @@ pub fn child_names(config: &ConnectionConfig, name: &str) -> Vec<String> {
 /// after the connection, holding the IKE/child configuration. Contains no
 /// secret material.
 pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
+    load_conn_message_for(config, name, config.ike_version)
+}
+
+/// As [`load_conn_message`], but building the connection for an explicit IKE
+/// version. Everything the version touches — the `version` field, the XAuth vs
+/// EAP auth round and identity key, and whether each subnet gets its own
+/// CHILD_SA — follows `version` rather than `config.ike_version`, so the connect
+/// flow can retry the other version without rebuilding the config.
+pub fn load_conn_message_for(
+    config: &ConnectionConfig,
+    name: &str,
+    version: IkeVersion,
+) -> Message {
     let mut local = Message::new().str("auth", "psk");
     if let Some(id) = config.local_id_wire() {
         local = local.str("id", id);
@@ -56,7 +86,7 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
     // `restart` makes charon re-establish it; otherwise it just clears.
     let on_fail = if config.dpd.auto_reconnect { "restart" } else { "clear" };
     let mut children = Message::new();
-    for (child_name, subnets) in child_selectors(config, name) {
+    for (child_name, subnets) in child_selectors_for(config, name, version) {
         let mut child = Message::new()
             .list("esp_proposals", config.esp_proposals())
             .str("start_action", "none")
@@ -72,7 +102,7 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
     }
 
     let mut conn = Message::new()
-        .str("version", config.ike_version.swanctl_value())
+        .str("version", version.swanctl_value())
         .list("remote_addrs", [config.gateway.clone()])
         .list("proposals", config.ike_proposals());
 
@@ -83,11 +113,11 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
     conn = match &config.user_auth {
         None => conn.section("local", local),
         Some(ua) => {
-            let mut round2 = Message::new().str("auth", user_auth_method(config));
+            let mut round2 = Message::new().str("auth", user_auth_method(version));
             if let Some(user) = &ua.username {
                 // XAuth and EAP name the identity differently; sending the one
                 // that belongs to the other round is silently ignored.
-                round2 = match config.ike_version {
+                round2 = match version {
                     IkeVersion::V1 => round2.str("xauth_id", user.clone()),
                     IkeVersion::V2 => round2.str("eap_id", user.clone()),
                 };
@@ -113,8 +143,8 @@ pub fn load_conn_message(config: &ConnectionConfig, name: &str) -> Message {
 /// strongSwan's name for the second auth round. IKEv1 calls it XAuth; the
 /// IKEv2 equivalent is EAP, where MSCHAPv2 is what a Sophos gateway offers for
 /// username/password.
-fn user_auth_method(config: &ConnectionConfig) -> &'static str {
-    match config.ike_version {
+fn user_auth_method(version: IkeVersion) -> &'static str {
+    match version {
         IkeVersion::V1 => "xauth",
         IkeVersion::V2 => "eap-mschapv2",
     }
@@ -130,7 +160,19 @@ pub fn load_shared_user_auth_message(
     name: &str,
     password: &Secret,
 ) -> Message {
-    let kind = match config.ike_version {
+    load_shared_user_auth_message_for(config, name, password, config.ike_version)
+}
+
+/// [`load_shared_user_auth_message`] for an explicit IKE version: the secret is
+/// typed `XAUTH` under IKEv1 and `EAP` under IKEv2, and charon ignores the one
+/// that does not match the negotiated version.
+pub fn load_shared_user_auth_message_for(
+    config: &ConnectionConfig,
+    name: &str,
+    password: &Secret,
+    version: IkeVersion,
+) -> Message {
+    let kind = match version {
         IkeVersion::V1 => "XAUTH",
         IkeVersion::V2 => "EAP",
     };
@@ -376,6 +418,47 @@ pub(crate) mod tests {
         cfg.ike_version = IkeVersion::V1;
         cfg.remote_subnets = nets(&[("0.0.0.0", 0)]);
         assert_eq!(child_names(&cfg, "c"), ["c"]);
+    }
+
+    /// The version-explicit builder is what the connect-time fallback uses: the
+    /// same config, negotiated as the *other* IKE version. Everything the
+    /// version governs has to follow the argument, not the config's own field.
+    #[test]
+    fn version_override_rebuilds_the_connection_as_the_other_version() {
+        // A config that says IKEv2, built for an IKEv1 retry.
+        let mut cfg = sample();
+        cfg.user_auth = Some(vpn_core::UserAuth {
+            username: Some("vpnuser".to_string()),
+            can_save: true,
+            otp: false,
+        });
+        assert_eq!(cfg.ike_version, IkeVersion::V2);
+
+        let msg = load_conn_message_for(&cfg, "c", IkeVersion::V1);
+        let conn = msg.get_section("c").unwrap();
+        assert_eq!(conn.get_str("version").as_deref(), Some("1"));
+        // The second round is XAuth (IKEv1), not EAP, and the identity travels
+        // under the XAuth key.
+        let round2 = conn.get_section("local-2").unwrap();
+        assert_eq!(round2.get_str("auth").as_deref(), Some("xauth"));
+        assert_eq!(round2.get_str("xauth_id").as_deref(), Some("vpnuser"));
+        assert!(round2.get_str("eap_id").is_none());
+
+        // And the user-auth secret is typed for XAuth, too.
+        let pw = Secret::new("pa55word".to_string());
+        let shared = load_shared_user_auth_message_for(&cfg, "c", &pw, IkeVersion::V1);
+        assert_eq!(shared.get_str("type").as_deref(), Some("XAUTH"));
+    }
+
+    /// Under the IKEv1 retry, several subnets must split into one child each —
+    /// even though the config's own version is IKEv2, which would keep them
+    /// together.
+    #[test]
+    fn version_override_splits_children_for_ikev1() {
+        let mut cfg = sample();
+        cfg.remote_subnets = nets(&[("172.21.108.0", 24), ("10.98.49.0", 24)]);
+        assert_eq!(child_names_for(&cfg, "c", IkeVersion::V2), ["c"]);
+        assert_eq!(child_names_for(&cfg, "c", IkeVersion::V1), ["c-1", "c-2"]);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::time::Duration;
 use thiserror::Error;
 use vici::{Client, Message};
-use vpn_core::{ConnectionConfig, Secret};
+use vpn_core::{ConnectionConfig, IkeVersion, Secret};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -60,6 +60,12 @@ pub enum ControlError {
     NoUnixTransport,
     #[error("this profile's gateway asks for a username and password, which were not supplied")]
     MissingUserPassword,
+    #[error(
+        "this profile names no remote networks, so bringing it up would route all traffic through \
+         the VPN — and if the gateway does not carry it, cut off internet access. Add the \
+         subnet(s) you need to reach, or choose to route all traffic through the VPN on purpose"
+    )]
+    NoRemoteNetworks,
 }
 
 pub type Result<T> = std::result::Result<T, ControlError>;
@@ -164,9 +170,69 @@ pub fn connect_logged(
         return Err(ControlError::MissingUserPassword);
     }
 
+    // A profile with no traffic selectors would negotiate 0.0.0.0/0 and — with
+    // charon's `install_routes` on — capture the machine's default route into
+    // the tunnel. Against a split-tunnel gateway that does not carry internet
+    // traffic (the common Sophos case), that silently kills connectivity. Never
+    // do it implicitly: a full tunnel has to be an explicit 0.0.0.0/0 in the
+    // profile, so an empty selector set is refused before any route is touched.
+    if config.remote_subnets.is_empty() {
+        return Err(ControlError::NoRemoteNetworks);
+    }
+
     let mut client = open(transport)?;
+    let primary = config.ike_version;
+    let mut outcome = attempt(&mut client, config, name, primary, user_password)?;
+
+    // The IKE version is not stated in a Sophos `.scx` (and a `.mobileconfig`
+    // states it, but old gateways still disagree), so the version we import can
+    // be wrong. An SFOS responder answers an IKE_SA_INIT it has no policy for —
+    // version included — with NO_PROPOSAL_CHOSEN, which is a fast, unambiguous
+    // "wrong version" (not an algorithm mismatch). Rather than make the user
+    // edit the profile, retry once with the other version. Verified live:
+    // SFOS 18.5 needs IKEv1, SFOS 21 needs IKEv2.
+    if !outcome.connected && suggests_wrong_ike_version(&outcome.log) {
+        let alternate = other_version(primary);
+        outcome.log.push(note(
+            name,
+            format!(
+                "the gateway did not accept IKEv{}; retrying as IKEv{}",
+                primary.swanctl_value(),
+                alternate.swanctl_value()
+            ),
+        ));
+        let retry = attempt(&mut client, config, name, alternate, user_password)?;
+
+        let mut log = outcome.log;
+        log.extend(retry.log);
+        if log.len() > MAX_LOG_LINES {
+            log.truncate(MAX_LOG_LINES);
+        }
+        // Report the profile's own version on a double failure: it is the one
+        // the user configured, and its error is the more meaningful of the two.
+        let error = if retry.connected { None } else { outcome.error };
+        return Ok(ConnectOutcome {
+            connected: retry.connected,
+            error,
+            log,
+        });
+    }
+
+    Ok(outcome)
+}
+
+/// One load-and-initiate pass at a single IKE version. Separated from
+/// [`connect_logged`] so the version-fallback path can run it twice against the
+/// same open client without duplicating the flow.
+fn attempt(
+    client: &mut Client<ViciStream>,
+    config: &ConnectionConfig,
+    name: &str,
+    version: IkeVersion,
+    user_password: Option<&Secret>,
+) -> Result<ConnectOutcome> {
     check(
-        client.request("load-conn", bridge::load_conn_message(config, name))?,
+        client.request("load-conn", bridge::load_conn_message_for(config, name, version))?,
         "load-conn",
     )?;
     check(
@@ -177,7 +243,7 @@ pub fn connect_logged(
         check(
             client.request(
                 "load-shared",
-                bridge::load_shared_user_auth_message(config, name, password),
+                bridge::load_shared_user_auth_message_for(config, name, password, version),
             )?,
             "load-shared (user auth)",
         )?;
@@ -185,7 +251,7 @@ pub fn connect_logged(
 
     // Under IKEv1 a profile's subnets become one CHILD_SA each (quick mode
     // negotiates a single selector pair), so there may be several to bring up.
-    let children = bridge::child_names(config, name);
+    let children = bridge::child_names_for(config, name, version);
     let mut log: Vec<LogLine> = Vec::new();
     let mut established = 0usize;
     let mut first_error: Option<String> = None;
@@ -237,6 +303,29 @@ pub fn connect_logged(
         connected,
         error,
         log,
+    })
+}
+
+/// The other IKE version, for the fallback retry.
+fn other_version(v: IkeVersion) -> IkeVersion {
+    match v {
+        IkeVersion::V1 => IkeVersion::V2,
+        IkeVersion::V2 => IkeVersion::V1,
+    }
+}
+
+/// Does the captured handshake say the gateway rejected the IKE *version*
+/// rather than something we could not fix by switching it?
+///
+/// `NO_PROPOSAL_CHOSEN` from a strongSwan responder (SFOS is one) at IKE_SA_INIT
+/// means no connection policy matched at all — a version mismatch reads exactly
+/// like this. It is deliberately the only trigger: an authentication failure or
+/// an unreachable gateway must *not* provoke a pointless second attempt at the
+/// other version.
+fn suggests_wrong_ike_version(log: &[LogLine]) -> bool {
+    log.iter().any(|line| {
+        let msg = line.msg.to_ascii_uppercase();
+        msg.contains("NO_PROPOSAL_CHOSEN") || msg.contains("NO_PROP")
     })
 }
 
@@ -322,5 +411,64 @@ mod tests {
             matches!(err, ControlError::MissingUserPassword),
             "expected the missing-password guard, got: {err}"
         );
+    }
+
+    /// A profile with no traffic selectors must be refused before anything is
+    /// opened, so it can never capture the default route into a tunnel the
+    /// gateway may not carry. Same reasoning as the missing-password guard: the
+    /// transport points at a dead port, so a regression that moved the check
+    /// after `open` would fail with a connection error instead.
+    #[test]
+    fn refuses_a_profile_with_no_remote_networks() {
+        let mut config = bridge::tests::sample();
+        config.remote_subnets.clear();
+        let transport = Transport::Tcp("127.0.0.1:1".to_string());
+        let err = connect_logged(&transport, &config, "c", None).unwrap_err();
+        assert!(
+            matches!(err, ControlError::NoRemoteNetworks),
+            "expected the no-networks guard, got: {err}"
+        );
+    }
+
+    fn log_line(msg: &str) -> LogLine {
+        LogLine {
+            group: "IKE".to_string(),
+            level: 1,
+            ikesa: None,
+            msg: msg.to_string(),
+        }
+    }
+
+    /// The one signal that provokes the version retry, in the shape charon
+    /// actually logs it — a parsed `N(NO_PROP)` notify on the IKE_SA_INIT
+    /// response.
+    #[test]
+    fn no_proposal_chosen_triggers_the_version_fallback() {
+        let log = [
+            log_line("initiating IKE_SA c[1] to 203.0.113.10"),
+            log_line("parsed IKE_SA_INIT response 0 [ N(NO_PROP) ]"),
+        ];
+        assert!(suggests_wrong_ike_version(&log));
+    }
+
+    /// An authentication failure or an unreachable gateway must not: switching
+    /// the IKE version cannot fix either, and a needless second attempt only
+    /// doubles the wait and muddies the log.
+    #[test]
+    fn auth_failure_does_not_trigger_the_fallback() {
+        let log = [
+            log_line("XAuth authentication of 'user' failed"),
+            log_line("received AUTHENTICATION_FAILED notify error"),
+        ];
+        assert!(!suggests_wrong_ike_version(&log));
+
+        let unreachable = [log_line("retransmit 5 of request with message ID 0")];
+        assert!(!suggests_wrong_ike_version(&unreachable));
+    }
+
+    #[test]
+    fn other_version_flips() {
+        assert_eq!(other_version(IkeVersion::V1), IkeVersion::V2);
+        assert_eq!(other_version(IkeVersion::V2), IkeVersion::V1);
     }
 }
