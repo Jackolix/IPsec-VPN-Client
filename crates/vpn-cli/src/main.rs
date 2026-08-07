@@ -107,8 +107,9 @@ fn print_provisioning(entries: &[sophos_profile::Provisioning]) {
         );
     }
     println!(
-        "\nSign in to the portal and download the .scx profile from it, then import that \
-         file. Fetching it automatically is not implemented."
+        "\nSign in to the portal, open the VPN section, and download the IPsec configuration \
+         (served as a .mobileconfig), then import that file. It lists no networks, so add the \
+         subnet(s) you need before connecting. Fetching it automatically is not implemented."
     );
 }
 
