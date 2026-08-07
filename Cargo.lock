@@ -3280,6 +3280,7 @@ dependencies = [
 name = "sophos-profile"
 version = "0.1.0"
 dependencies = [
+ "plist",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

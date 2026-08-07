@@ -10,6 +10,8 @@ use thiserror::Error;
 pub enum ImportError {
     #[error("not valid JSON: {0}")]
     Json(String),
+    #[error("not a valid Apple property list: {0}")]
+    Plist(String),
     #[error(transparent)]
     Ini(#[from] vpn_core::ini::ParseError),
     #[error("input exceeds {0} bytes")]

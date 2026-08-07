@@ -221,7 +221,7 @@ fn summarize(
 /// File extensions a profile may have, in the order [`profile_path`] resolves
 /// them. Ids stay bare file stems, so an override sidecar or a keychain entry
 /// written before Sophos profiles existed still addresses the same profile.
-const PROFILE_EXTENSIONS: [&str; 3] = ["ini", "scx", "tgb"];
+const PROFILE_EXTENSIONS: [&str; 4] = ["ini", "scx", "tgb", "mobileconfig"];
 
 /// Human-readable origin of a profile, from its extension. The importers pick
 /// by content, but the extension is what survived the copy into the profile
@@ -230,6 +230,7 @@ fn format_label(file: &str) -> &'static str {
     match file.rsplit('.').next().unwrap_or_default() {
         "scx" => "Sophos Connect",
         "tgb" => "Sophos (legacy)",
+        "mobileconfig" => "Sophos (portal)",
         _ => "NCP",
     }
 }
