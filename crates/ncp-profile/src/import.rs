@@ -44,21 +44,9 @@ pub enum ImportError {
     UnsupportedAuth,
 }
 
-/// A non-fatal finding the UI must surface before first connect.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportWarning(pub String);
-
-impl std::fmt::Display for ImportWarning {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Debug)]
-pub struct ImportedProfile {
-    pub config: ConnectionConfig,
-    pub warnings: Vec<ImportWarning>,
-}
+/// Both types are shared with the other importers — re-exported here so this
+/// crate's callers keep their existing paths.
+pub use vpn_core::import::{ImportWarning, ImportedProfile};
 
 struct Ctx {
     warnings: Vec<ImportWarning>,
@@ -402,9 +390,24 @@ pub fn import_profile(input: &str) -> Result<ImportedProfile, ImportError> {
             ));
         }
     }
-    if profile.get("UseXAUTH").map(str::trim) == Some("1") {
-        ctx.warn("UseXAUTH=1 (IKEv1 XAuth) is not supported and was ignored".to_string());
-    }
+    // NCP profiles are rejected above unless they are IKEv2, so extended auth
+    // here means the IKEv2 successor to XAuth: EAP. The profile says nothing
+    // about which EAP method the gateway offers, hence the warning.
+    let user_auth = if profile.get("UseXAUTH").map(str::trim) == Some("1") {
+        ctx.warn(
+            "UseXAUTH=1: a second authentication round will be negotiated as EAP-MSCHAPv2 \
+             (unconfirmed — verify on first connect); you will be asked for a username and \
+             password"
+                .to_string(),
+        );
+        Some(vpn_core::UserAuth {
+            username: None,
+            can_save: true,
+            otp: false,
+        })
+    } else {
+        None
+    };
 
     Ok(ImportedProfile {
         config: ConnectionConfig {
@@ -413,6 +416,9 @@ pub fn import_profile(input: &str) -> Result<ImportedProfile, ImportError> {
             local_id,
             local_id_type,
             auth,
+            // The importer rejects anything but ExchMode=34 (IKEv2) above.
+            ike_version: vpn_core::IkeVersion::V2,
+            user_auth,
             ike_enc: ike_enc.value,
             ike_integ: ike_integ.value,
             ike_prf: ike_prf.value,

@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::time::Duration;
 use thiserror::Error;
 use vici::{Client, Message};
-use vpn_core::ConnectionConfig;
+use vpn_core::{ConnectionConfig, IkeVersion, Secret};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -58,6 +58,14 @@ pub enum ControlError {
     Rejected(&'static str, String),
     #[error("the Unix vici socket is not available on this platform; use a TCP transport")]
     NoUnixTransport,
+    #[error("this profile's gateway asks for a username and password, which were not supplied")]
+    MissingUserPassword,
+    #[error(
+        "this profile names no remote networks, so bringing it up would route all traffic through \
+         the VPN — and if the gateway does not carry it, cut off internet access. Add the \
+         subnet(s) you need to reach, or choose to route all traffic through the VPN on purpose"
+    )]
+    NoRemoteNetworks,
 }
 
 pub type Result<T> = std::result::Result<T, ControlError>;
@@ -153,33 +161,144 @@ pub fn connect_logged(
     transport: &Transport,
     config: &ConnectionConfig,
     name: &str,
+    user_password: Option<&Secret>,
 ) -> Result<ConnectOutcome> {
+    // A profile whose gateway wants a second round cannot authenticate without
+    // the password, and charon would fail somewhere deep in the exchange with
+    // a message that doesn't say what is missing. Refuse up front instead.
+    if config.user_auth.is_some() && user_password.is_none() {
+        return Err(ControlError::MissingUserPassword);
+    }
+
+    // A profile with no traffic selectors would negotiate 0.0.0.0/0 and — with
+    // charon's `install_routes` on — capture the machine's default route into
+    // the tunnel. Against a split-tunnel gateway that does not carry internet
+    // traffic (the common Sophos case), that silently kills connectivity. Never
+    // do it implicitly: a full tunnel has to be an explicit 0.0.0.0/0 in the
+    // profile, so an empty selector set is refused before any route is touched.
+    if config.remote_subnets.is_empty() {
+        return Err(ControlError::NoRemoteNetworks);
+    }
+
     let mut client = open(transport)?;
+    let primary = config.ike_version;
+    let mut outcome = attempt(&mut client, config, name, primary, user_password)?;
+
+    // The IKE version is not stated in a Sophos `.scx` (and a `.mobileconfig`
+    // states it, but old gateways still disagree), so the version we import can
+    // be wrong. An SFOS responder answers an IKE_SA_INIT it has no policy for —
+    // version included — with NO_PROPOSAL_CHOSEN, which is a fast, unambiguous
+    // "wrong version" (not an algorithm mismatch). Rather than make the user
+    // edit the profile, retry once with the other version. Verified live:
+    // SFOS 18.5 needs IKEv1, SFOS 21 needs IKEv2.
+    if !outcome.connected && suggests_wrong_ike_version(&outcome.log) {
+        let alternate = other_version(primary);
+        outcome.log.push(note(
+            name,
+            format!(
+                "the gateway did not accept IKEv{}; retrying as IKEv{}",
+                primary.swanctl_value(),
+                alternate.swanctl_value()
+            ),
+        ));
+        let retry = attempt(&mut client, config, name, alternate, user_password)?;
+
+        let mut log = outcome.log;
+        log.extend(retry.log);
+        if log.len() > MAX_LOG_LINES {
+            log.truncate(MAX_LOG_LINES);
+        }
+        // Report the profile's own version on a double failure: it is the one
+        // the user configured, and its error is the more meaningful of the two.
+        let error = if retry.connected { None } else { outcome.error };
+        return Ok(ConnectOutcome {
+            connected: retry.connected,
+            error,
+            log,
+        });
+    }
+
+    Ok(outcome)
+}
+
+/// One load-and-initiate pass at a single IKE version. Separated from
+/// [`connect_logged`] so the version-fallback path can run it twice against the
+/// same open client without duplicating the flow.
+fn attempt(
+    client: &mut Client<ViciStream>,
+    config: &ConnectionConfig,
+    name: &str,
+    version: IkeVersion,
+    user_password: Option<&Secret>,
+) -> Result<ConnectOutcome> {
     check(
-        client.request("load-conn", bridge::load_conn_message(config, name))?,
+        client.request("load-conn", bridge::load_conn_message_for(config, name, version))?,
         "load-conn",
     )?;
     check(
         client.request("load-shared", bridge::load_shared_message(config, name))?,
         "load-shared",
     )?;
+    if let Some(password) = user_password.filter(|_| config.user_auth.is_some()) {
+        check(
+            client.request(
+                "load-shared",
+                bridge::load_shared_user_auth_message_for(config, name, password, version),
+            )?,
+            "load-shared (user auth)",
+        )?;
+    }
 
-    let (events, response) = client.stream_request(
-        "initiate",
-        "log",
-        Message::new().str("child", name).str("ike", name),
-    )?;
-    let log = events.iter().take(MAX_LOG_LINES).map(parse_log_line).collect();
-    let connected = response.get_str("success").as_deref() == Some("yes");
-    let error = if connected {
-        None
-    } else {
-        Some(
-            response
+    // Under IKEv1 a profile's subnets become one CHILD_SA each (quick mode
+    // negotiates a single selector pair), so there may be several to bring up.
+    let children = bridge::child_names_for(config, name, version);
+    let mut log: Vec<LogLine> = Vec::new();
+    let mut established = 0usize;
+    let mut first_error: Option<String> = None;
+
+    for child in &children {
+        let (events, response) = client.stream_request(
+            "initiate",
+            "log",
+            Message::new().str("child", child).str("ike", name),
+        )?;
+        for event in events.iter() {
+            if log.len() >= MAX_LOG_LINES {
+                break;
+            }
+            log.push(parse_log_line(event));
+        }
+        if response.get_str("success").as_deref() == Some("yes") {
+            established += 1;
+        } else {
+            let err = response
                 .get_str("errmsg")
-                .unwrap_or_else(|| "charon declined to initiate the connection".to_string()),
-        )
-    };
+                .unwrap_or_else(|| "charon declined to initiate the connection".to_string());
+            // Which subnet failed matters when the others came up: the tunnel
+            // looks fine but part of the remote network is unreachable.
+            if children.len() > 1 {
+                log.push(note(name, format!("{child} did not come up: {err}")));
+            }
+            first_error.get_or_insert(err);
+        }
+    }
+
+    // One established CHILD_SA means the tunnel carries traffic, so that is
+    // what "connected" means; a partial failure is reported in the log rather
+    // than by throwing away a working tunnel.
+    let connected = established > 0;
+    if connected && established < children.len() {
+        log.push(note(
+            name,
+            format!(
+                "{established} of {} remote networks came up; the rest are not reachable over \
+                 this tunnel",
+                children.len()
+            ),
+        ));
+    }
+    let error = if connected { None } else { first_error };
+
     Ok(ConnectOutcome {
         connected,
         error,
@@ -187,11 +306,39 @@ pub fn connect_logged(
     })
 }
 
+/// The other IKE version, for the fallback retry.
+fn other_version(v: IkeVersion) -> IkeVersion {
+    match v {
+        IkeVersion::V1 => IkeVersion::V2,
+        IkeVersion::V2 => IkeVersion::V1,
+    }
+}
+
+/// Does the captured handshake say the gateway rejected the IKE *version*
+/// rather than something we could not fix by switching it?
+///
+/// `NO_PROPOSAL_CHOSEN` from a strongSwan responder (SFOS is one) at IKE_SA_INIT
+/// means no connection policy matched at all — a version mismatch reads exactly
+/// like this. It is deliberately the only trigger: an authentication failure or
+/// an unreachable gateway must *not* provoke a pointless second attempt at the
+/// other version.
+fn suggests_wrong_ike_version(log: &[LogLine]) -> bool {
+    log.iter().any(|line| {
+        let msg = line.msg.to_ascii_uppercase();
+        msg.contains("NO_PROPOSAL_CHOSEN") || msg.contains("NO_PROP")
+    })
+}
+
 /// Load the connection + PSK and initiate the tunnel, returning only success
 /// or failure. Thin wrapper over [`connect_logged`] for the CLI, which prints
 /// charon's log itself rather than collecting it.
-pub fn connect(transport: &Transport, config: &ConnectionConfig, name: &str) -> Result<()> {
-    let outcome = connect_logged(transport, config, name)?;
+pub fn connect(
+    transport: &Transport,
+    config: &ConnectionConfig,
+    name: &str,
+    user_password: Option<&Secret>,
+) -> Result<()> {
+    let outcome = connect_logged(transport, config, name, user_password)?;
     if outcome.connected {
         Ok(())
     } else {
@@ -199,6 +346,17 @@ pub fn connect(transport: &Transport, config: &ConnectionConfig, name: &str) -> 
             "initiate",
             outcome.error.unwrap_or_default(),
         ))
+    }
+}
+
+/// A line of our own in the handshake transcript, phrased like charon's so the
+/// UI renders it the same way.
+fn note(ike: &str, msg: String) -> LogLine {
+    LogLine {
+        group: "CFG".to_string(),
+        level: 0,
+        ikesa: Some(ike.to_string()),
+        msg,
     }
 }
 
@@ -228,4 +386,89 @@ pub fn disconnect(transport: &Transport, name: &str) -> Result<()> {
         client.request("terminate", Message::new().str("ike", name))?,
         "terminate",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A profile that needs a login must be refused before any connection is
+    /// opened — the point of the guard is that charon never sees a half-built
+    /// credential set, so this must not depend on a reachable daemon. The
+    /// transport below points at a port nothing listens on: if the check ever
+    /// moves after `open`, this fails with a connection error instead.
+    #[test]
+    fn refuses_to_connect_without_the_user_password() {
+        let mut config = bridge::tests::sample();
+        config.user_auth = Some(vpn_core::UserAuth {
+            username: Some("vpnuser".to_string()),
+            can_save: true,
+            otp: false,
+        });
+        let transport = Transport::Tcp("127.0.0.1:1".to_string());
+        let err = connect_logged(&transport, &config, "c", None).unwrap_err();
+        assert!(
+            matches!(err, ControlError::MissingUserPassword),
+            "expected the missing-password guard, got: {err}"
+        );
+    }
+
+    /// A profile with no traffic selectors must be refused before anything is
+    /// opened, so it can never capture the default route into a tunnel the
+    /// gateway may not carry. Same reasoning as the missing-password guard: the
+    /// transport points at a dead port, so a regression that moved the check
+    /// after `open` would fail with a connection error instead.
+    #[test]
+    fn refuses_a_profile_with_no_remote_networks() {
+        let mut config = bridge::tests::sample();
+        config.remote_subnets.clear();
+        let transport = Transport::Tcp("127.0.0.1:1".to_string());
+        let err = connect_logged(&transport, &config, "c", None).unwrap_err();
+        assert!(
+            matches!(err, ControlError::NoRemoteNetworks),
+            "expected the no-networks guard, got: {err}"
+        );
+    }
+
+    fn log_line(msg: &str) -> LogLine {
+        LogLine {
+            group: "IKE".to_string(),
+            level: 1,
+            ikesa: None,
+            msg: msg.to_string(),
+        }
+    }
+
+    /// The one signal that provokes the version retry, in the shape charon
+    /// actually logs it — a parsed `N(NO_PROP)` notify on the IKE_SA_INIT
+    /// response.
+    #[test]
+    fn no_proposal_chosen_triggers_the_version_fallback() {
+        let log = [
+            log_line("initiating IKE_SA c[1] to 203.0.113.10"),
+            log_line("parsed IKE_SA_INIT response 0 [ N(NO_PROP) ]"),
+        ];
+        assert!(suggests_wrong_ike_version(&log));
+    }
+
+    /// An authentication failure or an unreachable gateway must not: switching
+    /// the IKE version cannot fix either, and a needless second attempt only
+    /// doubles the wait and muddies the log.
+    #[test]
+    fn auth_failure_does_not_trigger_the_fallback() {
+        let log = [
+            log_line("XAuth authentication of 'user' failed"),
+            log_line("received AUTHENTICATION_FAILED notify error"),
+        ];
+        assert!(!suggests_wrong_ike_version(&log));
+
+        let unreachable = [log_line("retransmit 5 of request with message ID 0")];
+        assert!(!suggests_wrong_ike_version(&unreachable));
+    }
+
+    #[test]
+    fn other_version_flips() {
+        assert_eq!(other_version(IkeVersion::V1), IkeVersion::V2);
+        assert_eq!(other_version(IkeVersion::V2), IkeVersion::V1);
+    }
 }

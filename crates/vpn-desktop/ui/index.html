@@ -300,7 +300,7 @@
 
   <div class="body">
     <aside class="sidebar">
-      <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import .ini</button></div>
+      <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import profile</button></div>
       <div class="side-search" id="side-search" style="display:none">
         <input id="profile-filter" type="search" autocomplete="off" spellcheck="false"
                placeholder="Filter by name or gateway…" aria-label="Filter profiles" aria-controls="profile-list">
@@ -326,6 +326,7 @@
 
         <div id="notice" class="notice" role="status"></div>
         <div id="creds-bar" class="creds-bar"></div>
+        <div id="login-bar" class="creds-bar"></div>
 
         <div class="tiles">
           <div class="tile"><div class="k">Virtual IP</div><div id="t-vip" class="v dim">—</div><div class="sub" id="t-vip-sub">assigned by gateway</div></div>
@@ -380,11 +381,14 @@
 
 <div class="overlay" id="overlay">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-    <h3 id="modal-title" class="mono">Import NCP profile</h3>
+    <h3 id="modal-title" class="mono">Import a profile</h3>
     <div class="mbody">
-      Drop a <b>.ini</b> profile into the profiles directory and it appears here automatically. The desktop app scans
+      Drop a profile — NCP <b>.ini</b>, Sophos Connect <b>.scx</b> or legacy Sophos <b>.tgb</b> — into the profiles
+      directory and it appears here automatically. The desktop app scans
       <code id="modal-dir">the profiles folder</code> and interprets each file on the fly — the pre-shared key is read into
       memory only when you connect, never copied to disk.
+      <br><br>A Sophos <b>.pro</b> is not a profile: it points at your user portal, and you sign in there to download
+      the <b>.scx</b> to import.
     </div>
     <div class="mfoot"><button class="btn btn-ghost" id="modal-cancel">Close</button><button class="btn btn-primary" id="modal-refresh">Rescan now</button></div>
   </div>
@@ -402,6 +406,32 @@
   </div>
 </div>
 
+<!-- XAuth/EAP sign-in. Sophos gateways ask for a person's login on top of the
+     profile's pre-shared key; neither value is ever written to the profile
+     file, and "remember" puts them in the OS keychain instead. -->
+<div class="overlay" id="login-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="login-title">
+    <h3 id="login-title" class="mono">Sign in to <span id="login-name">the gateway</span></h3>
+    <div class="mbody">
+      <div id="login-why"></div>
+      <div class="field wide" style="margin-top:12px">
+        <label for="login-user">Username</label>
+        <input id="login-user" type="text" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field wide">
+        <label for="login-pass">Password</label>
+        <input id="login-pass" type="password" autocomplete="off" />
+      </div>
+      <label id="login-remember-row" style="display:flex;align-items:center;gap:8px;margin-top:10px;cursor:pointer">
+        <input id="login-remember" type="checkbox" />
+        <span class="hint" id="login-remember-label"></span>
+      </label>
+      <div class="hint" id="login-err" style="color:var(--bad);margin-top:8px"></div>
+    </div>
+    <div class="mfoot"><button class="btn btn-ghost" id="login-cancel">Cancel</button><button class="btn btn-primary" id="login-ok">Sign in and connect</button></div>
+  </div>
+</div>
+
 <!-- Edit parameters. The imported .ini stays untouched: what's saved here is the
      set of fields that differ from it, replayed on top every time it's loaded. -->
 <div class="overlay" id="edit-overlay">
@@ -412,7 +442,11 @@
         <legend>Connection</legend>
         <div class="fgrid">
           <div class="field" id="f-name"><label for="e-name">Name</label><input id="e-name" type="text" spellcheck="false" /></div>
-          <div class="field" id="f-gateway"><label for="e-gateway">Gateway</label><input id="e-gateway" type="text" spellcheck="false" /></div>
+          <div class="field" id="f-gateway"><label for="e-gateway">Gateway</label><input id="e-gateway" type="text" spellcheck="false" /><span class="hint">Sophos exports name the firewall's internal address; replace it with the public one.</span></div>
+          <div class="field" id="f-ike_version"><label for="e-ike_version">IKE version</label><select id="e-ike_version"></select><span class="hint">The two Sophos exports for one gateway can disagree; only the gateway settles it.</span></div>
+          <div class="field" id="f-user_auth"><label for="e-user_auth">Username/password round</label>
+            <select id="e-user_auth"><option value="false">not required</option><option value="true">required (XAuth / EAP)</option></select>
+            <span class="hint">Turn on if the gateway rejects the pre-shared key despite it being correct.</span></div>
         </div>
       </fieldset>
 
@@ -447,7 +481,7 @@
       <fieldset class="fgroup">
         <legend>Traffic &amp; addressing</legend>
         <div class="fgrid">
-          <div class="field wide" id="f-remote"><label for="e-remote">Remote subnets</label><textarea id="e-remote" spellcheck="false" placeholder="10.0.0.0/24"></textarea><span class="hint">One CIDR per line. A bare address is a /32 host route.</span></div>
+          <div class="field wide" id="f-remote"><label for="e-remote">Remote subnets</label><textarea id="e-remote" spellcheck="false" placeholder="10.0.0.0/24"></textarea><span class="hint">One CIDR per line. A bare address is a /32 host route. Portal (.mobileconfig) profiles list none — add the networks you need to reach. <code>0.0.0.0/0</code> routes <em>all</em> traffic through the VPN (only for a gateway that carries internet traffic); leaving this empty refuses to connect.</span></div>
           <div class="field" id="f-request_virtual_ip"><label>Virtual IP</label><label class="check"><input id="e-request_virtual_ip" type="checkbox" /> Request one from the gateway</label></div>
           <div class="field" id="f-auto_reconnect"><label>Reconnect</label><label class="check"><input id="e-auto_reconnect" type="checkbox" /> Re-establish automatically</label></div>
           <div class="field" id="f-dpd_delay"><label for="e-dpd_delay">DPD interval (s)</label><input id="e-dpd_delay" type="number" min="0" max="3600" step="1" /><span class="hint">0 disables liveness probing.</span></div>
@@ -479,7 +513,7 @@
   </div>
 </div>
 
-<div id="dropzone"><div class="dz-card">Drop NCP <b>.ini</b> profile to import<span>it's copied into your profiles folder</span></div></div>
+<div id="dropzone"><div class="dz-card">Drop a profile to import<span>it's copied into your profiles folder</span></div></div>
 
 <script>
 (function () {
@@ -533,6 +567,12 @@
       stored: !!s.stored,
       dns: (s.dns && s.dns.length) ? s.dns.join(", ") : null,
       dnsDomain: s.dns_domain || null,
+      file: s.file || null,
+      format: s.format || null,
+      ikeVersion: s.ike_version || null,
+      userAuth: s.user_auth || null,
+      userStored: !!s.user_stored,
+      userName: s.user_name || null,
       edits: s.edits || [],
       warns: (s.warnings || []).map(function (w) { return { lvl: w.level, t: w.text, n: w.note }; })
     };
@@ -569,7 +609,7 @@
     // A filter is only worth its space once there's a list to search.
     $("side-search").style.display = profiles.length > 1 ? "" : "none";
     if (!profiles.length) {
-      ul.appendChild(sideEmpty('No profiles yet. Click <b>+ Import .ini</b> or drag a profile onto the window.' +
+      ul.appendChild(sideEmpty('No profiles yet. Click <b>+ Import profile</b> or drag one onto the window.' +
         (PROFILE_DIR ? '<br><span style="color:var(--faint)">Folder: ' + esc(PROFILE_DIR) + "</span>" : "")));
       renderCompactSelect(); return;
     }
@@ -606,13 +646,18 @@
     var n = (p.edits || []).length;
     $("sec-badge").textContent = n ? n + (n === 1 ? " field edited" : " fields edited") : "";
     var rows = [
-      ["IKE proposal", esc(p.ike)],
+      ["IKE proposal", esc(p.ike) + (p.ikeVersion ? ' <span class="badge">IKEv' + esc(p.ikeVersion) + "</span>" : "")],
       ["ESP proposal", esc(p.esp)],
       ["PFS group", p.pfs ? esc(p.pfs) : "none"],
-      ["Auth", '<span class="redacted">psk ••••••••••••</span>'],
+      // The PSK is only half the story once the gateway also wants a login.
+      ["Auth", '<span class="redacted">psk ••••••••••••</span>' +
+        (p.userAuth ? ' <span class="badge">+ ' + esc(p.userAuth) + "</span>" : "")],
       ["Local ID", esc(p.localId)],
       ["Remote subnet", esc(p.remote)]
     ];
+    if (p.format) {
+      rows.push(["Source", esc(p.format) + (p.file ? ' <span class="badge">' + esc(p.file) + "</span>" : "")]);
+    }
     if (p.dns) {
       rows.push(["DNS", esc(p.dns) + (p.dnsDomain ? ' <span class="badge">*.' + esc(p.dnsDomain) + "</span>" : "")]);
     }
@@ -862,6 +907,26 @@
         '<button class="btn btn-ghost btn-sm" id="creds-save">Save to ' + esc(KEYSTORE) + '</button>';
       $("creds-save").addEventListener("click", onSaveCreds);
     }
+    renderLoginBar();
+  }
+
+  // Second bar, only for profiles whose gateway wants a login as well. The
+  // password is never shown or re-read — the only actions are forgetting it,
+  // or being asked again on the next connect.
+  function renderLoginBar() {
+    var bar = $("login-bar");
+    var p = current;
+    if (!TAURI || !p.userAuth) { bar.className = "creds-bar"; bar.innerHTML = ""; return; }
+    bar.className = "creds-bar show" + (p.userStored ? " on" : "");
+    if (p.userStored) {
+      bar.innerHTML = '<span class="ci"><span class="led ok" style="box-shadow:none"></span>Signed in as ' +
+        esc(p.userName || "a saved user") + ' (' + esc(p.userAuth) + ', saved in ' + esc(KEYSTORE) + ')</span>' +
+        '<button class="btn btn-ghost btn-sm" id="login-forget">Forget</button>';
+      $("login-forget").addEventListener("click", onForgetUserLogin);
+    } else {
+      bar.innerHTML = '<span class="ci"><span class="led" style="box-shadow:none"></span>' +
+        esc(p.userAuth) + ' sign-in is asked for on connect</span>';
+    }
   }
   async function onSaveCreds() {
     var p = current;
@@ -884,6 +949,71 @@
     }
   }
 
+  /* ---------- XAuth/EAP sign-in ---------- */
+
+  // Resolves to {username, password, save} once the user submits, or null if
+  // they cancel. The password lives in this promise and the invoke that
+  // follows it — it is never written to `profiles` or any other kept state.
+  function askUserLogin(p) {
+    return new Promise(function (resolve) {
+      var overlay = $("login-overlay"), user = $("login-user"), pass = $("login-pass"),
+          remember = $("login-remember"), err = $("login-err");
+      $("login-name").textContent = p.name;
+      $("login-why").innerHTML = "This gateway asks for your username and password as well as the " +
+        "profile's pre-shared key (<b>" + esc(p.userAuth || "XAuth") + "</b>).";
+      user.value = p.userName || "";
+      pass.value = "";
+      err.textContent = "";
+
+      // A gateway expecting a one-time code gets no "remember": the saved
+      // password would be stale by the next connect. The backend enforces this
+      // too — this only keeps the UI from offering something that won't work.
+      var otp = /one-time/i.test(p.userAuth || "");
+      $("login-remember-row").style.display = otp ? "none" : "flex";
+      $("login-remember-label").textContent = "Remember in " + KEYSTORE;
+      remember.checked = false;
+      if (otp) {
+        $("login-why").innerHTML += " A one-time code is required, so this cannot be remembered.";
+      }
+
+      function close(result) {
+        overlay.classList.remove("show");
+        document.removeEventListener("keydown", onKey);
+        $("login-ok").removeEventListener("click", onOk);
+        $("login-cancel").removeEventListener("click", onCancel);
+        // Don't leave the typed password sitting in the DOM.
+        pass.value = "";
+        resolve(result);
+      }
+      function onOk() {
+        if (!user.value.trim()) { err.textContent = "Enter your username."; user.focus(); return; }
+        if (!pass.value) { err.textContent = "Enter your password."; pass.focus(); return; }
+        close({ username: user.value.trim(), password: pass.value, save: !otp && remember.checked });
+      }
+      function onCancel() { close(null); }
+      function onKey(e) {
+        if (e.key === "Escape") { onCancel(); }
+        if (e.key === "Enter" && overlay.classList.contains("show")) { onOk(); }
+      }
+      $("login-ok").addEventListener("click", onOk);
+      $("login-cancel").addEventListener("click", onCancel);
+      document.addEventListener("keydown", onKey);
+      overlay.classList.add("show");
+      (user.value ? pass : user).focus();
+    });
+  }
+
+  async function onForgetUserLogin() {
+    var p = current;
+    try {
+      await TAURI.invoke("forget_user_login", { id: p.id });
+      p.userStored = false; p.userName = null; renderCreds();
+      log("KNL", "sign-in removed from " + KEYSTORE + " — you'll be asked on the next connect");
+    } catch (e) {
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+    }
+  }
+
   function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 
   /* ---------- edit parameters ---------- */
@@ -897,9 +1027,9 @@
   var DH = ["modp1024", "modp1536", "modp2048", "modp3072", "modp4096", "ecp256", "ecp384"];
   var ID_TYPES = [["", "auto (charon infers)"], ["ipv4", "ipv4"], ["fqdn", "fqdn"], ["rfc822", "rfc822 (user FQDN)"], ["keyid", "keyid"]];
   // Every field the dialog edits, in the order the backend names them.
-  var FIELDS = ["name", "gateway", "local_id", "local_id_type", "ike_enc", "ike_integ", "ike_prf",
-    "ike_dh", "esp_enc", "esp_integ", "pfs", "remote", "request_virtual_ip", "compression",
-    "dns", "dns_domain", "dpd_delay", "auto_reconnect"];
+  var FIELDS = ["name", "gateway", "ike_version", "user_auth", "local_id", "local_id_type",
+    "ike_enc", "ike_integ", "ike_prf", "ike_dh", "esp_enc", "esp_integ", "pfs", "remote",
+    "request_virtual_ip", "compression", "dns", "dns_domain", "dpd_delay", "auto_reconnect"];
 
   function fillSelect(id, values) {
     var sel = $(id); sel.innerHTML = "";
@@ -908,6 +1038,7 @@
       var o = document.createElement("option"); o.value = value; o.textContent = label; sel.appendChild(o);
     });
   }
+  fillSelect("e-ike_version", [["ikev2", "IKEv2"], ["ikev1", "IKEv1 (legacy .tgb profiles)"]]);
   fillSelect("e-local_id_type", ID_TYPES);
   fillSelect("e-ike_enc", ENC); fillSelect("e-ike_integ", INTEG);
   fillSelect("e-ike_prf", PRF); fillSelect("e-ike_dh", DH);
@@ -920,6 +1051,8 @@
     var ike = (p.ike || "").split("-"), esp = (p.esp || "").split("-");
     return {
       name: p.name, gateway: p.gateway,
+      ike_version: p.ikeVersion === "1" ? "ikev1" : "ikev2",
+      user_auth: !!p.userAuth,
       local_id: p.localId === "—" ? "" : p.localId, local_id_type: "rfc822",
       ike_enc: ike[0] || "aes256", ike_integ: ike[1] || "sha256",
       ike_prf: ike[2] || "prfsha256", ike_dh: ike[3] || "modp3072",
@@ -953,6 +1086,8 @@
       else if (f === "remote" || f === "dns") {
         edit[f] = el.value.split(/[\n,]/).map(function (s) { return s.trim(); }).filter(Boolean);
       } else if (f === "dpd_delay") { edit[f] = parseInt(el.value, 10) || 0; }
+      // A <select> standing in for a bool: the backend wants the real thing.
+      else if (f === "user_auth") { edit[f] = el.value === "true"; }
       else { edit[f] = el.value.trim(); }
     });
     return edit;
@@ -1092,11 +1227,31 @@
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       return;
     }
+    // A gateway wanting a second authentication round needs a login before we
+    // can initiate. A saved one is used silently; otherwise ask, and treat
+    // cancelling as cancelling the connect.
+    var login = null;
+    if (p.userAuth && !p.userStored) {
+      login = await askUserLogin(p);
+      if (!login) {
+        state[p.id] = "disconnected"; setPill(); setAction(); renderList();
+        log("IKE", "sign-in cancelled — not connecting");
+        return;
+      }
+    }
+
     log("KNL", "load-conn + load-shared via vici (" + (p.stored ? "PSK from " + KEYSTORE : "PSK held in memory") + ")");
+    if (p.userAuth) {
+      log("CFG", p.userAuth + " sign-in as " + ((login && login.username) || p.userName || "the saved user") +
+        (login ? "" : " (from " + KEYSTORE + ")"));
+    }
     log("IKE", "initiating IKE_SA " + p.name + " to " + p.gateway);
     var out;
     try {
-      out = await TAURI.invoke("connect", { id: p.id });
+      out = await TAURI.invoke("connect", { id: p.id, login: login });
+      if (login && login.save) {
+        p.userStored = true; p.userName = login.username; renderCreds();
+      }
     } catch (e) {
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       log("IKE", String(e), "bad");
@@ -1108,7 +1263,14 @@
       var reason = (out && out.error) || "the handshake did not complete";
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       log("IKE", reason, "bad");
-      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(reason) + "</div>", "bad");
+      var extra = "";
+      // A saved login the gateway won't accept can only be fixed by replacing
+      // it, and nothing else in the UI says where that is done.
+      if (p.userAuth && p.userStored) {
+        extra = '<div class="hint" style="margin-top:6px">If your password changed, choose ' +
+          '<b>Forget</b> beside the saved sign-in and connect again to be asked for it.</div>';
+      }
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(reason) + extra + "</div>", "bad");
       return;
     }
     state[p.id] = "established"; connectAt = Date.now(); prevTotal = 0; samples = [];
@@ -1349,12 +1511,12 @@
     var extras = [];
     if ((p.edits || []).length) { extras.push("its saved parameter edits"); }
     if (p.stored) { extras.push("its pre-shared key in " + KEYSTORE); }
-    var body = "<b>" + esc(p.id) + ".ini</b> is deleted from the profiles folder" +
+    var body = "<b>" + esc(p.file || (p.id + ".ini")) + "</b> is deleted from the profiles folder" +
       (extras.length ? ", along with " + extras.join(" and ") : "") + ".";
     if (state[p.id] === "established" || state[p.id] === "connecting") {
       body += " Its tunnel is up and will be disconnected first.";
     }
-    body += " This cannot be undone — re-import the <b>.ini</b> to get it back.";
+    body += " This cannot be undone — re-import the file to get it back.";
     $("del-body").innerHTML = body;
     $("del-confirm").classList.remove("busy");
     $("del-overlay").classList.add("show");

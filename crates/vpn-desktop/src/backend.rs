@@ -1,9 +1,10 @@
 //! Backend logic for the desktop app, kept free of any Tauri types so it can
 //! be exercised headlessly (see `--selftest` in `main.rs`).
 //!
-//! Profiles are `.ini` files in a scanned directory; each is imported with
-//! `ncp-profile` on demand, so the PSK only ever lives in memory for the
-//! duration of a connect. Connection control goes through `vpn-control`.
+//! Profiles are files in a scanned directory — NCP `.ini`, Sophos `.scx` or
+//! legacy `.tgb` — each imported on demand by the importer matching its
+//! format, so the PSK only ever lives in memory for the duration of a
+//! connect. Connection control goes through `vpn-control`.
 
 use serde::Serialize;
 use std::path::PathBuf;
@@ -117,9 +118,23 @@ pub struct ProfileSummary {
     pub dns: Vec<String>,
     /// Split-DNS domain scoping those servers, if the profile names one.
     pub dns_domain: Option<String>,
-    /// Names of the fields the user has overridden (empty = the `.ini` as-is).
+    /// Names of the fields the user has overridden (empty = the file as-is).
     /// Everything above already reflects them; this is what the UI marks up.
     pub edits: Vec<String>,
+    /// The profile's file name, extension included — profiles no longer all
+    /// end in `.ini`, and the UI names the file when it is about to delete it.
+    pub file: String,
+    /// Which importer read it, for the UI to label the profile's origin.
+    pub format: String,
+    /// IKE version the profile negotiates (`1` or `2`).
+    pub ike_version: String,
+    /// Set when the gateway wants a username and password on top of the PSK.
+    pub user_auth: Option<String>,
+    /// Whether that login is saved in the keychain (so connect won't prompt).
+    pub user_stored: bool,
+    /// The username saved for it, to prefill the prompt when re-entering a
+    /// password. Not a secret — the password never leaves the keychain.
+    pub user_name: Option<String>,
 }
 
 /// A profile opened for editing: its current effective values, plus which of
@@ -159,12 +174,33 @@ fn to_warn_item(raw: &str) -> WarnItem {
 
 fn summarize(
     id: &str,
+    file: &str,
     config: &vpn_core::ConnectionConfig,
-    warnings: &[ncp_profile::ImportWarning],
+    warnings: &[vpn_core::ImportWarning],
     edits: Vec<String>,
 ) -> ProfileSummary {
     ProfileSummary {
         edits,
+        file: file.to_string(),
+        format: format_label(file).to_string(),
+        ike_version: config.ike_version.swanctl_value().to_string(),
+        user_stored: config.user_auth.is_some() && crate::creds::has_user(id),
+        user_name: config
+            .user_auth
+            .as_ref()
+            .and_then(|_| crate::creds::load_user(id).ok().flatten())
+            .map(|c| c.username),
+        user_auth: config.user_auth.as_ref().map(|ua| {
+            let method = match config.ike_version {
+                vpn_core::IkeVersion::V1 => "XAuth",
+                vpn_core::IkeVersion::V2 => "EAP-MSCHAPv2",
+            };
+            if ua.otp {
+                format!("{method} + one-time code")
+            } else {
+                method.to_string()
+            }
+        }),
         id: id.to_string(),
         name: config.name.clone(),
         gateway: config.gateway.clone(),
@@ -182,9 +218,57 @@ fn summarize(
     }
 }
 
-fn parse(path: &std::path::Path) -> std::result::Result<ncp_profile::ImportedProfile, String> {
+/// File extensions a profile may have, in the order [`profile_path`] resolves
+/// them. Ids stay bare file stems, so an override sidecar or a keychain entry
+/// written before Sophos profiles existed still addresses the same profile.
+const PROFILE_EXTENSIONS: [&str; 4] = ["ini", "scx", "tgb", "mobileconfig"];
+
+/// Human-readable origin of a profile, from its extension. The importers pick
+/// by content, but the extension is what survived the copy into the profile
+/// directory and is what the user sees in the folder.
+fn format_label(file: &str) -> &'static str {
+    match file.rsplit('.').next().unwrap_or_default() {
+        "scx" => "Sophos Connect",
+        "tgb" => "Sophos (legacy)",
+        "mobileconfig" => "Sophos (portal)",
+        _ => "NCP",
+    }
+}
+
+/// Interpret a profile file, whichever format it is in.
+///
+/// Dispatch is on content, not extension: these files are routinely renamed on
+/// the way to a user, and a file that claims one format while being another
+/// should be read as what it actually is.
+fn parse(path: &std::path::Path) -> std::result::Result<vpn_core::ImportedProfile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    ncp_profile::import_profile(&text).map_err(|e| format!("{}: {e}", path.display()))
+    parse_text(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse_text(text: &str) -> std::result::Result<vpn_core::ImportedProfile, String> {
+    match sophos_profile::detect(text) {
+        Some(sophos_profile::Format::Provisioning) => Err(provisioning_message(text)),
+        Some(_) => sophos_profile::import_profile(text).map_err(|e| e.to_string()),
+        None => ncp_profile::import_profile(text).map_err(|e| e.to_string()),
+    }
+}
+
+/// A `.pro` holds no connection to import — it names the user portal the real
+/// profile is downloaded from. Say which portal, so the message is actionable
+/// rather than just a rejection.
+fn provisioning_message(text: &str) -> String {
+    let portal = sophos_profile::pro::parse(text)
+        .ok()
+        .and_then(|entries| entries.first().and_then(|e| e.portal_url()));
+    match portal {
+        Some(url) => format!(
+            "this is a Sophos provisioning file, not a profile — sign in at {url}, download the \
+             .scx profile from the portal, and import that file instead"
+        ),
+        None => "this is a Sophos provisioning file, not a profile — it names a user portal to \
+                 download the real profile from"
+            .to_string(),
+    }
 }
 
 /// A profile as it is actually used: the `.ini` re-parsed from disk, with the
@@ -197,7 +281,7 @@ fn parse(path: &std::path::Path) -> std::result::Result<ncp_profile::ImportedPro
 fn load(
     state: &AppState,
     id: &str,
-) -> std::result::Result<(ncp_profile::ImportedProfile, Vec<String>), String> {
+) -> std::result::Result<(vpn_core::ImportedProfile, Vec<String>), String> {
     let mut imported = parse(&profile_path(state, id))?;
     let base = crate::overrides::Edit::from_config(&imported.config);
     let (edited, mut names) = crate::overrides::load(&state.profile_dir, id).overlay(&base);
@@ -205,7 +289,7 @@ fn load(
         if let Err(e) = edited.apply_to(&mut imported.config) {
             // Phrased for `to_warn_item`, which splits a trailing parenthetical
             // off as the note.
-            imported.warnings.push(ncp_profile::ImportWarning(format!(
+            imported.warnings.push(vpn_core::ImportWarning(format!(
                 "saved edits were not applied; using the profile file as imported ({e})"
             )));
             names.clear();
@@ -214,8 +298,25 @@ fn load(
     Ok((imported, names))
 }
 
+/// The file backing a profile id. The id is the file stem, so the extension is
+/// whichever one is actually on disk; [`import_path`] refuses a second file
+/// with the same stem, so at most one can match.
 fn profile_path(state: &AppState, id: &str) -> PathBuf {
-    state.profile_dir.join(format!("{id}.ini"))
+    PROFILE_EXTENSIONS
+        .iter()
+        .map(|ext| state.profile_dir.join(format!("{id}.{ext}")))
+        .find(|p| p.is_file())
+        // Nothing on disk: name the .ini so "cannot read ...ini" still reads
+        // sensibly for the overwhelmingly common case.
+        .unwrap_or_else(|| state.profile_dir.join(format!("{id}.ini")))
+}
+
+/// Is this a file extension we import profiles from?
+fn is_profile_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| PROFILE_EXTENSIONS.iter().any(|k| ext.eq_ignore_ascii_case(k)))
+        .unwrap_or(false)
 }
 
 /// A profile id addresses files in the profile directory, so one that came back
@@ -237,8 +338,9 @@ fn check_id(id: &str) -> std::result::Result<(), String> {
     }
 }
 
-/// Scan the profile directory and interpret every `.ini` file. Files that
-/// fail to parse are skipped (a real UI would flag them separately).
+/// Scan the profile directory and interpret every profile file, in any of the
+/// formats we import. Files that fail to parse are skipped (a real UI would
+/// flag them separately).
 pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&state.profile_dir) else {
@@ -246,14 +348,25 @@ pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("ini") {
+        if !is_profile_extension(&path) {
             continue;
         }
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        let file = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or_default()
+            .to_string();
         if let Ok((imported, edits)) = load(state, id) {
-            out.push(summarize(id, &imported.config, &imported.warnings, edits));
+            out.push(summarize(
+                id,
+                &file,
+                &imported.config,
+                &imported.warnings,
+                edits,
+            ));
         }
     }
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -302,44 +415,74 @@ pub fn profiles_dir(state: &AppState) -> String {
     state.profile_dir.display().to_string()
 }
 
-/// Import a `.ini` file into the profile directory so it shows up in the list.
-/// Validates the extension and that it parses as an NCP profile (so junk is
-/// rejected), then copies it in under a sanitized name. Returns the new
-/// profile id (its file stem).
+/// Import a profile file into the profile directory so it shows up in the
+/// list. Validates that it parses (so junk is rejected), then copies it in
+/// under a sanitized name, keeping the extension so the format stays evident
+/// on disk. Returns the new profile id (its file stem).
+///
+/// A Sophos `.pro` is refused here on purpose: it holds no connection, and
+/// storing it would put an entry in the list that can never be connected.
 pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Result<String, String> {
-    if src.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("ini")) != Some(true) {
-        return Err("only .ini profiles can be imported".to_string());
+    // Accept the provisioning extension so the file gets the explanation from
+    // `parse_text` rather than a flat "unsupported file type".
+    let known = is_profile_extension(src)
+        || src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("pro"))
+            .unwrap_or(false);
+    if !known {
+        return Err(format!(
+            "only {} profiles can be imported",
+            PROFILE_EXTENSIONS
+                .iter()
+                .map(|e| format!(".{e}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     let text = std::fs::read_to_string(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
-    // Parse to reject files that aren't valid NCP profiles.
-    ncp_profile::import_profile(&text).map_err(|e| format!("not a valid NCP profile: {e}"))?;
+    // Parse to reject files that aren't valid profiles in any format we read.
+    parse_text(&text)?;
 
+    let sanitize = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .collect::<String>()
+    };
     let stem = src
         .file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| {
-            s.chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
-                .collect::<String>()
-        })
+        .map(sanitize)
         .filter(|s| !s.is_empty())
         .ok_or("the file needs a name")?;
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| sanitize(&e.to_ascii_lowercase()))
+        .filter(|e| !e.is_empty())
+        .ok_or("the file needs an extension")?;
 
     std::fs::create_dir_all(&state.profile_dir).map_err(|e| e.to_string())?;
-    let dest = state.profile_dir.join(format!("{stem}.ini"));
-    // Don't silently overwrite a different existing profile.
-    if dest.exists() && std::fs::canonicalize(&dest).ok() != std::fs::canonicalize(src).ok() {
+    let dest = state.profile_dir.join(format!("{stem}.{ext}"));
+    // Don't silently overwrite a different existing profile — including one in
+    // another format, since a profile id is the stem alone and two files
+    // sharing a stem would be one profile with two backing files.
+    let taken = PROFILE_EXTENSIONS
+        .iter()
+        .map(|e| state.profile_dir.join(format!("{stem}.{e}")))
+        .find(|p| p.exists() && std::fs::canonicalize(p).ok() != std::fs::canonicalize(src).ok());
+    if taken.is_some() {
         return Err(format!("a profile named \"{stem}\" already exists"));
     }
     std::fs::write(&dest, text).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
     Ok(stem)
 }
 
-/// Connect the profile identified by `id` to the gateway it names.
-/// Remove an imported profile and everything that trails it: the `.ini`, its
-/// override sidecar, and any PSK it left in the keychain. All three go, or the
-/// leftovers would be silently adopted by the next profile imported under the
-/// same name.
+/// Remove an imported profile and everything that trails it: the profile file,
+/// its override sidecar, and both keychain entries it may have left (the PSK
+/// and the XAuth/EAP login). All of it goes, or the leftovers would be
+/// silently adopted by the next profile imported under the same name.
 ///
 /// If the profile's tunnel is up it is torn down first — once the `.ini` is
 /// gone nothing in the UI can name that connection, so it could not otherwise
@@ -372,20 +515,42 @@ pub fn delete_profile(state: &AppState, id: String) -> std::result::Result<(), S
     }
     crate::overrides::clear(&state.profile_dir, &id)?;
     crate::creds::delete(&id)?;
+    // The XAuth/EAP login is a second keychain entry and would otherwise be
+    // inherited by the next profile imported under the same name.
+    crate::creds::delete_user(&id)?;
     Ok(())
+}
+
+/// A username and password typed into the connect prompt, and whether the
+/// user asked to keep them. Only reaches [`connect`]; never stored on the
+/// profile.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct UserLogin {
+    pub username: String,
+    pub password: String,
+    /// Save to the OS keychain so the next connect doesn't prompt.
+    #[serde(default)]
+    pub save: bool,
 }
 
 pub fn connect(
     state: &AppState,
     id: String,
+    login: Option<UserLogin>,
 ) -> std::result::Result<vpn_control::ConnectOutcome, String> {
     let (mut imported, _) = load(state, &id)?;
     // Prefer a PSK saved in the OS keychain over the one parsed from the
-    // (plaintext-on-disk) .ini, so saved credentials are what actually
+    // (plaintext-on-disk) profile file, so saved credentials are what actually
     // authenticate the tunnel.
     if let Some(psk) = crate::creds::load(&id)? {
         imported.config.auth = vpn_core::AuthMethod::PresharedKey(psk);
     }
+
+    // Second authentication round: the gateway wants a person's login on top
+    // of the PSK. Take what was just typed, else what was saved; the username
+    // goes into the config (charon sends it as the XAuth/EAP identity) while
+    // the password is passed separately and never stored on the profile.
+    let user_password = resolve_user_login(&id, &mut imported.config, login)?;
     let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
 
     // charon's `initiate` is unconditional: called against a connection that is
@@ -412,8 +577,13 @@ pub fn connect(
         return Ok(outcome);
     }
 
-    let mut outcome =
-        vpn_control::connect_logged(&state.transport, &imported.config, &name).map_err(|e| e.to_string())?;
+    let mut outcome = vpn_control::connect_logged(
+        &state.transport,
+        &imported.config,
+        &name,
+        user_password.as_ref(),
+    )
+    .map_err(|e| e.to_string())?;
 
     // An established CHILD_SA does not mean the tunnel carries traffic yet: the
     // assigned virtual IP still has to land on an OS interface first.
@@ -421,13 +591,113 @@ pub fn connect(
         wait_for_virtual_ip(state, &name, &mut outcome);
     }
 
-    // With the tunnel up, apply the profile's DNS so names on the remote
-    // network resolve over the VPN. Failure here doesn't fail the connect —
-    // the tunnel still carries traffic — it's just surfaced in the log.
-    if outcome.connected && !imported.config.dns.is_empty() {
-        apply_dns(state, &name, &imported.config.dns, &mut outcome);
+    // With the tunnel up, apply DNS so names on the remote network resolve over
+    // the VPN. Two sources, merged: the profile's own servers, and any the
+    // gateway pushed over mode config (captured by charon's resolve plugin) —
+    // so a portal profile that carries no DNS of its own still resolves
+    // internal names. Failure here doesn't fail the connect; it's just logged.
+    if outcome.connected {
+        let mut dns = imported.config.dns.clone();
+        for server in crate::dns::pushed_servers() {
+            if !dns.servers.contains(&server) {
+                dns.servers.push(server);
+            }
+        }
+        if !dns.servers.is_empty() {
+            apply_dns(state, &name, &dns, &mut outcome);
+        }
     }
     Ok(outcome)
+}
+
+/// Settle the XAuth/EAP login for a connect, writing the username into the
+/// config and returning the password for the caller to hand to charon.
+///
+/// Returns `None` for a profile that needs no second round — including when a
+/// login was passed anyway, so a stale prompt can never bolt user auth onto a
+/// profile whose gateway doesn't ask for it.
+fn resolve_user_login(
+    id: &str,
+    config: &mut vpn_core::ConnectionConfig,
+    login: Option<UserLogin>,
+) -> std::result::Result<Option<vpn_core::Secret>, String> {
+    let Some(user_auth) = config.user_auth.as_mut() else {
+        return Ok(None);
+    };
+
+    let (username, password) = match login {
+        Some(l) => {
+            let username = l.username.trim().to_string();
+            if username.is_empty() {
+                return Err("the username cannot be empty".to_string());
+            }
+            if l.password.is_empty() {
+                return Err("the password cannot be empty".to_string());
+            }
+            // Honour the profile: a gateway that says its credentials must not
+            // be kept (typically because it expects a one-time code) doesn't
+            // get them written to the keychain whatever the checkbox said.
+            if l.save && user_auth.can_save && !user_auth.otp {
+                crate::creds::store_user(
+                    id,
+                    &crate::creds::UserCreds {
+                        username: username.clone(),
+                        password: vpn_core::Secret::new(l.password.clone()),
+                    },
+                )?;
+            }
+            (username, vpn_core::Secret::new(l.password))
+        }
+        None => {
+            let saved = crate::creds::load_user(id)?.ok_or_else(|| {
+                "this profile's gateway asks for a username and password".to_string()
+            })?;
+            (saved.username, saved.password)
+        }
+    };
+
+    user_auth.username = Some(username);
+    Ok(Some(password))
+}
+
+/// Whether a profile still needs to be asked for a login before it can
+/// connect: its gateway wants one and nothing usable is saved.
+pub fn needs_user_login(state: &AppState, id: &str) -> bool {
+    load(state, id)
+        .map(|(imported, _)| {
+            imported.config.user_auth.is_some() && !crate::creds::has_user(id)
+        })
+        .unwrap_or(false)
+}
+
+/// Forget a profile's saved XAuth/EAP login. The PSK entry is separate and
+/// stays put.
+pub fn forget_user_login(_state: &AppState, id: String) -> std::result::Result<(), String> {
+    crate::creds::delete_user(&id)
+}
+
+/// Save a login without connecting. The GUI stores credentials as a
+/// side-effect of a successful prompt; this is the same store on its own, for
+/// the headless harness.
+pub fn set_user_login(
+    _state: &AppState,
+    id: String,
+    username: String,
+    password: String,
+) -> std::result::Result<(), String> {
+    if username.trim().is_empty() {
+        return Err("the username cannot be empty".to_string());
+    }
+    if password.is_empty() {
+        return Err("the password cannot be empty".to_string());
+    }
+    crate::creds::store_user(
+        &id,
+        &crate::creds::UserCreds {
+            username: username.trim().to_string(),
+            password: vpn_core::Secret::new(password),
+        },
+    )
 }
 
 /// The live SA for `name`, if charon already has one carrying traffic — i.e. an

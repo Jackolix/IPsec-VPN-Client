@@ -8,6 +8,10 @@ description = "Phase 1 agent: import an NCP profile and drive charon over vici (
 [dependencies]
 vpn-core = { path = "../vpn-core" }
 ncp-profile = { path = "../ncp-profile" }
+sophos-profile = { path = "../sophos-profile" }
 vpn-control = { path = "../vpn-control" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# Reads the XAuth/EAP password without echoing it or putting it in the shell
+# history, for the case where --username is given but --password is not.
+rpassword = "7"

@@ -11,6 +11,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 vpn-core = { path = "../vpn-core" }
 ncp-profile = { path = "../ncp-profile" }
+sophos-profile = { path = "../sophos-profile" }
 vpn-control = { path = "../vpn-control" }
 vpn-broker = { path = "../vpn-broker" }
 tauri = { version = "2", features = ["tray-icon"] }
