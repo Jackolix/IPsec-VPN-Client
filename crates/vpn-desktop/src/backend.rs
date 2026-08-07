@@ -591,11 +591,21 @@ pub fn connect(
         wait_for_virtual_ip(state, &name, &mut outcome);
     }
 
-    // With the tunnel up, apply the profile's DNS so names on the remote
-    // network resolve over the VPN. Failure here doesn't fail the connect —
-    // the tunnel still carries traffic — it's just surfaced in the log.
-    if outcome.connected && !imported.config.dns.is_empty() {
-        apply_dns(state, &name, &imported.config.dns, &mut outcome);
+    // With the tunnel up, apply DNS so names on the remote network resolve over
+    // the VPN. Two sources, merged: the profile's own servers, and any the
+    // gateway pushed over mode config (captured by charon's resolve plugin) —
+    // so a portal profile that carries no DNS of its own still resolves
+    // internal names. Failure here doesn't fail the connect; it's just logged.
+    if outcome.connected {
+        let mut dns = imported.config.dns.clone();
+        for server in crate::dns::pushed_servers() {
+            if !dns.servers.contains(&server) {
+                dns.servers.push(server);
+            }
+        }
+        if !dns.servers.is_empty() {
+            apply_dns(state, &name, &dns, &mut outcome);
+        }
     }
     Ok(outcome)
 }

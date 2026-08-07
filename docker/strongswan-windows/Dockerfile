@@ -100,6 +100,13 @@ RUN cd "strongswan-${STRONGSWAN_VER}" && autoreconf -fi
 # (ikev1/xauth-generic/eap-mschapv2 are absent from a binary built without
 # them), but no tunnel has been negotiated with them yet — see the Sophos
 # section of the README.
+#
+# resolve: without an attribute handler charon receives the gateway's
+# INTERNAL_IP4_DNS and discards it ("handling INTERNAL_IP4_DNS attribute
+# failed"). The resolve plugin consumes it and writes the servers to a file
+# (strongswan.conf sets charon.plugins.resolve.file); the app reads that file
+# and applies the servers via NRPT. Windows ignores resolv.conf for its own
+# resolution, so the file is purely our capture channel — no double-apply.
 RUN cd "strongswan-${STRONGSWAN_VER}" \
     && ./configure --host="${MINGW}" --prefix="${PREFIX}" \
         --disable-defaults \
@@ -116,6 +123,7 @@ RUN cd "strongswan-${STRONGSWAN_VER}" \
         --enable-xauth-generic --enable-eap-identity --enable-eap-mschapv2 \
         --enable-md4 --enable-md5 --enable-des --enable-sha1 \
         --enable-vici --enable-updown \
+        --enable-resolve \
         openssl_CFLAGS="-I${PREFIX}/include" \
         openssl_LIBS="-L${PREFIX}/lib -lssl -lcrypto" \
         CFLAGS="-I${PREFIX}/include -O2" \
