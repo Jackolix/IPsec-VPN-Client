@@ -476,6 +476,38 @@ mod tests {
         assert_eq!(cfg.dpd.delay_secs, 0);
     }
 
+    /// The portal `.mobileconfig` imports with no remote subnets on purpose
+    /// (a synthesised 0.0.0.0/0 would capture the default route). The user
+    /// supplies the networks in the edit dialog; this is that path — the edit
+    /// turns an unconnectable profile into a usable one.
+    #[test]
+    fn a_subnetless_profile_gains_its_networks_by_editing() {
+        let mut cfg = ncp_profile::import_profile(FIXTURE).unwrap().config;
+        cfg.remote_subnets.clear();
+
+        let mut e = Edit::from_config(&cfg);
+        assert!(e.remote.is_empty(), "starts with no networks");
+        e.remote = vec!["172.21.108.0/24".to_string(), "10.98.49.0/24".to_string()];
+        e.apply_to(&mut cfg).unwrap();
+
+        assert_eq!(
+            cfg.remote_subnets.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            ["172.21.108.0/24", "10.98.49.0/24"]
+        );
+    }
+
+    /// Full tunnel is the explicit opt-in: typing 0.0.0.0/0 is accepted and is
+    /// how a user deliberately routes everything (the importer never does it).
+    #[test]
+    fn full_tunnel_is_an_explicit_edit() {
+        let mut cfg = ncp_profile::import_profile(FIXTURE).unwrap().config;
+        let mut e = Edit::from_config(&cfg);
+        e.remote = vec!["0.0.0.0/0".to_string()];
+        e.apply_to(&mut cfg).unwrap();
+        assert_eq!(cfg.remote_subnets.len(), 1);
+        assert_eq!(cfg.remote_subnets[0].to_string(), "0.0.0.0/0");
+    }
+
     /// The same redacted export `ncp-profile` pins its code table against, so
     /// these tests edit a config that really came out of the importer.
     const FIXTURE: &str = include_str!("../../ncp-profile/tests/fixtures/ncp_export.redacted.ini");
