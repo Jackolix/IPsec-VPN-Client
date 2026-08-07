@@ -86,7 +86,8 @@ fn main() -> Result<()> {
             let mut imported = match sophos_profile::detect(&text) {
                 Some(sophos_profile::Format::Provisioning) => anyhow::bail!(
                     "{} is a provisioning file, not a profile — sign in to the user portal it \
-                     names and import the profile downloaded from there",
+                     names, download the IPsec configuration (served as a .mobileconfig), and \
+                     import that instead",
                     profile.display()
                 ),
                 Some(_) => sophos_profile::import_profile(&text)

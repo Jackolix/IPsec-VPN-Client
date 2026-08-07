@@ -262,11 +262,13 @@ fn provisioning_message(text: &str) -> String {
         .and_then(|entries| entries.first().and_then(|e| e.portal_url()));
     match portal {
         Some(url) => format!(
-            "this is a Sophos provisioning file, not a profile — sign in at {url}, download the \
-             .scx profile from the portal, and import that file instead"
+            "this is a Sophos provisioning file, not a profile — sign in at {url}, open the VPN \
+             section, and download the IPsec configuration (the portal serves it as a \
+             .mobileconfig). Import that file instead. Note the portal profile lists no networks, \
+             so add the subnet(s) you need to reach in the profile's settings before connecting"
         ),
         None => "this is a Sophos provisioning file, not a profile — it names a user portal to \
-                 download the real profile from"
+                 download the real profile (a .mobileconfig) from"
             .to_string(),
     }
 }
