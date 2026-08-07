@@ -481,7 +481,7 @@
       <fieldset class="fgroup">
         <legend>Traffic &amp; addressing</legend>
         <div class="fgrid">
-          <div class="field wide" id="f-remote"><label for="e-remote">Remote subnets</label><textarea id="e-remote" spellcheck="false" placeholder="10.0.0.0/24"></textarea><span class="hint">One CIDR per line. A bare address is a /32 host route.</span></div>
+          <div class="field wide" id="f-remote"><label for="e-remote">Remote subnets</label><textarea id="e-remote" spellcheck="false" placeholder="10.0.0.0/24"></textarea><span class="hint">One CIDR per line. A bare address is a /32 host route. Portal (.mobileconfig) profiles list none — add the networks you need to reach. <code>0.0.0.0/0</code> routes <em>all</em> traffic through the VPN (only for a gateway that carries internet traffic); leaving this empty refuses to connect.</span></div>
           <div class="field" id="f-request_virtual_ip"><label>Virtual IP</label><label class="check"><input id="e-request_virtual_ip" type="checkbox" /> Request one from the gateway</label></div>
           <div class="field" id="f-auto_reconnect"><label>Reconnect</label><label class="check"><input id="e-auto_reconnect" type="checkbox" /> Re-establish automatically</label></div>
           <div class="field" id="f-dpd_delay"><label for="e-dpd_delay">DPD interval (s)</label><input id="e-dpd_delay" type="number" min="0" max="3600" step="1" /><span class="hint">0 disables liveness probing.</span></div>
