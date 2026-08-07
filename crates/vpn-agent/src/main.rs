@@ -45,6 +45,13 @@ enum Command {
         /// one, so it need not appear in the shell history.
         #[arg(long)]
         password: Option<String>,
+        /// Route ALL traffic through the tunnel (0.0.0.0/0). Only needed for a
+        /// profile that names no networks of its own — e.g. an iOS
+        /// `.mobileconfig`. Do not use it against a split-tunnel gateway that
+        /// does not carry internet traffic, or connectivity drops while the
+        /// tunnel is up.
+        #[arg(long)]
+        full_tunnel: bool,
     },
     /// List active IKE/CHILD SAs.
     Status,
@@ -68,6 +75,7 @@ fn main() -> Result<()> {
             gateway_override,
             username,
             password,
+            full_tunnel,
         } => {
             use vpn_core::swanctl::sanitize_name;
 
@@ -89,6 +97,13 @@ fn main() -> Result<()> {
             if let Some(gw) = gateway_override {
                 eprintln!("overriding gateway {} -> {gw}", imported.config.gateway);
                 imported.config.gateway = gw;
+            }
+            if full_tunnel {
+                // Explicit opt-in: route everything. The connect flow otherwise
+                // refuses a profile with no networks rather than silently
+                // capturing the default route.
+                imported.config.remote_subnets = vec!["0.0.0.0/0".parse().expect("valid CIDR")];
+                eprintln!("routing all traffic through the tunnel (0.0.0.0/0)");
             }
             for w in &imported.warnings {
                 eprintln!("! {w}");
