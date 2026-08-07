@@ -447,23 +447,44 @@ pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Resu
     // Parse to reject files that aren't valid profiles in any format we read.
     parse_text(&text)?;
 
-    let sanitize = |s: &str| {
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
-            .collect::<String>()
-    };
     let stem = src
         .file_stem()
         .and_then(|s| s.to_str())
-        .map(sanitize)
-        .filter(|s| !s.is_empty())
         .ok_or("the file needs a name")?;
     let ext = src
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| sanitize(&e.to_ascii_lowercase()))
-        .filter(|e| !e.is_empty())
         .ok_or("the file needs an extension")?;
+    save_imported_text(state, stem, ext, &text)
+}
+
+/// Sanitize the name and extension used for a stem/ext pair. A profile id is the
+/// stem alone, so the character set is kept tight — it becomes a file name.
+fn sanitize_stem(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+/// Write already-validated profile text into the profile directory as
+/// `<stem>.<ext>`, refusing to clobber a different existing profile. Shared by
+/// file import and portal download so both land a profile the same way, with
+/// the same id (the sanitized stem) the rest of the app addresses it by.
+fn save_imported_text(
+    state: &AppState,
+    raw_stem: &str,
+    raw_ext: &str,
+    text: &str,
+) -> std::result::Result<String, String> {
+    let stem = sanitize_stem(raw_stem);
+    let stem = stem.trim_matches('.');
+    if stem.is_empty() {
+        return Err("the profile needs a name".to_string());
+    }
+    let ext = sanitize_stem(&raw_ext.to_ascii_lowercase());
+    if ext.is_empty() {
+        return Err("the profile needs a file type".to_string());
+    }
 
     std::fs::create_dir_all(&state.profile_dir).map_err(|e| e.to_string())?;
     let dest = state.profile_dir.join(format!("{stem}.{ext}"));
@@ -473,12 +494,58 @@ pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Resu
     let taken = PROFILE_EXTENSIONS
         .iter()
         .map(|e| state.profile_dir.join(format!("{stem}.{e}")))
-        .find(|p| p.exists() && std::fs::canonicalize(p).ok() != std::fs::canonicalize(src).ok());
+        .find(|p| p.exists() && std::fs::canonicalize(p).ok() != std::fs::canonicalize(&dest).ok());
     if taken.is_some() {
         return Err(format!("a profile named \"{stem}\" already exists"));
     }
     std::fs::write(&dest, text).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
-    Ok(stem)
+    Ok(stem.to_string())
+}
+
+/// Sign in to the user portal a `.pro` points at, download the IPsec profile,
+/// and import it — the automated version of "download it from the portal
+/// yourself and import that file". Returns the new profile's id.
+pub fn import_from_portal(
+    state: &AppState,
+    portal_url: String,
+    username: String,
+    password: String,
+    name: String,
+) -> std::result::Result<String, String> {
+    let text = crate::portal::download_ipsec_profile(&portal_url, &username, &password)?;
+    // The portal profile is a .mobileconfig; keep the extension so the format is
+    // obvious in the profile folder and re-parses the same way on load.
+    let stem = if name.trim().is_empty() { "Sophos VPN" } else { name.trim() };
+    save_imported_text(state, stem, "mobileconfig", &text)
+}
+
+/// Classify a file the user picked for import: a provisioning `.pro` becomes a
+/// portal to sign in to (handled by [`import_from_portal`]), anything else is
+/// imported in place. Lets the GUI offer the sign-in flow instead of a dead-end
+/// error for a `.pro`.
+pub fn classify_import(
+    state: &AppState,
+    src: &std::path::Path,
+) -> std::result::Result<ImportOutcome, String> {
+    let text = std::fs::read_to_string(src)
+        .map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    if let Some(target) = crate::portal::target(&text) {
+        return Ok(ImportOutcome::Provisioning {
+            url: target.url,
+            name: target.name,
+            otp: target.otp,
+        });
+    }
+    import_path(state, src).map(|id| ImportOutcome::Profile { id })
+}
+
+/// The result of picking a file to import: a profile landed, or a `.pro` that
+/// points at a portal the GUI should offer to sign in to.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ImportOutcome {
+    Profile { id: String },
+    Provisioning { url: String, name: String, otp: bool },
 }
 
 /// Remove an imported profile and everything that trails it: the profile file,
