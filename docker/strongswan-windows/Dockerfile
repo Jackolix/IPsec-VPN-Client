@@ -86,19 +86,44 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN cd "strongswan-${STRONGSWAN_VER}" && autoreconf -fi
 
+# `--disable-defaults` means every plugin the daemon needs is listed here, so
+# what is missing from this list is a feature the daemon simply cannot do.
+#
+# The Sophos profiles are why ikev1 and the two user-auth families are on the
+# list. A legacy .tgb export is IKEv1 (main mode + quick mode), and both Sophos
+# formats put an interactive round on top of the PSK — XAuth under IKEv1, EAP
+# under IKEv2. eap-mschapv2 wants MD4 and DES, which OpenSSL 3 has moved to its
+# legacy provider, so the built-in implementations are enabled rather than
+# relying on the openssl plugin to still offer them.
+#
+# The cross-build succeeds with these and the plugins land in libcharon
+# (ikev1/xauth-generic/eap-mschapv2 are absent from a binary built without
+# them), but no tunnel has been negotiated with them yet — see the Sophos
+# section of the README.
+#
+# resolve: without an attribute handler charon receives the gateway's
+# INTERNAL_IP4_DNS and discards it ("handling INTERNAL_IP4_DNS attribute
+# failed"). The resolve plugin consumes it and writes the servers to a file
+# (strongswan.conf sets charon.plugins.resolve.file); the app reads that file
+# and applies the servers via NRPT. Windows ignores resolv.conf for its own
+# resolution, so the file is purely our capture channel — no double-apply.
 RUN cd "strongswan-${STRONGSWAN_VER}" \
     && ./configure --host="${MINGW}" --prefix="${PREFIX}" \
         --disable-defaults \
         --enable-monolithic \
         --enable-svc \
         --enable-ikev2 \
+        --enable-ikev1 \
         --enable-socket-win --enable-kernel-iph --enable-winhttp \
         --enable-libipsec --enable-kernel-libipsec --enable-wintun \
         --enable-openssl \
         --enable-pem --enable-pkcs1 --enable-pkcs8 --enable-pubkey --enable-x509 \
         --enable-constraints --enable-revocation \
         --enable-nonce --enable-hmac --enable-kdf \
+        --enable-xauth-generic --enable-eap-identity --enable-eap-mschapv2 \
+        --enable-md4 --enable-md5 --enable-des --enable-sha1 \
         --enable-vici --enable-updown \
+        --enable-resolve \
         openssl_CFLAGS="-I${PREFIX}/include" \
         openssl_LIBS="-L${PREFIX}/lib -lssl -lcrypto" \
         CFLAGS="-I${PREFIX}/include -O2" \

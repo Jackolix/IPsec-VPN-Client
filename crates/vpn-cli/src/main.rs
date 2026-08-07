@@ -1,19 +1,19 @@
 //! Phase 0 CLI.
 //!
-//! `show`     — parse an NCP ini and print the interpreted config (redacted)
-//!              plus every mapping warning.
+//! `show`     — parse a profile (NCP `.ini`, Sophos `.scx`/`.tgb`) and print
+//!              the interpreted config (redacted) plus every mapping warning.
 //! `generate` — write a real swanctl.conf (contains the PSK!) for the
 //!              strongSwan initiator to load. Output paths are gitignored.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ncp_profile::{import_profile, ImportedProfile};
 use std::fs;
 use std::path::{Path, PathBuf};
 use vpn_core::swanctl::{render, sanitize_name, SecretRendering};
+use vpn_core::ImportedProfile;
 
 #[derive(Parser)]
-#[command(name = "vpn-cli", about = "NCP profile importer / strongSwan config generator")]
+#[command(name = "vpn-cli", about = "VPN profile importer / strongSwan config generator")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -38,41 +38,111 @@ enum Command {
 
 const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 
-fn load(path: &Path) -> Result<ImportedProfile> {
-    let meta = fs::metadata(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+/// What a file turned out to hold. A Sophos `.pro` is not a connection — it
+/// points at a user portal the profile is downloaded from — so it cannot be
+/// folded into [`ImportedProfile`].
+enum Loaded {
+    Profile(Box<ImportedProfile>),
+    Provisioning(Vec<sophos_profile::Provisioning>),
+}
+
+fn read_profile(path: &Path) -> Result<String> {
+    let meta = fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
     if meta.len() > MAX_PROFILE_BYTES {
         bail!("{} is too large to be a profile export", path.display());
     }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
-    import_profile(&text).with_context(|| format!("failed to import {}", path.display()))
+    fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))
+}
+
+/// Pick the importer by content rather than by extension: these files are
+/// routinely renamed on the way to a user.
+fn load(path: &Path) -> Result<Loaded> {
+    let text = read_profile(path)?;
+    let failed = || format!("failed to import {}", path.display());
+
+    match sophos_profile::detect(&text) {
+        Some(sophos_profile::Format::Provisioning) => Ok(Loaded::Provisioning(
+            sophos_profile::pro::parse(&text).with_context(failed)?,
+        )),
+        Some(_) => Ok(Loaded::Profile(Box::new(
+            sophos_profile::import_profile(&text).with_context(failed)?,
+        ))),
+        None => Ok(Loaded::Profile(Box::new(
+            ncp_profile::import_profile(&text).with_context(failed)?,
+        ))),
+    }
+}
+
+/// `generate` needs an actual connection; a provisioning file has none.
+fn load_connection(path: &Path) -> Result<ImportedProfile> {
+    match load(path)? {
+        Loaded::Profile(p) => Ok(*p),
+        Loaded::Provisioning(_) => bail!(
+            "{} is a provisioning file: it names a user portal to sign in to, and the profile \
+             itself is downloaded from there. Run `show` to see the portal.",
+            path.display()
+        ),
+    }
+}
+
+fn print_provisioning(entries: &[sophos_profile::Provisioning]) {
+    println!("Sophos provisioning file — no connection settings in it.\n");
+    for e in entries {
+        println!("Entry:          {}", e.label());
+        println!(
+            "User portal:    {}",
+            e.portal_url().unwrap_or_else(|| "(none)".to_string())
+        );
+        println!(
+            "One-time code:  {}",
+            if e.otp { "required" } else { "not required" }
+        );
+        println!(
+            "Save login:     {}",
+            if e.can_save_credentials {
+                "allowed"
+            } else {
+                "not allowed"
+            }
+        );
+    }
+    println!(
+        "\nSign in to the portal and download the .scx profile from it, then import that \
+         file. Fetching it automatically is not implemented."
+    );
 }
 
 fn print_summary(imported: &ImportedProfile) {
     let c = &imported.config;
     println!("Profile:        {}", c.name);
     println!("Gateway:        {}", c.gateway);
+    println!("IKE version:    {}", c.ike_version.swanctl_value());
     println!(
-        "Local ID:       {}",
-        c.local_id.as_deref().unwrap_or("(none)")
+        "Local ID:       {}{}",
+        c.local_id.as_deref().unwrap_or("(none)"),
+        match c.local_id_type {
+            Some(t) => format!(" ({})", t.name()),
+            None => String::new(),
+        }
     );
     println!("Auth:           pre-shared key (***REDACTED***)");
+    if let Some(ua) = &c.user_auth {
+        println!(
+            "User auth:      {} (username/password asked for on connect{})",
+            match c.ike_version {
+                vpn_core::IkeVersion::V1 => "XAuth",
+                vpn_core::IkeVersion::V2 => "EAP-MSCHAPv2",
+            },
+            if ua.otp { ", one-time code" } else { "" }
+        );
+    }
+    // Exactly the strings handed to charon, rather than a reconstruction —
+    // IKEv1 carries no PRF term, and the summary should show that.
+    println!("IKE proposal:   {}", c.ike_proposal());
     println!(
-        "IKE proposal:   {}-{}-{}-{}",
-        c.ike_enc.swanctl_name(),
-        c.ike_integ.swanctl_name(),
-        c.ike_prf.swanctl_name(),
-        c.ike_dh.swanctl_name()
-    );
-    println!(
-        "ESP proposal:   {}-{}{}",
-        c.esp_enc.swanctl_name(),
-        c.esp_integ.swanctl_name(),
-        match c.pfs {
-            Some(g) => format!(" (PFS {})", g.swanctl_name()),
-            None => " (no PFS)".to_string(),
-        }
+        "ESP proposal:   {}{}",
+        c.esp_proposal(),
+        if c.pfs.is_some() { " (with PFS)" } else { " (no PFS)" }
     );
     print!("Remote subnets: ");
     if c.remote_subnets.is_empty() {
@@ -108,18 +178,20 @@ fn print_summary(imported: &ImportedProfile) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Show { profile } => {
-            let imported = load(&profile)?;
-            print_summary(&imported);
-            println!("\n--- swanctl.conf (secret redacted) ---");
-            print!("{}", render(&imported.config, SecretRendering::Redact));
-        }
+        Command::Show { profile } => match load(&profile)? {
+            Loaded::Provisioning(entries) => print_provisioning(&entries),
+            Loaded::Profile(imported) => {
+                print_summary(&imported);
+                println!("\n--- swanctl.conf (secret redacted) ---");
+                print!("{}", render(&imported.config, SecretRendering::Redact));
+            }
+        },
         Command::Generate {
             profile,
             out_dir,
             gateway_override,
         } => {
-            let mut imported = load(&profile)?;
+            let mut imported = load_connection(&profile)?;
             if let Some(gw) = gateway_override {
                 println!(
                     "NOTE: overriding gateway {} -> {gw}",

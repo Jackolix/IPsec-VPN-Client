@@ -31,7 +31,7 @@ async fn profiles_dir(state: tauri::State<'_, AppState>) -> Result<String, Strin
         .map_err(|e| e.to_string())?
 }
 
-/// Open a native file picker and import the chosen `.ini`. Returns the new
+/// Open a native file picker and import the chosen profile. Returns the new
 /// profile id, or `None` if the dialog was cancelled.
 #[tauri::command]
 async fn import_profile_dialog(
@@ -44,8 +44,14 @@ async fn import_profile_dialog(
         let picked = app
             .dialog()
             .file()
+            // One combined filter first so the default view shows everything
+            // importable, then per-vendor ones for a user who knows what they
+            // are looking for. `.pro` is offered so picking one produces the
+            // explanation about the user portal rather than a greyed-out file.
+            .add_filter("VPN profile", &["ini", "scx", "tgb", "pro"])
             .add_filter("NCP profile", &["ini"])
-            .set_title("Import NCP profile")
+            .add_filter("Sophos profile", &["scx", "tgb", "pro"])
+            .set_title("Import VPN profile")
             .blocking_pick_file();
         match picked {
             Some(fp) => {
@@ -110,12 +116,38 @@ async fn reset_profile_edit(state: tauri::State<'_, AppState>, id: String) -> Re
 }
 
 #[tauri::command]
+/// `login` carries the XAuth/EAP username and password when the UI has just
+/// prompted for them. It is omitted on an ordinary connect, where a saved
+/// login (if any) is used instead.
 async fn connect(
     state: tauri::State<'_, AppState>,
     id: String,
+    login: Option<backend::UserLogin>,
 ) -> Result<ConnectOutcome, String> {
     let s = state.inner().clone();
-    match tauri::async_runtime::spawn_blocking(move || backend::connect(&s, id)).await {
+    match tauri::async_runtime::spawn_blocking(move || backend::connect(&s, id, login)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Does this profile need a username and password before it can connect?
+/// Lets the UI raise the prompt before calling `connect`, rather than having
+/// to interpret a failure.
+#[tauri::command]
+async fn needs_user_login(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::needs_user_login(&s, &id)).await {
+        Ok(result) => Ok(result),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Forget a saved XAuth/EAP login (the PSK entry is separate and stays).
+#[tauri::command]
+async fn forget_user_login(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::forget_user_login(&s, id)).await {
         Ok(result) => result,
         Err(e) => Err(e.to_string()),
     }
@@ -216,8 +248,37 @@ fn selftest() {
 fn dev(args: &[String]) {
     let state = AppState::from_env();
     let result: std::result::Result<String, String> = match args.first().map(String::as_str) {
-        Some("connect") => backend::connect(&state, args.get(1).cloned().unwrap_or_default())
-            .map(|o| serde_json::to_string(&o).expect("serialize outcome")),
+        // `connect <id> [user] [password] [save]` — the optional login stands in
+        // for the GUI's prompt so the XAuth/EAP path is drivable headlessly.
+        Some("connect") => {
+            let login = args.get(2).map(|username| backend::UserLogin {
+                username: username.clone(),
+                password: args.get(3).cloned().unwrap_or_default(),
+                save: args.get(4).map(|s| s == "save").unwrap_or(false),
+            });
+            backend::connect(&state, args.get(1).cloned().unwrap_or_default(), login)
+                .map(|o| serde_json::to_string(&o).expect("serialize outcome"))
+        }
+        Some("needs-user-login") => Ok(
+            if backend::needs_user_login(&state, args.get(1).map(String::as_str).unwrap_or("")) {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            },
+        ),
+        Some("forget-user-login") => {
+            backend::forget_user_login(&state, args.get(1).cloned().unwrap_or_default())
+                .map(|_| "forgotten".to_string())
+        }
+        // Store a login without connecting — mirrors `set-creds` for the PSK,
+        // and lets the keychain path be tested without dialling a gateway.
+        Some("set-user-login") => backend::set_user_login(
+            &state,
+            args.get(1).cloned().unwrap_or_default(),
+            args.get(2).cloned().unwrap_or_default(),
+            args.get(3).cloned().unwrap_or_default(),
+        )
+        .map(|_| "set".to_string()),
         Some("disconnect") => backend::disconnect(&state, args.get(1).cloned().unwrap_or_default())
             .map(|_| "disconnected".to_string()),
         Some("daemon-status") => Ok(if backend::daemon_running(&state) {
@@ -301,6 +362,8 @@ fn main() {
             save_credentials,
             set_credentials,
             forget_credentials,
+            needs_user_login,
+            forget_user_login,
             get_profile_edit,
             save_profile_edit,
             reset_profile_edit
@@ -316,7 +379,7 @@ fn main() {
                 let _ = window.hide();
                 api.prevent_close();
             }
-            // Dragging .ini files onto the window imports them; Enter/Leave
+            // Dragging profile files onto the window imports them; Enter/Leave
             // drive a drop-zone highlight in the UI.
             tauri::WindowEvent::DragDrop(drag) => {
                 use tauri::{Emitter, Manager};

@@ -37,6 +37,21 @@ enum Command {
         /// test responder).
         #[arg(long)]
         gateway_override: Option<String>,
+        /// XAuth/EAP username, for a gateway that asks for a login on top of
+        /// the pre-shared key (Sophos profiles typically do).
+        #[arg(long)]
+        username: Option<String>,
+        /// XAuth/EAP password. Prompted for if a username was given without
+        /// one, so it need not appear in the shell history.
+        #[arg(long)]
+        password: Option<String>,
+        /// Route ALL traffic through the tunnel (0.0.0.0/0). Only needed for a
+        /// profile that names no networks of its own — e.g. an iOS
+        /// `.mobileconfig`. Do not use it against a split-tunnel gateway that
+        /// does not carry internet traffic, or connectivity drops while the
+        /// tunnel is up.
+        #[arg(long)]
+        full_tunnel: bool,
     },
     /// List active IKE/CHILD SAs.
     Status,
@@ -58,24 +73,72 @@ fn main() -> Result<()> {
         Command::Connect {
             profile,
             gateway_override,
+            username,
+            password,
+            full_tunnel,
         } => {
-            use ncp_profile::import_profile;
             use vpn_core::swanctl::sanitize_name;
 
             let text = std::fs::read_to_string(&profile)
                 .with_context(|| format!("cannot read {}", profile.display()))?;
-            let mut imported = import_profile(&text)
-                .with_context(|| format!("failed to import {}", profile.display()))?;
+            // Same content-based dispatch the desktop and vpn-cli use, so a
+            // Sophos export can be driven from here too.
+            let mut imported = match sophos_profile::detect(&text) {
+                Some(sophos_profile::Format::Provisioning) => anyhow::bail!(
+                    "{} is a provisioning file, not a profile — sign in to the user portal it \
+                     names and import the profile downloaded from there",
+                    profile.display()
+                ),
+                Some(_) => sophos_profile::import_profile(&text)
+                    .with_context(|| format!("failed to import {}", profile.display()))?,
+                None => ncp_profile::import_profile(&text)
+                    .with_context(|| format!("failed to import {}", profile.display()))?,
+            };
             if let Some(gw) = gateway_override {
                 eprintln!("overriding gateway {} -> {gw}", imported.config.gateway);
                 imported.config.gateway = gw;
+            }
+            if full_tunnel {
+                // Explicit opt-in: route everything. The connect flow otherwise
+                // refuses a profile with no networks rather than silently
+                // capturing the default route.
+                imported.config.remote_subnets = vec!["0.0.0.0/0".parse().expect("valid CIDR")];
+                eprintln!("routing all traffic through the tunnel (0.0.0.0/0)");
             }
             for w in &imported.warnings {
                 eprintln!("! {w}");
             }
 
+            // The profile only says *that* a login is required; the username
+            // and password are the user's to supply.
+            let user_password = match (&imported.config.user_auth, &username) {
+                (Some(_), Some(user)) => {
+                    imported.config.user_auth.as_mut().unwrap().username = Some(user.clone());
+                    let pw = match &password {
+                        Some(p) => p.clone(),
+                        None => rpassword::prompt_password(format!("Password for {user}: "))
+                            .context("could not read the password")?,
+                    };
+                    Some(vpn_core::Secret::new(pw))
+                }
+                (Some(_), None) => anyhow::bail!(
+                    "this profile's gateway asks for a username and password; pass --username"
+                ),
+                (None, Some(_)) => {
+                    eprintln!("! this profile needs no second authentication round; ignoring --username");
+                    None
+                }
+                (None, None) => None,
+            };
+
             let name = sanitize_name(&imported.config.name);
-            let outcome = vpn_control::connect_logged(&transport, &imported.config, &name)?;
+            let outcome = vpn_control::connect_logged(
+                &transport,
+                &imported.config,
+                &name,
+                user_password.as_ref(),
+            )?;
+            drop(user_password); // and the password once it has been sent
             drop(imported); // discard the plaintext PSK once charon has it
 
             // Live handshake transcript from charon's log bus.

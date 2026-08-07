@@ -15,7 +15,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use vpn_core::{ConnectionConfig, DhGroup, DnsConfig, EncAlg, IkeIdType, IntegAlg, Ipv4Net, PrfAlg};
+use vpn_core::{
+    ConnectionConfig, DhGroup, DnsConfig, EncAlg, IkeIdType, IkeVersion, IntegAlg, Ipv4Net, PrfAlg,
+};
 
 /// The editable view of a connection: every field the UI can change, as the
 /// plain strings/bools it round-trips. `Edit` is what the UI reads and writes;
@@ -24,6 +26,16 @@ use vpn_core::{ConnectionConfig, DhGroup, DnsConfig, EncAlg, IkeIdType, IntegAlg
 pub struct Edit {
     pub name: String,
     pub gateway: String,
+    /// `ikev1` or `ikev2`. Editable because the two Sophos exports for one
+    /// gateway can disagree, and only the gateway settles it.
+    pub ike_version: String,
+    /// Whether the gateway asks for a username and password on top of the PSK
+    /// (XAuth under IKEv1, EAP under IKEv2).
+    ///
+    /// Editable for the same reason: a `.tgb` that says `Xauth = 0` has been
+    /// seen against a gateway that requires it — main mode then fails with
+    /// AUTHENTICATION_FAILED, and nothing in the profile hints at the cause.
+    pub user_auth: bool,
     /// Empty means "no local IKE identity" (charon derives one).
     pub local_id: String,
     /// One of [`IkeIdType::name`], or empty for "let charon infer".
@@ -55,6 +67,8 @@ impl Edit {
         Edit {
             name: config.name.clone(),
             gateway: config.gateway.clone(),
+            ike_version: config.ike_version.name().to_string(),
+            user_auth: config.user_auth.is_some(),
             local_id: config.local_id.clone().unwrap_or_default(),
             local_id_type: config.local_id_type.map(|t| t.name().to_string()).unwrap_or_default(),
             ike_enc: config.ike_enc.swanctl_name().to_string(),
@@ -100,6 +114,20 @@ impl Edit {
             t => Some(IkeIdType::from_name(t).ok_or(format!("unknown IKE ID type {t:?}"))?),
         };
 
+        let ike_version = IkeVersion::from_name(self.ike_version.trim())
+            .ok_or_else(|| format!("unknown IKE version {:?}", self.ike_version))?;
+        // Turning the round on keeps whatever the profile said about saving
+        // and one-time codes; turning it off drops it entirely.
+        let user_auth = match (self.user_auth, config.user_auth.take()) {
+            (true, Some(existing)) => Some(existing),
+            (true, None) => Some(vpn_core::UserAuth {
+                username: None,
+                can_save: true,
+                otp: false,
+            }),
+            (false, _) => None,
+        };
+
         let ike_enc = enc(&self.ike_enc)?;
         let ike_integ = integ(&self.ike_integ)?;
         let ike_prf = PrfAlg::from_swanctl_name(self.ike_prf.trim())
@@ -140,6 +168,8 @@ impl Edit {
 
         config.name = name.to_string();
         config.gateway = gateway.to_string();
+        config.ike_version = ike_version;
+        config.user_auth = user_auth;
         config.local_id = Some(self.local_id.trim().to_string()).filter(|s| !s.is_empty());
         config.local_id_type = local_id_type;
         config.ike_enc = ike_enc;
@@ -182,6 +212,10 @@ pub struct Overrides {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ike_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_auth: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,7 +268,8 @@ impl Overrides {
         let mut out = Overrides::default();
         let mut names = Vec::new();
         diff_fields!(
-            base, edited, out, names, name, gateway, local_id, local_id_type, ike_enc, ike_integ,
+            base, edited, out, names, name, gateway, ike_version, user_auth, local_id, local_id_type,
+            ike_enc, ike_integ,
             ike_prf, ike_dh, esp_enc, esp_integ, pfs, remote, request_virtual_ip, compression, dns,
             dns_domain, dpd_delay, auto_reconnect,
         );
@@ -258,7 +293,8 @@ impl Overrides {
             };
         }
         set!(
-            name, gateway, local_id, local_id_type, ike_enc, ike_integ, ike_prf, ike_dh, esp_enc,
+            name, gateway, ike_version, user_auth, local_id, local_id_type, ike_enc, ike_integ,
+            ike_prf, ike_dh, esp_enc,
             esp_integ, pfs, remote, request_virtual_ip, compression, dns, dns_domain, dpd_delay,
             auto_reconnect,
         );
@@ -313,6 +349,8 @@ mod tests {
         Edit {
             name: "conn".to_string(),
             gateway: "vpn.example.test".to_string(),
+            ike_version: "ikev2".to_string(),
+            user_auth: false,
             local_id: "user@example.test".to_string(),
             local_id_type: "rfc822".to_string(),
             ike_enc: "aes256".to_string(),
@@ -436,6 +474,38 @@ mod tests {
         );
         assert_eq!(cfg.dns.domain.as_deref(), Some("corp.example.test"));
         assert_eq!(cfg.dpd.delay_secs, 0);
+    }
+
+    /// The portal `.mobileconfig` imports with no remote subnets on purpose
+    /// (a synthesised 0.0.0.0/0 would capture the default route). The user
+    /// supplies the networks in the edit dialog; this is that path — the edit
+    /// turns an unconnectable profile into a usable one.
+    #[test]
+    fn a_subnetless_profile_gains_its_networks_by_editing() {
+        let mut cfg = ncp_profile::import_profile(FIXTURE).unwrap().config;
+        cfg.remote_subnets.clear();
+
+        let mut e = Edit::from_config(&cfg);
+        assert!(e.remote.is_empty(), "starts with no networks");
+        e.remote = vec!["172.21.108.0/24".to_string(), "10.98.49.0/24".to_string()];
+        e.apply_to(&mut cfg).unwrap();
+
+        assert_eq!(
+            cfg.remote_subnets.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            ["172.21.108.0/24", "10.98.49.0/24"]
+        );
+    }
+
+    /// Full tunnel is the explicit opt-in: typing 0.0.0.0/0 is accepted and is
+    /// how a user deliberately routes everything (the importer never does it).
+    #[test]
+    fn full_tunnel_is_an_explicit_edit() {
+        let mut cfg = ncp_profile::import_profile(FIXTURE).unwrap().config;
+        let mut e = Edit::from_config(&cfg);
+        e.remote = vec!["0.0.0.0/0".to_string()];
+        e.apply_to(&mut cfg).unwrap();
+        assert_eq!(cfg.remote_subnets.len(), 1);
+        assert_eq!(cfg.remote_subnets[0].to_string(), "0.0.0.0/0");
     }
 
     /// The same redacted export `ncp-profile` pins its code table against, so
