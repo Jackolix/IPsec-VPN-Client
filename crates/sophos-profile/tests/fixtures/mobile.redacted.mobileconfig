@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>IPSec</key>
+			<dict>
+				<key>AuthenticationMethod</key>
+				<string>SharedSecret</string>
+				<key>RemoteAddress</key>
+				<string>203.0.113.10</string>
+				<key>SharedSecret</key>
+				<data>UkVEQUNURUQtTk9ULUEtUkVBTC1LRVk=</data>
+				<key>XAuthEnabled</key>
+				<integer>1</integer>
+				<key>XAuthName</key>
+				<string>vpn.user</string>
+			</dict>
+			<key>IPv4</key>
+			<dict>
+				<key>OverridePrimary</key>
+				<integer>0</integer>
+			</dict>
+			<key>PayloadDescription</key>
+			<string>Configures VPN settings, including authentication.</string>
+			<key>PayloadDisplayName</key>
+			<string>Sophos IPSEC settings</string>
+			<key>PayloadIdentifier</key>
+			<string>com.sophos.iphone.profile.vpn1</string>
+			<key>PayloadOrganization</key>
+			<string>Sophos</string>
+			<key>PayloadType</key>
+			<string>com.apple.vpn.managed</string>
+			<key>PayloadUUID</key>
+			<string>5BB9D20F-6C34-3A4C-81B1-5E669D4902C6</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>UserDefinedName</key>
+			<string>Example IPsec Mobile</string>
+			<key>VPNType</key>
+			<string>IPSec</string>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>Sophos profile for iPhone.</string>
+	<key>PayloadDisplayName</key>
+	<string>Sophos profile</string>
+	<key>PayloadIdentifier</key>
+	<string>com.sophos.iphone.profile</string>
+	<key>PayloadOrganization</key>
+	<string>Sophos</string>
+	<key>PayloadRemovalDisallowed</key>
+	<false/>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>CA476ACB-26FA-371A-B573-646632048AA5</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>

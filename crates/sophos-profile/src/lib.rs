@@ -4,6 +4,7 @@
 //! |---|---|---|
 //! | `.scx` | Sophos Connect profile — JSON, close to a serialised swanctl connection | a connection |
 //! | `.tgb` | legacy Cyberoam/TheGreenBow client profile — ini-shaped, IKEv1 | a connection |
+//! | `.mobileconfig` | Apple config profile the user portal emits for IPsec — XML plist, IKEv1 | a connection |
 //! | `.pro` | provisioning pointer to a user portal | [`Format::Provisioning`], not a connection |
 //!
 //! All three are undocumented, so the importers follow the same policy as the
@@ -17,6 +18,7 @@
 //! written back out, or committed.
 
 pub mod error;
+pub mod mobileconfig;
 pub mod pro;
 pub mod proposal;
 pub mod scx;
@@ -26,19 +28,22 @@ pub use error::ImportError;
 pub use pro::Provisioning;
 pub use vpn_core::import::{ImportWarning, ImportedProfile};
 
-/// Which of the three formats a file is.
+/// Which of the formats a file is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Format {
     /// Sophos Connect profile (`.scx`).
     Connect,
     /// Legacy Cyberoam/TheGreenBow profile (`.tgb`).
     Legacy,
+    /// Apple configuration profile the user portal emits for IPsec
+    /// (`.mobileconfig`).
+    MobileConfig,
     /// Provisioning pointer (`.pro`) — names a user portal to sign in to.
     Provisioning,
 }
 
 /// The file extensions this crate can be handed.
-pub const EXTENSIONS: [&str; 3] = ["scx", "tgb", "pro"];
+pub const EXTENSIONS: [&str; 4] = ["scx", "tgb", "mobileconfig", "pro"];
 
 /// Is this an extension we import? Case-insensitive.
 pub fn handles_extension(ext: &str) -> bool {
@@ -56,6 +61,8 @@ pub fn detect(input: &str) -> Option<Format> {
         Some(Format::Provisioning)
     } else if scx::looks_like(input) {
         Some(Format::Connect)
+    } else if mobileconfig::looks_like(input) {
+        Some(Format::MobileConfig)
     } else if tgb::looks_like(input) {
         Some(Format::Legacy)
     } else {
@@ -71,6 +78,7 @@ pub fn import_profile(input: &str) -> Result<ImportedProfile, ImportError> {
     match detect(input) {
         Some(Format::Connect) => scx::import(input),
         Some(Format::Legacy) => tgb::import(input),
+        Some(Format::MobileConfig) => mobileconfig::import(input),
         Some(Format::Provisioning) => Err(ImportError::IsProvisioning),
         None => Err(ImportError::Unrecognised),
     }
@@ -94,6 +102,14 @@ mod tests {
             detect("# Written by VpnConf\n[Phase 1]\n1.2.3.4 = x-P1\n"),
             Some(Format::Legacy)
         );
+        assert_eq!(
+            detect(
+                "<?xml version=\"1.0\"?><plist><dict><key>PayloadContent</key><array><dict>\
+                 <key>PayloadType</key><string>com.apple.vpn.managed</string></dict></array>\
+                 </dict></plist>"
+            ),
+            Some(Format::MobileConfig)
+        );
         assert_eq!(detect("hello"), None);
     }
 
@@ -107,6 +123,7 @@ mod tests {
     fn extensions_are_matched_case_insensitively() {
         assert!(handles_extension("SCX"));
         assert!(handles_extension("tgb"));
+        assert!(handles_extension("MobileConfig"));
         assert!(!handles_extension("ini"));
     }
 }

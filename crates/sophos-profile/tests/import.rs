@@ -10,6 +10,7 @@ use vpn_core::{DhGroup, EncAlg, IkeIdType, IkeVersion, IntegAlg, PrfAlg};
 
 const SCX: &str = include_str!("fixtures/connect.redacted.scx");
 const TGB: &str = include_str!("fixtures/legacy.redacted.tgb");
+const MOBILECONFIG: &str = include_str!("fixtures/mobile.redacted.mobileconfig");
 const PRO: &str = include_str!("fixtures/portal.redacted.pro");
 
 #[test]
@@ -77,6 +78,79 @@ fn imports_the_legacy_tgb_profile() {
     assert!(c.user_auth.is_none(), "Xauth = 0");
 }
 
+#[test]
+fn imports_the_portal_mobileconfig() {
+    let imported = import_profile(MOBILECONFIG).expect("mobileconfig imports");
+    let c = &imported.config;
+
+    assert_eq!(c.name, "Example IPsec Mobile");
+    assert_eq!(c.gateway, "203.0.113.10");
+    // VPNType IPSec is Apple's Cisco-style tunnel: IKEv1 with XAuth. This is
+    // the format that states its version outright, so it is never a guess.
+    assert_eq!(c.ike_version, IkeVersion::V1);
+
+    // No IKE identity in the file — charon derives it from the local address.
+    assert_eq!(c.local_id, None);
+    assert_eq!(c.local_id_type, None);
+
+    // The file states no algorithms; a Sophos-accepted default is filled in.
+    assert_eq!(c.ike_enc, EncAlg::Aes256);
+    assert_eq!(c.ike_integ, IntegAlg::Sha256);
+    assert_eq!(c.ike_dh, DhGroup::Modp2048);
+    assert_eq!(c.esp_enc, EncAlg::Aes256);
+    assert_eq!(c.esp_integ, IntegAlg::Sha256);
+    assert_eq!(c.pfs, Some(DhGroup::Modp2048));
+    // IKEv1 folds the PRF into the hash, so no PRF term in the proposal.
+    assert_eq!(c.ike_proposal(), "aes256-sha256-modp2048");
+
+    // The file names no selectors, and — deliberately — none are invented: a
+    // synthesised 0.0.0.0/0 would capture the default route. The connect flow
+    // refuses an empty selector set rather than silently full-tunnelling.
+    assert!(c.remote_subnets.is_empty());
+    assert!(c.request_virtual_ip);
+
+    // XAuth is on, and — unlike the .scx/.tgb — the file names the user, which
+    // is prefilled; the password is still the person's to supply.
+    let ua = c.user_auth.as_ref().expect("XAuthEnabled = 1 means user auth");
+    assert_eq!(ua.username.as_deref(), Some("vpn.user"));
+    assert!(ua.can_save);
+    assert!(!ua.otp);
+}
+
+#[test]
+fn a_mobileconfig_is_detected_as_its_own_format() {
+    assert_eq!(detect(MOBILECONFIG), Some(Format::MobileConfig));
+}
+
+/// An IKEv2 configuration profile must be refused rather than imported as the
+/// IKEv1 tunnel this format usually carries — negotiating the wrong version is
+/// worse than a clear refusal.
+#[test]
+fn an_ikev2_mobileconfig_is_refused() {
+    let ikev2 = MOBILECONFIG.replace(
+        "<string>IPSec</string>",
+        "<string>IKEv2</string>",
+    );
+    assert!(matches!(
+        import_profile(&ikev2),
+        Err(ImportError::Unsupported(_))
+    ));
+}
+
+/// A certificate-authenticated profile has no pre-shared key to fall back to,
+/// so it must fail rather than import a keyless connection.
+#[test]
+fn a_certificate_mobileconfig_is_refused() {
+    let cert = MOBILECONFIG.replace(
+        "<string>SharedSecret</string>",
+        "<string>Certificate</string>",
+    );
+    assert!(matches!(
+        import_profile(&cert),
+        Err(ImportError::Unsupported(_))
+    ));
+}
+
 /// The export was generated against the firewall's internal interface, so the
 /// address in it is not reachable from outside — the import has to say so
 /// rather than leave the user with a connection that just times out.
@@ -110,7 +184,7 @@ fn scx_warns_that_the_second_auth_round_is_a_guess() {
 /// user-visible text quoting the key back out of the file.
 #[test]
 fn no_warning_ever_repeats_the_pre_shared_key() {
-    for input in [SCX, TGB] {
+    for input in [SCX, TGB, MOBILECONFIG] {
         let imported = import_profile(input).unwrap();
         for w in &imported.warnings {
             assert!(

@@ -10,3 +10,6 @@ vpn-core = { path = "../vpn-core" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Apple property-list reader for the .mobileconfig the Sophos user portal hands
+# out for IPsec. Pinned to the version already resolved in the workspace.
+plist = "1.9"
