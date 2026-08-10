@@ -135,6 +135,9 @@ pub struct ProfileSummary {
     /// The username saved for it, to prefill the prompt when re-entering a
     /// password. Not a secret — the password never leaves the keychain.
     pub user_name: Option<String>,
+    /// Which datapath this profile uses: `ipsec` (charon) or `ssl` (OpenVPN via
+    /// the broker). The UI adapts labels and skips IPsec-only editing for SSL.
+    pub kind: String,
 }
 
 /// A profile opened for editing: its current effective values, plus which of
@@ -215,13 +218,58 @@ fn summarize(
         stored: crate::creds::has(id),
         dns: config.dns.servers.iter().map(|s| s.to_string()).collect(),
         dns_domain: config.dns.domain.clone(),
+        kind: "ipsec".to_string(),
+    }
+}
+
+/// Summarize an SSL VPN (OpenVPN) profile for the list. It carries none of the
+/// IPsec knobs — routes, DNS, ciphers and the second-factor login are all
+/// settled by the gateway at connect time — so the IPsec-shaped fields are
+/// filled with what actually describes an OpenVPN tunnel.
+fn summarize_ssl(id: &str, file: &str, text: &str) -> ProfileSummary {
+    let meta = crate::ssl::parse_meta(text);
+    let gateway = if meta.port.is_empty() {
+        meta.gateway.clone()
+    } else {
+        format!("{}:{}", meta.gateway, meta.port)
+    };
+    ProfileSummary {
+        id: id.to_string(),
+        name: id.to_string(),
+        gateway,
+        local_id: None,
+        remote: Vec::new(),
+        ike: "OpenVPN / TLS".to_string(),
+        esp: "negotiated (AES-GCM)".to_string(),
+        pfs: None,
+        auth: "certificate".to_string(),
+        virtual_ip_requested: true,
+        warnings: vec![WarnItem {
+            level: "info".to_string(),
+            text: "Routes and DNS are pushed by the gateway on connect".to_string(),
+            note: "an SSL VPN profile needs no subnets set by hand".to_string(),
+        }],
+        stored: false,
+        dns: Vec::new(),
+        dns_domain: None,
+        edits: Vec::new(),
+        file: file.to_string(),
+        format: format_label(file).to_string(),
+        ike_version: "-".to_string(),
+        user_auth: meta.needs_user.then(|| "Username & password".to_string()),
+        user_stored: meta.needs_user && crate::creds::has_user(id),
+        user_name: meta
+            .needs_user
+            .then(|| crate::creds::load_user(id).ok().flatten().map(|c| c.username))
+            .flatten(),
+        kind: "ssl".to_string(),
     }
 }
 
 /// File extensions a profile may have, in the order [`profile_path`] resolves
 /// them. Ids stay bare file stems, so an override sidecar or a keychain entry
 /// written before Sophos profiles existed still addresses the same profile.
-const PROFILE_EXTENSIONS: [&str; 4] = ["ini", "scx", "tgb", "mobileconfig"];
+const PROFILE_EXTENSIONS: [&str; 5] = ["ini", "scx", "tgb", "mobileconfig", "ovpn"];
 
 /// Human-readable origin of a profile, from its extension. The importers pick
 /// by content, but the extension is what survived the copy into the profile
@@ -231,7 +279,38 @@ fn format_label(file: &str) -> &'static str {
         "scx" => "Sophos Connect",
         "tgb" => "Sophos (legacy)",
         "mobileconfig" => "Sophos (portal)",
+        "ovpn" => "Sophos SSL VPN",
         _ => "NCP",
+    }
+}
+
+/// Is this profile file an SSL VPN (OpenVPN) config, driven by the broker rather
+/// than by charon? Dispatch through the app hinges on this.
+fn is_ssl_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("ovpn"))
+        .unwrap_or(false)
+}
+
+/// Whether the profile with this id is an SSL VPN profile.
+fn is_ssl_profile(state: &AppState, id: &str) -> bool {
+    is_ssl_path(&profile_path(state, id))
+}
+
+/// The connection name a profile is keyed by, matching the front-end's own
+/// `sanitize` (non `[A-Za-z0-9_-]` → `_`). Used for the SSL path, whose name has
+/// to line up with what the GUI computes from the profile name and passes back
+/// to `disconnect`.
+fn conn_name(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if out.is_empty() {
+        "conn".to_string()
+    } else {
+        out
     }
 }
 
@@ -361,7 +440,11 @@ pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
             .and_then(|f| f.to_str())
             .unwrap_or_default()
             .to_string();
-        if let Ok((imported, edits)) = load(state, id) {
+        if is_ssl_path(&path) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                out.push(summarize_ssl(id, &file, &text));
+            }
+        } else if let Ok((imported, edits)) = load(state, id) {
             out.push(summarize(
                 id,
                 &file,
@@ -377,6 +460,10 @@ pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
 
 /// The editable view of a profile — what the edit dialog opens on.
 pub fn get_profile_edit(state: &AppState, id: String) -> std::result::Result<ProfileEdit, String> {
+    if is_ssl_profile(state, &id) {
+        return Err("SSL VPN profiles have no editable parameters — the gateway pushes routes \
+                    and DNS on connect".to_string());
+    }
     let (imported, edits) = load(state, &id)?;
     Ok(ProfileEdit {
         edit: crate::overrides::Edit::from_config(&imported.config),
@@ -393,6 +480,9 @@ pub fn save_profile_edit(
     id: String,
     edit: crate::overrides::Edit,
 ) -> std::result::Result<Vec<String>, String> {
+    if is_ssl_profile(state, &id) {
+        return Err("SSL VPN profiles have no editable parameters".to_string());
+    }
     // Validate against the profile as imported: an edit that can't be applied
     // must not reach the sidecar, or the profile would carry a broken override.
     let mut imported = parse(&profile_path(state, &id))?;
@@ -444,8 +534,15 @@ pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Resu
         ));
     }
     let text = std::fs::read_to_string(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
-    // Parse to reject files that aren't valid profiles in any format we read.
-    parse_text(&text)?;
+    // Validate so junk is rejected. An `.ovpn` is not an IPsec profile — check
+    // it against OpenVPN's own markers rather than the IPsec importers.
+    if is_ssl_path(src) {
+        if !crate::ssl::looks_like_ovpn(&text) {
+            return Err("this .ovpn file is not a valid OpenVPN configuration".to_string());
+        }
+    } else {
+        parse_text(&text)?;
+    }
 
     let stem = src
         .file_stem()
@@ -560,6 +657,19 @@ pub fn delete_profile(state: &AppState, id: String) -> std::result::Result<(), S
     check_id(&id)?;
     let path = profile_path(state, &id);
 
+    // An SSL profile's tunnel lives in the broker, not charon — tear it down
+    // there before the file that names it is gone. (The IPsec teardown below is
+    // skipped for SSL, since it can't be parsed as an IPsec profile.)
+    if is_ssl_path(&path) {
+        if let Ok(Some(s)) = crate::ssl::status() {
+            if s.name == conn_name(&id) {
+                if let Err(e) = crate::ssl::disconnect() {
+                    eprintln!("SSL disconnect before deleting {id} failed: {e}");
+                }
+            }
+        }
+    }
+
     // Best-effort: a profile that no longer parses can't tell us its connection
     // name, and a charon that isn't running can't be asked to disconnect. Losing
     // the tunnel teardown is not a reason to refuse the delete.
@@ -607,6 +717,9 @@ pub fn connect(
     id: String,
     login: Option<UserLogin>,
 ) -> std::result::Result<vpn_control::ConnectOutcome, String> {
+    if is_ssl_profile(state, &id) {
+        return ssl_connect(state, &id, login);
+    }
     let (mut imported, _) = load(state, &id)?;
     // Prefer a PSK saved in the OS keychain over the one parsed from the
     // (plaintext-on-disk) profile file, so saved credentials are what actually
@@ -679,6 +792,70 @@ pub fn connect(
     Ok(outcome)
 }
 
+/// Bring up an SSL VPN (OpenVPN) profile via the broker. The `.ovpn` (which
+/// carries a private key) is read and handed to the broker, which runs openvpn
+/// as LocalSystem — the privilege the adapter and routes need. The gateway asks
+/// for a username and password (`auth-user-pass`); they come from the connect
+/// prompt or the keychain, exactly as the IPsec second factor does.
+fn ssl_connect(
+    state: &AppState,
+    id: &str,
+    login: Option<UserLogin>,
+) -> std::result::Result<vpn_control::ConnectOutcome, String> {
+    let path = profile_path(state, id);
+    let config = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let name = conn_name(id);
+
+    // Resolve the username/password: what was typed, else what was saved.
+    let (username, password) = match login {
+        Some(l) => {
+            let username = l.username.trim().to_string();
+            if username.is_empty() {
+                return Err("the username cannot be empty".to_string());
+            }
+            if l.password.is_empty() {
+                return Err("the password cannot be empty".to_string());
+            }
+            if l.save {
+                crate::creds::store_user(
+                    id,
+                    &crate::creds::UserCreds {
+                        username: username.clone(),
+                        password: vpn_core::Secret::new(l.password.clone()),
+                    },
+                )?;
+            }
+            (username, l.password)
+        }
+        None => {
+            let saved = crate::creds::load_user(id)?
+                .ok_or("this SSL VPN profile needs a username and password")?;
+            (saved.username, saved.password.expose().to_string())
+        }
+    };
+
+    match crate::ssl::connect(&name, &config, &username, &password) {
+        Ok(ip) => {
+            let msg = if ip.is_empty() {
+                "SSL VPN connected".to_string()
+            } else {
+                format!("SSL VPN connected; assigned IP {ip}. Routes and DNS applied from the gateway push.")
+            };
+            Ok(vpn_control::ConnectOutcome {
+                connected: true,
+                error: None,
+                log: vec![note_line(&name, 2, msg)],
+            })
+        }
+        Err(e) => Ok(vpn_control::ConnectOutcome {
+            connected: false,
+            error: Some(e.clone()),
+            log: vec![note_line(&name, 0, format!("SSL VPN connect failed: {e}"))],
+        }),
+    }
+}
+
 /// Settle the XAuth/EAP login for a connect, writing the username into the
 /// config and returning the password for the caller to hand to charon.
 ///
@@ -732,6 +909,14 @@ fn resolve_user_login(
 /// Whether a profile still needs to be asked for a login before it can
 /// connect: its gateway wants one and nothing usable is saved.
 pub fn needs_user_login(state: &AppState, id: &str) -> bool {
+    if is_ssl_profile(state, id) {
+        // A Sophos SSL VPN profile authenticates with a certificate plus a
+        // username/password (`auth-user-pass`); prompt unless one is saved.
+        let needs = std::fs::read_to_string(profile_path(state, id))
+            .map(|t| crate::ssl::parse_meta(&t).needs_user)
+            .unwrap_or(true);
+        return needs && !crate::creds::has_user(id);
+    }
     load(state, id)
         .map(|(imported, _)| {
             imported.config.user_auth.is_some() && !crate::creds::has_user(id)
@@ -914,6 +1099,13 @@ pub fn forget_credentials(_state: &AppState, id: String) -> std::result::Result<
 }
 
 pub fn disconnect(state: &AppState, name: String) -> std::result::Result<(), String> {
+    // If this name is the live SSL tunnel, tear it down through the broker; the
+    // broker also drops the OpenVPN routes and DNS it installed.
+    if let Ok(Some(s)) = crate::ssl::status() {
+        if s.name == name {
+            return crate::ssl::disconnect();
+        }
+    }
     // Undo any DNS we applied for this connection first (best-effort — a stale
     // resolver override is worse than a failed revert log).
     if let Err(e) = crate::dns::revert(&name) {
@@ -922,6 +1114,49 @@ pub fn disconnect(state: &AppState, name: String) -> std::result::Result<(), Str
     vpn_control::disconnect(&state.transport, &name).map_err(|e| e.to_string())
 }
 
+/// Live connections across both datapaths: charon's IKE SAs plus, if one is up,
+/// the broker's SSL VPN tunnel rendered as a synthetic SA so the UI shows and
+/// can tear it down the same way.
 pub fn status(state: &AppState) -> std::result::Result<Vec<IkeSa>, String> {
-    vpn_control::status(&state.transport).map_err(|e| e.to_string())
+    let ssl = crate::ssl::status().ok().flatten();
+    let mut sas = match vpn_control::status(&state.transport) {
+        Ok(sas) => sas,
+        // charon may be down while an SSL tunnel is up (SSL needs no charon):
+        // don't report the backend as unreachable in that case.
+        Err(e) => {
+            if ssl.is_some() {
+                Vec::new()
+            } else {
+                return Err(e.to_string());
+            }
+        }
+    };
+    if let Some(s) = ssl {
+        sas.push(synth_ssl_sa(&s));
+    }
+    Ok(sas)
+}
+
+/// Render the broker's SSL tunnel as an `IkeSa` so the IPsec-shaped UI can key
+/// off it (match by name, show "established", offer disconnect). The byte
+/// counters and hosts charon would fill are not available for OpenVPN, so they
+/// are left at their zero/empty defaults.
+fn synth_ssl_sa(s: &crate::ssl::SslStatus) -> IkeSa {
+    IkeSa {
+        name: s.name.clone(),
+        state: "ESTABLISHED".to_string(),
+        local_host: String::new(),
+        remote_host: String::new(),
+        virtual_ips: if s.ip.is_empty() { Vec::new() } else { vec![s.ip.clone()] },
+        children: vec![vpn_control::ChildSa {
+            name: s.name.clone(),
+            state: "INSTALLED".to_string(),
+            bytes_in: 0,
+            bytes_out: 0,
+            packets_in: 0,
+            packets_out: 0,
+            local_ts: if s.ip.is_empty() { Vec::new() } else { vec![format!("{}/32", s.ip)] },
+            remote_ts: Vec::new(),
+        }],
+    }
 }
