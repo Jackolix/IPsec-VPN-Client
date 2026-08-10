@@ -12,6 +12,7 @@ mod daemon;
 mod dns;
 mod overrides;
 mod portal;
+mod ssl;
 
 use backend::{AppState, ProfileEdit, ProfileSummary};
 use vpn_control::{ConnectOutcome, IkeSa};
@@ -50,9 +51,9 @@ async fn import_profile_dialog(
             // are looking for. `.pro` and `.mobileconfig` are offered so a
             // provisioning file leads to the portal sign-in, and a portal
             // profile imports directly.
-            .add_filter("VPN profile", &["ini", "scx", "tgb", "mobileconfig", "pro"])
+            .add_filter("VPN profile", &["ini", "scx", "tgb", "mobileconfig", "ovpn", "pro"])
             .add_filter("NCP profile", &["ini"])
-            .add_filter("Sophos profile", &["scx", "tgb", "mobileconfig", "pro"])
+            .add_filter("Sophos profile", &["scx", "tgb", "mobileconfig", "ovpn", "pro"])
             .set_title("Import VPN profile")
             .blocking_pick_file();
         match picked {
@@ -300,6 +301,9 @@ fn dev(args: &[String]) {
         .map(|_| "set".to_string()),
         Some("disconnect") => backend::disconnect(&state, args.get(1).cloned().unwrap_or_default())
             .map(|_| "disconnected".to_string()),
+        // Live connections across both datapaths (IPsec SAs + any SSL tunnel).
+        Some("status") => backend::status(&state)
+            .map(|sas| serde_json::to_string_pretty(&sas).expect("serialize status")),
         Some("daemon-status") => Ok(if backend::daemon_running(&state) {
             "running".to_string()
         } else {
@@ -319,6 +323,36 @@ fn dev(args: &[String]) {
             args.get(4).cloned().unwrap_or_default(),
         )
         .map(|id| format!("imported {id}")),
+        // `download-ssl <url> <username> <password> <outfile>` — sign in to the
+        // portal and write the OpenVPN `.ovpn` it serves to a file, for
+        // inspection ahead of a dedicated SSL VPN engine. The file holds a live
+        // private key: only its path is printed, never its contents.
+        Some("download-ssl") => {
+            let out = args.get(4).cloned().unwrap_or_default();
+            if out.is_empty() {
+                Err("usage: download-ssl <url> <username> <password> <outfile>".to_string())
+            } else {
+                portal::download_ssl_profile(
+                    args.get(1).map(String::as_str).unwrap_or(""),
+                    args.get(2).map(String::as_str).unwrap_or(""),
+                    args.get(3).map(String::as_str).unwrap_or(""),
+                )
+                .and_then(|ovpn| {
+                    std::fs::write(&out, ovpn).map_err(|e| format!("could not write {out}: {e}"))
+                })
+                .map(|_| format!("wrote SSL VPN profile to {out}"))
+            }
+        }
+        // `portal-services <url> <username> <password>` — print the portal's
+        // advertised, non-secret service flags (which of IPsec / SSL VPN are on,
+        // and how they authenticate). Diagnosis only; no secrets are printed.
+        Some("portal-services") => portal::services(
+            args.get(1).map(String::as_str).unwrap_or(""),
+            args.get(2).map(String::as_str).unwrap_or(""),
+            args.get(3).map(String::as_str).unwrap_or(""),
+        ),
+        Some("list") => Ok(serde_json::to_string_pretty(&backend::list_profiles(&state))
+            .expect("serialize profiles")),
         Some("profiles-dir") => Ok(backend::profiles_dir(&state)),
         Some("delete") => backend::delete_profile(&state, args.get(1).cloned().unwrap_or_default())
             .map(|_| "deleted".to_string()),
