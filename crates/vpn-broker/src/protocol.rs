@@ -33,6 +33,26 @@ pub enum Request {
     },
     /// Remove the NRPT rule previously applied for `conn`.
     RevertDns { conn: String },
+    /// Bring up an SSL VPN (OpenVPN) tunnel. The broker runs `openvpn` as
+    /// LocalSystem — which is what installs the adapter and routes the
+    /// unelevated GUI cannot — after sanitising the config. `config` is the
+    /// `.ovpn` text (which carries a private key); `username`/`password` answer
+    /// its `auth-user-pass` round. On success the response `msg` is the assigned
+    /// tunnel IP.
+    SslConnect {
+        /// The connection name the GUI keys this tunnel by (a sanitized profile
+        /// name); echoed back by [`Request::SslStatus`] so status/disconnect can
+        /// map to the right profile.
+        name: String,
+        config: String,
+        username: String,
+        password: String,
+    },
+    /// Tear down the SSL VPN tunnel, if one is up.
+    SslDisconnect,
+    /// Report the SSL VPN tunnel state. Response `msg` is a JSON object
+    /// `{"name","ip"}` when a tunnel is up, or empty when none is.
+    SslStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

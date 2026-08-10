@@ -8,7 +8,7 @@
 //! privilege boundary; keep it airtight.
 
 use crate::protocol::{Request, Response};
-use crate::{charon, ipc, nrpt};
+use crate::{charon, ipc, nrpt, openvpn};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Child;
@@ -22,16 +22,26 @@ pub struct Broker {
     /// The charon child we started (if any). `None` when charon was already
     /// running (not ours to stop) or failed to start.
     charon: Mutex<Option<Child>>,
+    /// The live SSL VPN (OpenVPN) tunnel, if one is up, with the connection name
+    /// the GUI keys it by. At most one at a time.
+    ssl: Mutex<Option<(String, openvpn::Tunnel)>>,
 }
 
 impl Broker {
     pub fn new() -> Arc<Self> {
-        Arc::new(Broker { charon: Mutex::new(None) })
+        Arc::new(Broker {
+            charon: Mutex::new(None),
+            ssl: Mutex::new(None),
+        })
     }
 
     /// Start charon (best-effort) and spawn the IPC server on a background
     /// thread. Returns once serving; the caller waits for the stop signal.
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
+        // Remove any SSL config a previous, killed broker left staged before we
+        // start serving — it would hold a live private key.
+        openvpn::sweep_stale_configs();
+
         match charon::start() {
             Ok(child) => *self.charon.lock().unwrap() = child,
             // Don't fail the whole service if charon won't come up — the GUI
@@ -70,13 +80,60 @@ impl Broker {
                 Ok(()) => Response::ok(""),
                 Err(e) => Response::err(e),
             },
+            Request::SslConnect { name, config, username, password } => {
+                // Only one SSL tunnel at a time — replace any existing one. Take
+                // it out (releasing the lock) before the up-to-45s connect, so a
+                // status query isn't blocked behind it.
+                if let Some((_, old)) = self.ssl.lock().unwrap().take() {
+                    old.disconnect();
+                }
+                match openvpn::connect(&config, &username, &password) {
+                    Ok(tunnel) => {
+                        let ip = tunnel.vpn_ip.clone().unwrap_or_default();
+                        *self.ssl.lock().unwrap() = Some((name, tunnel));
+                        Response::ok(ip)
+                    }
+                    Err(e) => Response::err(e),
+                }
+            }
+            Request::SslDisconnect => {
+                if let Some((_, tunnel)) = self.ssl.lock().unwrap().take() {
+                    tunnel.disconnect();
+                }
+                Response::ok("")
+            }
+            Request::SslStatus => {
+                let mut guard = self.ssl.lock().unwrap();
+                let up = match guard.as_mut() {
+                    Some((name, tunnel)) => {
+                        if tunnel.is_alive() {
+                            Some((name.clone(), tunnel.vpn_ip.clone().unwrap_or_default()))
+                        } else {
+                            // The process died underneath us: drop it — which
+                            // also deletes its staged config.
+                            *guard = None;
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                match up {
+                    Some((name, ip)) => Response::ok(
+                        serde_json::json!({ "name": name, "ip": ip }).to_string(),
+                    ),
+                    None => Response::ok(""),
+                }
+            }
         }
     }
 
-    /// Revert any DNS we applied and stop charon (by image name, since it
-    /// detaches — see `charon::stop`).
+    /// Revert any DNS we applied, tear down the SSL tunnel, and stop charon (by
+    /// image name, since it detaches — see `charon::stop`).
     pub fn shutdown(&self) {
         nrpt::revert_all();
+        if let Some((_, tunnel)) = self.ssl.lock().unwrap().take() {
+            tunnel.disconnect();
+        }
         let mut child = self.charon.lock().unwrap().take();
         charon::stop(child.as_mut());
     }

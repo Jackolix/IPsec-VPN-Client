@@ -432,6 +432,27 @@
   </div>
 </div>
 
+<!-- Portal sign-in: a .pro names a user portal; sign in and the profile it
+     serves is downloaded and imported. -->
+<div class="overlay" id="portal-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="portal-title">
+    <h3 id="portal-title" class="mono">Sign in to the VPN portal</h3>
+    <div class="mbody">
+      <div id="portal-why"></div>
+      <div class="field wide" style="margin-top:12px">
+        <label for="portal-user">Portal username</label>
+        <input id="portal-user" type="text" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field wide">
+        <label for="portal-pass">Portal password</label>
+        <input id="portal-pass" type="password" autocomplete="off" />
+      </div>
+      <div class="hint" id="portal-err" style="color:var(--bad);margin-top:8px"></div>
+    </div>
+    <div class="mfoot"><button class="btn btn-ghost" id="portal-cancel">Cancel</button><button class="btn btn-primary" id="portal-ok">Sign in and download</button></div>
+  </div>
+</div>
+
 <!-- Edit parameters. The imported .ini stays untouched: what's saved here is the
      set of fields that differ from it, replayed on top every time it's loaded. -->
 <div class="overlay" id="edit-overlay">
@@ -1003,6 +1024,41 @@
     });
   }
 
+  function askPortalLogin(target) {
+    return new Promise(function (resolve) {
+      var overlay = $("portal-overlay"), user = $("portal-user"), pass = $("portal-pass"), err = $("portal-err");
+      $("portal-why").innerHTML = "This provisioning file points at a user portal. Sign in to <b>" +
+        esc(target.url) + "</b> and the IPsec profile will be downloaded and imported.";
+      user.value = ""; pass.value = ""; err.textContent = "";
+      if (target.otp) {
+        err.textContent = "This portal requires a one-time code as well, which isn't supported yet.";
+      }
+      function close(result) {
+        overlay.classList.remove("show");
+        document.removeEventListener("keydown", onKey);
+        $("portal-ok").removeEventListener("click", onOk);
+        $("portal-cancel").removeEventListener("click", onCancel);
+        pass.value = "";   // don't leave the password in the DOM
+        resolve(result);
+      }
+      function onOk() {
+        if (!user.value.trim()) { err.textContent = "Enter your portal username."; user.focus(); return; }
+        if (!pass.value) { err.textContent = "Enter your portal password."; pass.focus(); return; }
+        close({ username: user.value.trim(), password: pass.value });
+      }
+      function onCancel() { close(null); }
+      function onKey(e) {
+        if (e.key === "Escape") { onCancel(); }
+        if (e.key === "Enter" && overlay.classList.contains("show")) { onOk(); }
+      }
+      $("portal-ok").addEventListener("click", onOk);
+      $("portal-cancel").addEventListener("click", onCancel);
+      document.addEventListener("keydown", onKey);
+      overlay.classList.add("show");
+      user.focus();
+    });
+  }
+
   async function onForgetUserLogin() {
     var p = current;
     try {
@@ -1446,12 +1502,23 @@
   async function onImport() {
     if (!TAURI) { $("overlay").classList.add("show"); return; }
     try {
-      var id = await TAURI.invoke("import_profile_dialog");
-      if (!id) { return; }                 // cancelled
+      var outcome = await TAURI.invoke("import_profile_dialog");
+      if (!outcome) { return; }             // cancelled the file picker
+      var id;
+      if (outcome.kind === "provisioning") {
+        var login = await askPortalLogin(outcome);
+        if (!login) { return; }             // cancelled the sign-in
+        showNotice('<span class="led" style="box-shadow:none"></span><div>Signing in to the portal and downloading…</div>', "");
+        id = await TAURI.invoke("import_from_portal", {
+          portalUrl: outcome.url, username: login.username, password: login.password, name: outcome.name
+        });
+      } else {
+        id = outcome.id;
+      }
       await refresh();
       var p = profiles.filter(function (x) { return x.id === id; })[0];
       if (p) { current = p; renderAll(); }
-      showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported <b>' + esc(id) + "</b>.</div>", "");
+      showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported <b>' + esc(id) + "</b>. Add the networks you need to reach in its settings before connecting.</div>", "");
     } catch (e) {
       showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
     }
@@ -1615,6 +1682,31 @@
         }
         showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported ' + ids.length + ' profile' + (ids.length === 1 ? "" : "s") + ".</div>", "");
       });
+    });
+    // A drop that imported nothing reports why here, instead of looking dead.
+    EVT.listen("import-error", function (e) {
+      $("dropzone").classList.remove("show");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String((e && e.payload) || "that file could not be imported")) + "</div>", "bad");
+    });
+    // A dropped .pro can't open a modal from the Rust side, so it arrives here.
+    EVT.listen("provisioning-dropped", async function (e) {
+      $("dropzone").classList.remove("show");
+      var target = e && e.payload;
+      if (!target) { return; }
+      try {
+        var login = await askPortalLogin(target);
+        if (!login) { return; }
+        showNotice('<span class="led" style="box-shadow:none"></span><div>Signing in to the portal and downloading…</div>', "");
+        var id = await TAURI.invoke("import_from_portal", {
+          portalUrl: target.url, username: login.username, password: login.password, name: target.name
+        });
+        await refresh();
+        var p = profiles.filter(function (x) { return x.id === id; })[0];
+        if (p) { current = p; renderAll(); }
+        showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported <b>' + esc(id) + "</b>. Add the networks you need to reach in its settings before connecting.</div>", "");
+      } catch (err) {
+        showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(err)) + "</div>", "bad");
+      }
     });
   }
 
