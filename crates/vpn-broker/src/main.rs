@@ -2,6 +2,8 @@
 //!   * `run`      — service entry point (what the SCM launches; also the default)
 //!   * `console`  — run the supervisor in the foreground for debugging
 //!   * `install`  / `uninstall` — register/remove the Windows service (elevated)
+//!   * `stop`     — stop the service without removing it (elevated; used by the
+//!                  installer's upgrade hook to release the locked binaries)
 //!   * `ping`     — client-side liveness check against the broker pipe
 //!
 //! Everything real is Windows-only; on other platforms this is a stub so the
@@ -45,6 +47,10 @@ fn run_windows(cmd: Option<&str>, args: &[String]) -> i32 {
     match cmd {
         Some("install") => report(install::install()),
         Some("uninstall") => report(install::uninstall()),
+        // Stop the running service (without removing it) so an upgrade can
+        // overwrite the locked binaries; the installer's pre-install hook uses
+        // this, and post-install `install` starts it again.
+        Some("stop") => report(install::stop()),
         Some("console") => {
             let broker = supervisor::Broker::new();
             if let Err(e) = broker.start() {

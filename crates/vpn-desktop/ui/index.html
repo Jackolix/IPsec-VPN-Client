@@ -95,6 +95,12 @@
   .detail-head .title h1 { margin: 0; font-family: var(--mono); font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.01em; text-wrap: balance; }
   .gw-line { display: flex; align-items: center; gap: 8px; margin-top: 5px; color: var(--muted); font-family: var(--mono); font-size: var(--fs-sm); }
   .gw-line .arrow { color: var(--faint); }
+  /* Datapath type label: IPsec (charon) vs SSL VPN (OpenVPN). */
+  .detail-head .title .name-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .kind-tag { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; flex: 0 0 auto; }
+  .kind-tag.ipsec { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+  .kind-tag.ssl { color: #b892f6; border-color: rgba(184,146,246,.42); background: rgba(184,146,246,.14); }
+  .profile-kind { margin-left: auto; font-family: var(--mono); font-size: 8.5px; letter-spacing: .08em; text-transform: uppercase; padding: 1px 5px; border-radius: 4px; border: 1px solid rgba(184,146,246,.4); color: #b892f6; flex: 0 0 auto; }
   .detail-head .spacer { flex: 1; }
   .status-pill { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 6px 13px; background: rgba(0,0,0,.2); white-space: nowrap; }
   .status-pill.established { color: var(--ok); border-color: rgba(70,194,102,.42); background: var(--ok-soft); }
@@ -313,8 +319,8 @@
       <div class="main-scroll">
         <div class="detail-head">
           <div class="title">
-            <h1 id="d-name" class="mono">—</h1>
-            <div class="gw-line"><span id="d-localid">—</span><span class="arrow">→</span><span id="d-gw">—</span></div>
+            <div class="name-row"><h1 id="d-name" class="mono">—</h1><span id="d-kind" class="kind-tag"></span></div>
+            <div class="gw-line"><span id="d-localid">—</span><span id="d-arrow" class="arrow">→</span><span id="d-gw">—</span></div>
           </div>
           <div class="spacer"></div>
           <div style="display:flex; align-items:center; gap:12px;">
@@ -341,7 +347,7 @@
         </div>
 
         <div class="console">
-          <div class="console-head"><span>charon log</span><span class="spacer"></span><button id="clear-log">Clear</button></div>
+          <div class="console-head"><span id="log-title">charon log</span><span class="spacer"></span><button id="clear-log">Clear</button></div>
           <div class="log" id="log" role="log" aria-live="polite"><div class="log-empty">No events yet — connect to begin the IKE_SA handshake.</div></div>
         </div>
       </div>
@@ -581,6 +587,7 @@
   function mapSummary(s) {
     return {
       id: s.id, name: s.name, gateway: s.gateway,
+      kind: s.kind === "ssl" ? "ssl" : "ipsec",
       localId: s.local_id || "—",
       remote: (s.remote && s.remote.length) ? s.remote.join(", ") : "—",
       vip: "—",
@@ -647,7 +654,9 @@
       var st = state[p.id];
       var led = st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
       b.innerHTML = '<div class="profile-top"><span class="' + led + '"></span>' +
-        '<span class="profile-name"></span></div>' +
+        '<span class="profile-name"></span>' +
+        (p.kind === "ssl" ? '<span class="profile-kind">SSL</span>' : '') +
+        '</div>' +
         '<div class="profile-gw"></div>';
       b.querySelector(".profile-name").textContent = p.name;
       b.querySelector(".profile-gw").textContent = p.gateway;
@@ -666,16 +675,29 @@
     var p = current;
     var n = (p.edits || []).length;
     $("sec-badge").textContent = n ? n + (n === 1 ? " field edited" : " fields edited") : "";
-    var rows = [
-      ["IKE proposal", esc(p.ike) + (p.ikeVersion ? ' <span class="badge">IKEv' + esc(p.ikeVersion) + "</span>" : "")],
-      ["ESP proposal", esc(p.esp)],
-      ["PFS group", p.pfs ? esc(p.pfs) : "none"],
-      // The PSK is only half the story once the gateway also wants a login.
-      ["Auth", '<span class="redacted">psk ••••••••••••</span>' +
-        (p.userAuth ? ' <span class="badge">+ ' + esc(p.userAuth) + "</span>" : "")],
-      ["Local ID", esc(p.localId)],
-      ["Remote subnet", esc(p.remote)]
-    ];
+    var rows;
+    if (p.kind === "ssl") {
+      // OpenVPN carries none of the IKE/ESP/PSK knobs — the gateway settles the
+      // cipher, routes and DNS at connect, so show what actually describes it.
+      rows = [
+        ["Protocol", esc(p.ike)],
+        ["Data cipher", esc(p.esp)],
+        ["Auth", "certificate" +
+          (p.userAuth ? ' <span class="badge">+ ' + esc(p.userAuth) + "</span>" : "")],
+        ["Routing", "pushed by the gateway on connect"]
+      ];
+    } else {
+      rows = [
+        ["IKE proposal", esc(p.ike) + (p.ikeVersion ? ' <span class="badge">IKEv' + esc(p.ikeVersion) + "</span>" : "")],
+        ["ESP proposal", esc(p.esp)],
+        ["PFS group", p.pfs ? esc(p.pfs) : "none"],
+        // The PSK is only half the story once the gateway also wants a login.
+        ["Auth", '<span class="redacted">psk ••••••••••••</span>' +
+          (p.userAuth ? ' <span class="badge">+ ' + esc(p.userAuth) + "</span>" : "")],
+        ["Local ID", esc(p.localId)],
+        ["Remote subnet", esc(p.remote)]
+      ];
+    }
     if (p.format) {
       rows.push(["Source", esc(p.format) + (p.file ? ' <span class="badge">' + esc(p.file) + "</span>" : "")]);
     }
@@ -907,7 +929,20 @@
   function renderAll() {
     if (!current) { return; }
     $("d-name").textContent = current.name;
-    $("d-localid").textContent = current.localId;
+    var kind = current.kind === "ssl" ? "ssl" : "ipsec";
+    var kt = $("d-kind");
+    kt.textContent = kind === "ssl" ? "SSL VPN" : "IPsec";
+    kt.className = "kind-tag " + kind;
+    $("log-title").textContent = kind === "ssl" ? "openvpn log" : "charon log";
+    // An SSL VPN profile has no local IKE identity — show just the gateway.
+    if (kind === "ssl") {
+      $("d-localid").style.display = "none";
+      $("d-arrow").style.display = "none";
+    } else {
+      $("d-localid").style.display = "";
+      $("d-arrow").style.display = "";
+      $("d-localid").textContent = current.localId;
+    }
     $("d-gw").textContent = current.gateway;
     hideNotice();
     renderList(); renderSecurity(); renderWarns(); setPill(); setAction(); renderTiles(); renderCreds();
@@ -918,6 +953,13 @@
     var bar = $("creds-bar");
     if (!TAURI) { bar.className = "creds-bar"; bar.innerHTML = ""; return; }
     var p = current;
+    // SSL VPN authenticates with a certificate (in the .ovpn) plus the login
+    // below — there is no PSK, so skip the PSK bar entirely.
+    if (p.kind === "ssl") {
+      bar.className = "creds-bar"; bar.innerHTML = "";
+      renderLoginBar();
+      return;
+    }
     bar.className = "creds-bar show" + (p.stored ? " on" : "");
     if (p.stored) {
       bar.innerHTML = '<span class="ci"><span class="led ok" style="box-shadow:none"></span>PSK saved in ' + esc(KEYSTORE) + '</span>' +
