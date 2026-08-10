@@ -8,9 +8,11 @@
 //! process per tunnel rather than a single long-lived daemon.
 //!
 //! We talk to it over OpenVPN's management interface (a loopback TCP socket),
-//! which is to OpenVPN what vici is to charon: it delivers the `auth-user-pass`
-//! prompt so the password never touches a file or the command line, reports the
-//! connection state machine, and carries the disconnect signal.
+//! which is to OpenVPN what vici is to charon: it releases the start-up hold,
+//! reports the connection state machine, and carries the disconnect signal. The
+//! login itself is supplied through a transient `--auth-user-pass` file rather
+//! than over the socket — OpenVPN 2.6's management password query stalls before
+//! it dials the gateway, whereas the file path is reliable across versions.
 //!
 //! SECURITY: the broker runs as LocalSystem, and an `.ovpn` is *code* — OpenVPN
 //! directives like `up`, `down`, `plugin` and `tls-verify` name programs it will
@@ -18,15 +20,15 @@
 //! both here: [`sanitize`] refuses a config that carries such a directive, and
 //! the process is launched with `--script-security 1` (no user scripts) placed
 //! *after* `--config` so it overrides anything the file tried to set. The config
-//! also holds a live private key: it is written to a transient file that is
-//! deleted the moment the tunnel stops (and again on drop).
+//! holds a live private key and the auth file holds the password: both are
+//! written to transient files deleted the moment the tunnel stops (and on drop,
+//! and swept at broker startup after a crash).
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Overall budget for reaching CONNECTED: TLS, `auth-user-pass`, the server's
@@ -38,6 +40,10 @@ const MGMT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_GRACE: Duration = Duration::from_secs(4);
 /// How many of openvpn's own `>LOG:` lines to keep for diagnosing a failure.
 const LOG_RING: usize = 40;
+/// The wintun adapter openvpn uses. Named distinctly so it never collides with
+/// charon's own wintun device ("strongSwan Tunnel"); pre-created via tapctl
+/// because openvpn reuses an existing adapter rather than making one.
+const ADAPTER_NAME: &str = "OpenVPN Data Channel";
 
 /// A live (or connecting) OpenVPN tunnel. Dropping it tears the tunnel down and
 /// deletes the on-disk config, so a lost handle never leaks a running process or
@@ -47,6 +53,8 @@ pub struct Tunnel {
     /// Write half of the management socket, for sending `signal SIGTERM`.
     mgmt: TcpStream,
     config_path: PathBuf,
+    /// The `--auth-user-pass` file (username/password). Deleted with the config.
+    auth_path: PathBuf,
     /// The virtual IP the gateway assigned, from the CONNECTED state line.
     pub vpn_ip: Option<String>,
 }
@@ -85,8 +93,10 @@ impl Tunnel {
                 }
             }
         }
-        // The config carries a live private key — don't leave it on disk.
+        // The config carries a live private key and the auth file the password —
+        // don't leave either on disk.
         let _ = std::fs::remove_file(&self.config_path);
+        let _ = std::fs::remove_file(&self.auth_path);
     }
 }
 
@@ -110,7 +120,7 @@ pub fn sweep_stale_configs() {
         let is_staged = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.starts_with("sslvpn-") && n.ends_with(".ovpn"))
+            .map(|n| n.starts_with("sslvpn-") && (n.ends_with(".ovpn") || n.ends_with(".auth")))
             .unwrap_or(false);
         if is_staged {
             let _ = std::fs::remove_file(&path);
@@ -118,22 +128,35 @@ pub fn sweep_stale_configs() {
     }
 }
 
-/// Bring up an SSL VPN tunnel from an `.ovpn` config, answering its
-/// `auth-user-pass` prompt with `username`/`password`. Returns once openvpn
-/// reports CONNECTED, or an error that carries no secret and is safe to show.
+/// Bring up an SSL VPN tunnel from an `.ovpn` config, supplying `username`/
+/// `password` for its `auth-user-pass` round via a transient file. Returns once
+/// openvpn reports CONNECTED, or an error that carries no secret and is safe to
+/// show.
 pub fn connect(config: &str, username: &str, password: &str) -> Result<Tunnel, String> {
     sanitize(config)?;
 
     let exe = openvpn_exe()?;
+    ensure_adapter(&exe)?;
     let dir = work_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     let port = free_port()?;
     let config_path = dir.join(format!("sslvpn-{}.ovpn", port));
     std::fs::write(&config_path, config)
         .map_err(|e| format!("could not stage the SSL VPN config: {e}"))?;
-    // Guard against leaking the key file if we bail before building a Tunnel
-    // (which would otherwise own the cleanup).
-    let guard = FileGuard(config_path.clone());
+
+    // Feed the credentials through an `--auth-user-pass` file rather than over
+    // the management interface: OpenVPN 2.6's management password query stalls
+    // before it even dials the gateway, whereas the file path is reliable across
+    // versions. The file (username on line 1, password on line 2) is as
+    // sensitive as the private key already beside it, and shares its lifecycle —
+    // deleted on teardown, on drop, and swept at startup.
+    let auth_path = dir.join(format!("sslvpn-{}.auth", port));
+    std::fs::write(&auth_path, format!("{}\n{}\n", username, password))
+        .map_err(|e| format!("could not stage the SSL VPN credentials: {e}"))?;
+
+    // Guard against leaking either secret-bearing file if we bail before building
+    // a Tunnel (which would otherwise own the cleanup).
+    let guard = FileGuard(vec![config_path.clone(), auth_path.clone()]);
 
     let log_path = dir.join(format!("openvpn-{}.log", port));
     // One file, two handles (stdout+stderr) — created once so the second doesn't
@@ -148,83 +171,112 @@ pub fn connect(config: &str, username: &str, password: &str) -> Result<Tunnel, S
 
     // `--config` first, then the hardening flags, so they override anything the
     // file set. `--management-hold` starts openvpn paused so we can enable state
-    // reporting and be ready for the password prompt before it proceeds;
-    // `--management-query-passwords` delivers `auth-user-pass` over the socket
-    // instead of prompting on a console the service does not have.
-    let mut child = Command::new(&exe)
-        .arg("--config")
+    // reporting before it proceeds; `--auth-user-pass <file>` supplies the login.
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--config")
         .arg(&config_path)
         .args(["--script-security", "1"])
+        // Use the wintun adapter we ship (the DLL sits beside openvpn.exe),
+        // rather than requiring a TAP driver install. Layer-3, self-contained,
+        // same driver charon uses. `--windows-driver` after `--config` overrides
+        // anything the profile set.
+        .args(["--windows-driver", "wintun"])
+        // A distinctly named adapter so openvpn creates its own rather than
+        // grabbing charon's wintun device (both use wintun; without this openvpn
+        // finds charon's "strongSwan Tunnel" adapter and reports it "in use").
+        .arg("--dev-node")
+        .arg(ADAPTER_NAME)
+        .arg("--auth-user-pass")
+        .arg(&auth_path)
         .args(["--management", "127.0.0.1", &port.to_string()])
         .arg("--management-hold")
-        .arg("--management-query-passwords")
-        .arg("--auth-nocache")
         .args(["--auth-retry", "none"])
         .args(["--verb", "3"])
         .current_dir(&dir)
         .stdout(stdout)
-        .stderr(stderr)
+        .stderr(stderr);
+    // Point OpenSSL 3 at the bundled provider modules (the legacy provider ships
+    // there) so a gateway still on an older cipher can be negotiated. Harmless
+    // when unused. Only the bundled layout has this directory.
+    if let Some(exe_dir) = exe.parent() {
+        let modules = exe_dir.join("ssl").join("modules");
+        if modules.is_dir() {
+            cmd.env("OPENSSL_MODULES", &modules);
+        }
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to launch openvpn: {e}"))?;
 
     let stream = match connect_mgmt(port, &mut child) {
         Ok(s) => s,
         Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child(&mut child, None);
             return Err(with_log(e, &log_path));
         }
     };
+    // A cleanup handle to the management socket, so a failed connect can stop
+    // openvpn *gracefully* — a hard kill leaves its wintun adapter registered,
+    // and the leaked adapters then block the next attempt.
+    let cleanup = stream.try_clone().ok();
 
-    match drive(&mut child, stream, username, password) {
+    match drive(&mut child, stream) {
         Ok((vpn_ip, mgmt)) => {
             guard.disarm();
-            Ok(Tunnel { child, mgmt, config_path, vpn_ip })
+            Ok(Tunnel { child, mgmt, config_path, auth_path, vpn_ip })
         }
         Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child(&mut child, cleanup);
             Err(with_log(e, &log_path))
         }
     }
 }
 
-/// Enable state reporting, release the hold, answer the credential prompt, and
-/// wait for CONNECTED. On success returns the assigned IP and the write half of
-/// the management socket (kept for the eventual disconnect).
+/// Stop an openvpn child, gracefully if we still have its management socket
+/// (SIGTERM lets it remove its wintun adapter), then kill and reap as a backstop.
+fn stop_child(child: &mut Child, mgmt: Option<TcpStream>) {
+    if let Some(mut w) = mgmt {
+        let _ = w.write_all(b"signal SIGTERM\n");
+        let _ = w.flush();
+        let deadline = Instant::now() + STOP_GRACE;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Enable state reporting, release the hold, and wait for CONNECTED (the login
+/// comes from the `--auth-user-pass` file). On success returns the assigned IP
+/// and the write half of the management socket (kept for the eventual
+/// disconnect).
 fn drive(
     child: &mut Child,
-    stream: TcpStream,
-    username: &str,
-    password: &str,
+    mut stream: TcpStream,
 ) -> Result<(Option<String>, TcpStream), String> {
-    let mut writer = stream.try_clone().map_err(|e| format!("management socket error: {e}"))?;
-
-    // A reader thread turns the socket into a line stream we can select on with a
-    // timeout, so the main loop can also watch the deadline and the child.
-    let (tx, rx) = mpsc::channel::<String>();
-    let reader = stream;
-    std::thread::spawn(move || {
-        for line in BufReader::new(reader).lines() {
-            match line {
-                Ok(l) => {
-                    if tx.send(l).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Turn on state reporting. The hold is *not* released here: sending "hold
-    // release" before openvpn has registered the hold is a no-op and the tunnel
-    // then sits paused forever. Instead we release in response to openvpn's own
-    // ">HOLD:" notification below, which it (re)emits whenever it is waiting.
-    send(&mut writer, "state on")?;
+    // Single-threaded read+write on the one socket, polling with a short read
+    // timeout. A background reader thread with a cloned writer looked equivalent
+    // but did not work: openvpn accepted `state on`/`log on` yet never saw the
+    // following `hold release` (no SUCCESS, no progress) and stayed paused. Doing
+    // it the way the interface expects — one owner, read then write — is
+    // reliable, matching a hand-driven session.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .map_err(|e| format!("management socket error: {e}"))?;
 
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     let mut recent: VecDeque<String> = VecDeque::with_capacity(LOG_RING);
+    let mut rbuf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    // The setup commands are sent only *after* openvpn's first line: it opens the
+    // management port a moment before it is ready to parse commands, and anything
+    // sent into that gap (notably "hold release") is silently dropped, leaving it
+    // paused. Its banner is the "ready" signal.
+    let mut setup_sent = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -238,64 +290,89 @@ fn drive(
             return Err(format!("openvpn exited ({status}){}", tail(&recent)));
         }
 
-        let line = match rx.recv_timeout(Duration::from_millis(400)) {
-            Ok(l) => l,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+        // Consume every complete line currently buffered.
+        while let Some(pos) = rbuf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = rbuf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw).trim_end().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            // Keep every management line (not just `>LOG:`) so a failed connect
+            // shows the real dialogue.
+            push_recent(&mut recent, &line);
+
+            // A state notification may arrive raw (`>STATE:…`, from `state on`) or
+            // wrapped in a log echo (`>LOG:…,MANAGEMENT: >STATE:…`, from `log on`);
+            // match it wherever it appears so detection never hinges on which one
+            // openvpn sent.
+            if let Some(idx) = line.find(">STATE:") {
+                // >STATE:<time>,<state>,<detail>,<local/vpn ip>,<remote ip>,...
+                let fields: Vec<&str> = line[idx + ">STATE:".len()..].split(',').collect();
+                match fields.get(1).copied().unwrap_or("") {
+                    "CONNECTED" => {
+                        let vpn_ip = fields
+                            .get(3)
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        return Ok((vpn_ip, stream));
+                    }
+                    "EXITING" => {
+                        let reason = fields.get(2).copied().unwrap_or("");
+                        return Err(exit_reason(reason, &recent));
+                    }
+                    _ => {}
+                }
+            } else if setup_sent && line.starts_with(">HOLD:") {
+                // A reconnect re-entered hold — let it proceed again.
+                send(&mut stream, "hold release")?;
+            } else if line.strip_prefix(">PASSWORD:").is_some_and(|r| r.contains("Verification Failed"))
+            {
+                return Err("the gateway rejected the username or password".to_string());
+            } else if let Some(rest) = line.strip_prefix(">FATAL:") {
+                return Err(format!("openvpn could not start: {}{}", rest.trim(), tail(&recent)));
+            }
+        }
+
+        // openvpn has spoken and is ready: enable state + real-time log reporting
+        // and release the start-up hold, once.
+        if !setup_sent && !recent.is_empty() {
+            send(&mut stream, "state on")?;
+            send(&mut stream, "log on")?;
+            send(&mut stream, "hold release")?;
+            setup_sent = true;
+        }
+
+        // Read more, tolerating the poll timeout.
+        match stream.read(&mut chunk) {
+            Ok(0) => {
                 return Err(format!("openvpn closed its management interface{}", tail(&recent)))
             }
-        };
-
-        if line.starts_with(">HOLD:") {
-            // openvpn is paused waiting for us — let it proceed. Re-emitted on
-            // every hold, so this also covers a reconnect that re-enters hold.
-            send(&mut writer, "hold release")?;
-        } else if let Some(rest) = line.strip_prefix(">PASSWORD:") {
-            if rest.starts_with("Need 'Auth'") {
-                // Answer the username/password round. Values are quoted and
-                // backslash-escaped as the management parser expects.
-                send(&mut writer, &format!("username \"Auth\" {}", escape(username)))?;
-                send(&mut writer, &format!("password \"Auth\" {}", escape(password)))?;
-            } else if rest.starts_with("Verification Failed: 'Auth'") {
-                return Err("the gateway rejected the username or password".to_string());
-            } else if rest.starts_with("Need ") {
-                // Some other secret we cannot supply — most likely the private
-                // key is passphrase-protected, which the portal profile is not
-                // expected to be.
-                let what = rest.split('\'').nth(1).unwrap_or("a credential");
-                return Err(format!(
-                    "the SSL VPN profile needs {what}, which this client cannot supply"
-                ));
-            }
-        } else if let Some(rest) = line.strip_prefix(">STATE:") {
-            // >STATE:<time>,<state>,<detail>,<local/vpn ip>,<remote ip>,...
-            let fields: Vec<&str> = rest.split(',').collect();
-            match fields.get(1).copied().unwrap_or("") {
-                "CONNECTED" => {
-                    let vpn_ip = fields
-                        .get(3)
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string);
-                    return Ok((vpn_ip, writer));
-                }
-                "EXITING" => {
-                    let reason = fields.get(2).copied().unwrap_or("");
-                    return Err(exit_reason(reason, &recent));
-                }
-                _ => {}
-            }
-        } else if let Some(rest) = line.strip_prefix(">FATAL:") {
-            return Err(format!("openvpn could not start: {}{}", rest.trim(), tail(&recent)));
-        } else if let Some(rest) = line.strip_prefix(">LOG:") {
-            if recent.len() == LOG_RING {
-                recent.pop_front();
-            }
-            // >LOG:<time>,<flags>,<message> — keep just the message.
-            let msg = rest.splitn(3, ',').nth(2).unwrap_or(rest);
-            recent.push_back(msg.trim().to_string());
+            Ok(n) => rbuf.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(format!("management read failed: {e}{}", tail(&recent))),
         }
     }
+}
+
+/// Append a management line to the bounded diagnostic ring, trimming the noisy
+/// `>LOG:<time>,<flags>,` prefix down to the message.
+fn push_recent(recent: &mut VecDeque<String>, line: &str) {
+    let shown = match line.strip_prefix(">LOG:") {
+        Some(rest) => rest.splitn(3, ',').nth(2).unwrap_or(rest).trim(),
+        None => line.trim(),
+    };
+    if shown.is_empty() {
+        return;
+    }
+    if recent.len() == LOG_RING {
+        recent.pop_front();
+    }
+    recent.push_back(shown.to_string());
 }
 
 /// Turn an EXITING detail into an actionable message.
@@ -336,21 +413,6 @@ fn send(w: &mut TcpStream, cmd: &str) -> Result<(), String> {
         .and_then(|_| w.write_all(b"\n"))
         .and_then(|_| w.flush())
         .map_err(|e| format!("management socket write failed: {e}"))
-}
-
-/// Escape a value for a quoted management-interface argument: the parser honours
-/// backslash escapes for `\` and `"` inside the quotes.
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        if c == '\\' || c == '"' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
 }
 
 /// Directives that make OpenVPN run a program or read a path as the (SYSTEM)
@@ -425,16 +487,60 @@ fn openvpn_exe() -> Result<PathBuf, String> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            // Bundled beside the broker (production layout).
             candidates.push(dir.join("openvpn").join(EXE));
             candidates.push(dir.join(EXE));
+            // Dev: target/debug/vpn-broker.exe -> repo/out/openvpn (mirrors the
+            // charon dev fallback), populated by scripts/fetch-openvpn-windows.ps1.
+            candidates.push(dir.join("../../out/openvpn").join(EXE));
         }
     }
-    // Dev fallback only; a shipped build bundles its own openvpn.
+    // Last-resort dev fallback; a shipped build always bundles its own openvpn.
     candidates.push(PathBuf::from(r"C:\Program Files (x86)\Sophos\Connect\openvpn.exe"));
 
     candidates.into_iter().find(|p| p.is_file()).ok_or_else(|| {
         "openvpn.exe not found (bundle it beside the broker or set VPN_OPENVPN_EXE)".to_string()
     })
+}
+
+/// Make sure the dedicated wintun adapter openvpn will use exists, creating it
+/// with `tapctl` if not. openvpn reuses an existing wintun adapter rather than
+/// creating one, and would otherwise grab charon's; a distinctly named,
+/// pre-created adapter keeps the two datapaths from colliding. Persistent, so
+/// this is a no-op on every connect after the first.
+///
+/// `tapctl` ships beside openvpn in the bundle. If it is absent (the dev
+/// fallback to Sophos Connect's openvpn has none), this is skipped and openvpn
+/// falls back to whatever adapter is available.
+fn ensure_adapter(openvpn_exe: &Path) -> Result<(), String> {
+    let Some(tapctl) = openvpn_exe.parent().map(|d| d.join("tapctl.exe")).filter(|p| p.is_file())
+    else {
+        return Ok(());
+    };
+
+    let listing = Command::new(&tapctl)
+        .arg("list")
+        .output()
+        .map_err(|e| format!("could not run tapctl: {e}"))?;
+    // `tapctl list` prints "<guid>\t<name>" per adapter.
+    if String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .any(|l| l.contains(ADAPTER_NAME))
+    {
+        return Ok(());
+    }
+
+    let created = Command::new(&tapctl)
+        .args(["create", "--name", ADAPTER_NAME, "--hwid", "wintun"])
+        .output()
+        .map_err(|e| format!("could not create the wintun adapter: {e}"))?;
+    if !created.status.success() {
+        return Err(format!(
+            "could not create the '{ADAPTER_NAME}' wintun adapter: {}",
+            String::from_utf8_lossy(&created.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /// A free loopback TCP port for the management interface. Bind to port 0, read
@@ -478,10 +584,10 @@ fn tail(recent: &VecDeque<String>) -> String {
     format!(" ({})", lines.join(" | "))
 }
 
-/// Deletes a path on drop unless disarmed — so an early return can't leave the
-/// private-key config on disk, while the success path hands ownership to the
-/// [`Tunnel`].
-struct FileGuard(PathBuf);
+/// Deletes its paths on drop unless disarmed — so an early return can't leave
+/// the private-key config or the credentials file on disk, while the success
+/// path hands ownership to the [`Tunnel`].
+struct FileGuard(Vec<PathBuf>);
 impl FileGuard {
     fn disarm(self) {
         std::mem::forget(self);
@@ -489,20 +595,15 @@ impl FileGuard {
 }
 impl Drop for FileGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        for p in &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn escapes_quotes_and_backslashes() {
-        assert_eq!(escape("simple"), "\"simple\"");
-        assert_eq!(escape(r#"a"b"#), r#""a\"b""#);
-        assert_eq!(escape(r"a\b"), r#""a\\b""#);
-    }
 
     #[test]
     fn sanitize_accepts_a_normal_sophos_ovpn() {
