@@ -4,7 +4,9 @@
     "resources": {
       "../../out/strongswan-windows/*": "charon/",
       "../../out/strongswan-windows/etc/*": "charon/etc/",
-      "../../out/broker/*": "./"
+      "../../out/broker/*": "./",
+      "../../out/openvpn/*": "openvpn/",
+      "../../out/openvpn/ssl/modules/*": "openvpn/ssl/modules/"
     },
     "windows": {
       "nsis": {

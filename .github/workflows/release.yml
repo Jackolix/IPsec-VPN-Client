@@ -101,6 +101,18 @@ jobs:
           $missing = $required | Where-Object { -not (Test-Path "out\strongswan-windows\$_") }
           if ($missing) { throw "daemon artifacts missing: $($missing -join ', ')" }
 
+      # Vendor OpenVPN for the SSL VPN datapath into out\openvpn (openvpn.exe +
+      # tapctl + DLLs + the legacy provider), reusing the strongSwan build's
+      # wintun.dll. Bundled beside the broker as openvpn\ (see
+      # tauri.windows.conf.json). Must run before any build of vpn-desktop,
+      # whose build.rs validates the "../../out/openvpn/*" resource glob resolves
+      # — so before the broker build, the tests, and the tauri build below.
+      - name: Vendor the bundled OpenVPN
+        shell: pwsh
+        run: |
+          .\scripts\fetch-openvpn-windows.ps1
+          Get-ChildItem -Recurse out\openvpn
+
       # vpn-desktop's build.rs (tauri_build::build()) validates that the
       # "../../out/broker/*" resource glob in tauri.windows.conf.json
       # resolves to real files, so out/broker must exist before *any* build
