@@ -50,6 +50,41 @@ pub fn install() -> Result<(), String> {
     Ok(())
 }
 
+/// Stop the service and wait for it to actually reach Stopped, without removing
+/// it. Used by the installer's pre-install hook: an upgrade has to overwrite
+/// `vpn-broker.exe` (and the charon files), which the running service holds a
+/// lock on, so it must be stopped first — but the service definition is kept, so
+/// the post-install `install` just starts it again against the new binary.
+///
+/// A missing service (fresh install) is success — there is nothing to stop.
+pub fn stop() -> Result<(), String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| format!("open SCM: {e}"))?;
+    let service = match manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(svc) => svc,
+        Err(_) => return Ok(()),
+    };
+
+    // Ask it to stop and wait so its shutdown (DNS revert, charon kill, SSL
+    // teardown) runs and the file locks are released before the installer copies.
+    if let Ok(status) = service.query_status() {
+        if status.current_state != ServiceState::Stopped {
+            let _ = service.stop();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                match service.query_status() {
+                    Ok(s) if s.current_state == ServiceState::Stopped => break,
+                    _ => std::thread::sleep(Duration::from_millis(300)),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn uninstall() -> Result<(), String> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .map_err(|e| format!("open SCM: {e}"))?;
