@@ -12,6 +12,24 @@
 ; Uninstalling removes the service again. The MSI registers the same service
 ; from a WiX fragment (installer.wxs).
 
+!macro NSIS_HOOK_PREINSTALL
+  ; On an upgrade the previous broker service is still running, and it holds a
+  ; lock on vpn-broker.exe (and the charon binaries it supervises) — so writing
+  ; the new files fails with "file in use". Stop it first; its own shutdown
+  ; reverts DNS and stops charon, releasing the locks. The service definition is
+  ; left in place, so POSTINSTALL's "install" simply starts it again against the
+  ; freshly written binary. A fresh install has no vpn-broker.exe here yet — the
+  ; guard skips it, so this is a no-op the first time.
+  ${If} ${FileExists} "$INSTDIR\vpn-broker.exe"
+    DetailPrint "Stopping the running VPN broker service before upgrade..."
+    nsExec::ExecToLog '"$INSTDIR\vpn-broker.exe" stop'
+    Pop $0
+    DetailPrint "vpn-broker stop exit code: $0"
+    ; Give Windows a moment to release the image handles after the process exits.
+    Sleep 1000
+  ${EndIf}
+!macroend
+
 !macro NSIS_HOOK_POSTINSTALL
   DetailPrint "Registering the VPN broker service..."
   ; auto-start LocalSystem service; supervises charon-svc + applies VPN DNS.
