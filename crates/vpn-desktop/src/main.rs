@@ -13,6 +13,7 @@ mod dns;
 mod overrides;
 mod portal;
 mod ssl;
+mod update;
 
 use backend::{AppState, ProfileEdit, ProfileSummary};
 use vpn_control::{ConnectOutcome, IkeSa};
@@ -249,6 +250,25 @@ async fn forget_credentials(state: tauri::State<'_, AppState>, id: String) -> Re
     }
 }
 
+/// The running build's version, for the UI to show and to compare against.
+#[tauri::command]
+fn app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// Ask the release endpoint whether a newer version exists. `None` = current.
+#[tauri::command]
+async fn check_update(app: tauri::AppHandle) -> Result<Option<update::Available>, String> {
+    update::check(&app).await
+}
+
+/// Download and run the newer installer. On Windows this ends the process, so
+/// the call only ever returns on failure.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    update::install(&app).await
+}
+
 fn selftest() {
     let state = AppState::from_env();
     let profiles = backend::list_profiles(&state);
@@ -433,6 +453,7 @@ fn main() {
             tray::reveal(app);
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::from_env())
         .invoke_handler(tauri::generate_handler![
             list_profiles,
@@ -453,10 +474,14 @@ fn main() {
             forget_user_login,
             get_profile_edit,
             save_profile_edit,
-            reset_profile_edit
+            reset_profile_edit,
+            app_version,
+            check_update,
+            install_update
         ])
         .setup(|app| {
             tray::build(app.handle())?;
+            update::watch(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| match event {

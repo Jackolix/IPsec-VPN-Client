@@ -208,6 +208,25 @@
   .creds-bar button { margin-left: auto; }
   .btn-sm { padding: 5px 12px; font-size: var(--fs-xs); border-radius: 7px; }
 
+  /* Update strip. Sits directly under the titlebar, outside .body, so it is
+     equally visible in the full and the compact view — an update that is worth
+     interrupting for is worth interrupting for in either. */
+  .update-bar { display: none; align-items: center; gap: 12px; flex: 0 0 auto; padding: 9px 16px;
+    font-size: var(--fs-sm); color: #bcd9ff; background: var(--accent-soft); border-bottom: 1px solid var(--accent-line); }
+  .update-bar.show { display: flex; }
+  .update-bar.bad { color: #f0a996; background: var(--crit-soft); border-bottom-color: rgba(240,96,58,.4); }
+  .update-bar .ub-text { flex: 1; min-width: 0; }
+  .update-bar .ub-sub { color: var(--muted); }
+  .update-bar b { font-family: var(--mono); }
+  .ub-progress { flex: 0 0 150px; height: 5px; border-radius: 3px; background: rgba(0,0,0,.35); overflow: hidden; }
+  .ub-fill { height: 100%; width: 0; background: var(--accent); transition: width .18s linear; }
+  .side-version { padding: 0 16px 11px; font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint);
+    display: flex; align-items: center; gap: 8px; }
+  .side-version .spacer { flex: 1; }
+  .side-version button { background: none; border: 0; padding: 0; font: inherit; color: var(--accent);
+    cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+  .side-version button[disabled] { color: var(--faint); text-decoration: none; cursor: default; }
+
   /* gateway-override modal field */
   /* Drag-and-drop import overlay */
   #dropzone { position: fixed; inset: 0; z-index: 50; display: none; align-items: center; justify-content: center;
@@ -328,6 +347,14 @@
     </div>
   </div>
 
+  <div class="update-bar" id="update-bar" role="status">
+    <span class="led ok" style="box-shadow:none" aria-hidden="true"></span>
+    <div class="ub-text" id="ub-text"></div>
+    <div class="ub-progress" id="ub-progress" hidden><div class="ub-fill" id="ub-fill"></div></div>
+    <button id="ub-install" class="btn btn-primary btn-sm">Install and restart</button>
+    <button id="ub-later" class="btn btn-ghost btn-sm">Later</button>
+  </div>
+
   <div class="body">
     <aside class="sidebar">
       <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import profile</button></div>
@@ -337,6 +364,7 @@
       </div>
       <ul class="profiles" id="profile-list"></ul>
       <div class="side-foot"><span id="foot-led" class="led"></span><span id="foot-text">connecting to vici…</span><button id="daemon-btn" class="btn-sm" style="display:none">Start</button></div>
+      <div class="side-version"><span>v<span id="app-version">—</span></span><span class="spacer"></span><button type="button" id="check-update">Check for updates</button></div>
     </aside>
 
     <section class="main">
@@ -1757,9 +1785,122 @@
   });
   window.addEventListener("resize", drawSpark);
 
+  // ---- updates --------------------------------------------------------------
+  // Rust owns the check, the download and the signature verification; this only
+  // decides what the strip says. Two things the user is entitled to know before
+  // clicking, because both are surprising: the installer stops the broker
+  // service (so a live tunnel goes down with it), and it is a per-machine
+  // bundle, so Windows raises a UAC prompt.
+  var pendingUpdate = null, updateBusy = false;
+
+  function ubShow(html, cls) {
+    var bar = $("update-bar");
+    bar.className = "update-bar show" + (cls ? " " + cls : "");
+    $("ub-text").innerHTML = html;
+  }
+
+  function offerUpdate(u) {
+    pendingUpdate = u;
+    ubShow("Version <b>" + esc(u.version) + "</b> is available — this is <b>" + esc(u.current_version) + "</b>. " +
+      '<span class="ub-sub">Installing closes the app and asks for Administrator rights, and any tunnel that is up will drop.</span>');
+    // The release notes can run to a full changelog, which would swamp a
+    // one-line strip — hang them off the tooltip instead of showing them.
+    $("ub-text").title = u.notes || "";
+    $("ub-install").hidden = false;
+    $("ub-later").hidden = false;
+    $("ub-progress").hidden = true;
+  }
+
+  // "Later" is remembered per version, so a user who declines is not asked again
+  // on every launch — but a *newer* release than the one they declined still
+  // gets to interrupt.
+  function dismissedVersion() {
+    try { return localStorage.getItem("updateDismissed") || ""; } catch (e) { return ""; }
+  }
+
+  function dismissUpdate() {
+    if (pendingUpdate) {
+      try { localStorage.setItem("updateDismissed", pendingUpdate.version); } catch (e) {}
+    }
+    $("update-bar").className = "update-bar";
+  }
+
+  async function runUpdate() {
+    if (updateBusy || !TAURI || !pendingUpdate) { return; }
+    updateBusy = true;
+    $("ub-install").hidden = true;
+    $("ub-later").hidden = true;
+    $("ub-progress").hidden = false;
+    $("ub-fill").style.width = "0%";
+    ubShow("Downloading version <b>" + esc(pendingUpdate.version) + "</b>…");
+    try {
+      await TAURI.invoke("install_update");
+      // On Windows this never returns: a running .exe cannot be overwritten, so
+      // the installer is launched and this process ends. It reopens the app.
+    } catch (err) {
+      updateBusy = false;
+      $("ub-progress").hidden = true;
+      $("ub-install").hidden = false;
+      $("ub-later").hidden = false;
+      ubShow("The update could not be installed: " + esc(String(err)), "bad");
+    }
+  }
+
+  async function checkUpdateNow() {
+    if (!TAURI || updateBusy) { return; }
+    var btn = $("check-update");
+    btn.disabled = true;
+    btn.textContent = "Checking…";
+    try {
+      var u = await TAURI.invoke("check_update");
+      if (u) {
+        // An explicit check overrides an earlier "later" for this same version:
+        // the user just asked, so answer them.
+        try { localStorage.removeItem("updateDismissed"); } catch (e) {}
+        offerUpdate(u);
+        btn.textContent = "Check for updates";
+      } else {
+        btn.textContent = "Up to date";
+        setTimeout(function () { btn.textContent = "Check for updates"; btn.disabled = false; }, 2500);
+        return;
+      }
+    } catch (err) {
+      pendingUpdate = null;
+      ubShow("Could not check for updates: " + esc(String(err)), "bad");
+      $("ub-install").hidden = true;
+      $("ub-later").hidden = false;
+      btn.textContent = "Check for updates";
+    }
+    btn.disabled = false;
+  }
+
+  $("ub-install").addEventListener("click", runUpdate);
+  $("ub-later").addEventListener("click", dismissUpdate);
+  $("check-update").addEventListener("click", checkUpdateNow);
+  if (TAURI) {
+    TAURI.invoke("app_version").then(function (v) { $("app-version").textContent = v; }).catch(function () {});
+  }
+
   // Native events from the Rust side: drag-and-drop highlight + import refresh.
   var EVT = (window.__TAURI__ && window.__TAURI__.event) ? window.__TAURI__.event : null;
   if (EVT) {
+    // The startup check reports here rather than blocking anything on load.
+    EVT.listen("update-available", function (e) {
+      var u = e && e.payload;
+      if (!u || updateBusy || u.version === dismissedVersion()) { return; }
+      offerUpdate(u);
+    });
+    EVT.listen("update-progress", function (e) {
+      var p = (e && e.payload) || {};
+      if (!p.total) { return; }
+      $("ub-fill").style.width = Math.max(0, Math.min(100, Math.round((p.downloaded / p.total) * 100))) + "%";
+    });
+    // Fires on the last byte, before the signature is checked — so this says
+    // "verifying", not "verified". A bad signature surfaces as a failed invoke.
+    EVT.listen("update-downloaded", function () {
+      $("ub-progress").hidden = true;
+      ubShow("Downloaded — verifying the signature, then starting the installer. The app will close and reopen.");
+    });
     EVT.listen("drag-active", function (e) { $("dropzone").classList.toggle("show", !!e.payload); });
     EVT.listen("profiles-changed", function (e) {
       $("dropzone").classList.remove("show");
