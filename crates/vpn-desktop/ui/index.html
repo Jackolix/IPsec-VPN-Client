@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>IPsec VPN Client</title>
+<title>VPN Client</title>
 <style>
   :root {
     --bg: #0b121b; --window: #0e1620; --surface: #16202e; --surface-2: #1b2838;
@@ -27,14 +27,29 @@
   .mono { font-family: var(--mono); }
   .app { height: 100vh; display: flex; flex-direction: column; }
 
+  /* Custom titlebar: the native decoration is off (tauri.conf.json), so this
+     row is the drag region and carries its own window controls. */
   .titlebar {
-    display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 16px;
+    display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 0 0 16px;
     background: linear-gradient(180deg,#16212f,#121b27); border-bottom: 1px solid var(--line-soft); flex: 0 0 auto;
+    user-select: none; -webkit-user-select: none; cursor: default;
   }
   .brand { display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: var(--fs-sm); letter-spacing: .04em; min-width: 0; }
+  .brand > * { pointer-events: none; } /* clicks fall through to the drag region */
   .brand .glyph { width: 20px; height: 20px; display: grid; place-items: center; color: var(--accent); flex: 0 0 auto; }
-  .brand b { font-weight: 600; white-space: nowrap; } .brand span { color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .brand b { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .titlebar .spacer { flex: 1; }
+  .win-controls { display: flex; align-self: stretch; flex: 0 0 auto; }
+  .win-btn {
+    width: 44px; border: 0; background: transparent; color: var(--muted);
+    display: grid; place-items: center; cursor: default; padding: 0;
+  }
+  .win-btn:hover { background: rgba(255,255,255,.07); color: var(--text); }
+  .win-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .win-btn.close:hover { background: #c42b1c; color: #fff; }
+  .win-btn .ic-restore { display: none; }
+  body.maximized .win-btn .ic-restore { display: block; }
+  body.maximized .win-btn .ic-max { display: none; }
   .global-status {
     display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs);
     letter-spacing: .08em; text-transform: uppercase; color: var(--muted); white-space: nowrap; flex: 0 0 auto;
@@ -100,7 +115,9 @@
   .kind-tag { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; flex: 0 0 auto; }
   .kind-tag.ipsec { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
   .kind-tag.ssl { color: #b892f6; border-color: rgba(184,146,246,.42); background: rgba(184,146,246,.14); }
-  .profile-kind { margin-left: auto; font-family: var(--mono); font-size: 8.5px; letter-spacing: .08em; text-transform: uppercase; padding: 1px 5px; border-radius: 4px; border: 1px solid rgba(184,146,246,.4); color: #b892f6; flex: 0 0 auto; }
+  .profile-kind { margin-left: auto; font-family: var(--mono); font-size: 8.5px; letter-spacing: .08em; text-transform: uppercase; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--line); color: var(--muted); flex: 0 0 auto; }
+  .profile-kind.ssl { border-color: rgba(184,146,246,.4); color: #b892f6; }
+  .profile-kind.ipsec { border-color: var(--accent-line); color: var(--accent); }
   .detail-head .spacer { flex: 1; }
   .status-pill { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 6px 13px; background: rgba(0,0,0,.2); white-space: nowrap; }
   .status-pill.established { color: var(--ok); border-color: rgba(70,194,102,.42); background: var(--ok-soft); }
@@ -155,6 +172,7 @@
   .log-line .sys { flex: 0 0 42px; }
   .log-line .sys.IKE { color: var(--accent); } .log-line .sys.CFG { color: #9a86e0; }
   .log-line .sys.KNL { color: var(--warn); } .log-line .sys.NET { color: var(--ok); }
+  .log-line .sys.OVP { color: #b892f6; }
   .log-line .msg { color: var(--muted); }
   .log-line.good .msg { color: var(--ok); } .log-line.bad .msg { color: var(--crit); }
   .log-empty { color: var(--faint); }
@@ -236,7 +254,8 @@
   .view-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   /* compact view: hidden until body.compact; then it replaces the dashboard */
-  body.compact .brand span { display: none; }
+  body.compact #win-max { display: none; } /* window is locked non-resizable */
+  body.compact .global-status { display: none; } /* the compact panel has its own status line */
   .compact-view { display: none; }
   body.compact .body { display: none; }
   body.compact .compact-view { display: flex; flex: 1; min-height: 0; align-items: center; justify-content: center; padding: 14px; overflow-y: auto; }
@@ -294,14 +313,19 @@
 </head>
 <body>
 <div class="app">
-  <div class="titlebar">
-    <div class="brand">
+  <div class="titlebar" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region>
       <span class="glyph" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.5 8 8 11 4.5-3 8-6 8-11V5l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg></span>
-      <b>IPsec&nbsp;VPN</b><span>· NCP profile client</span>
+      <b>VPN&nbsp;Client</b>
     </div>
-    <div class="spacer"></div>
+    <div class="spacer" data-tauri-drag-region></div>
     <button id="view-toggle" class="view-toggle" title="Switch to a compact view">▭ Compact</button>
     <div class="global-status"><span id="glob-led" class="led"></span><span id="glob-text">disconnected</span></div>
+    <div class="win-controls">
+      <button id="win-min" class="win-btn" title="Minimize" aria-label="Minimize"><svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0 5h10" stroke="currentColor" stroke-width="1"/></svg></button>
+      <button id="win-max" class="win-btn" title="Maximize" aria-label="Maximize"><svg class="ic-max" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x=".5" y=".5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1"/></svg><svg class="ic-restore" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.5 2.5v-2h7v7h-2" fill="none" stroke="currentColor" stroke-width="1"/><rect x=".5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1"/></svg></button>
+      <button id="win-close" class="win-btn close" title="Close to tray" aria-label="Close to tray"><svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0 0l10 10M10 0L0 10" stroke="currentColor" stroke-width="1"/></svg></button>
+    </div>
   </div>
 
   <div class="body">
@@ -655,7 +679,8 @@
       var led = st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
       b.innerHTML = '<div class="profile-top"><span class="' + led + '"></span>' +
         '<span class="profile-name"></span>' +
-        (p.kind === "ssl" ? '<span class="profile-kind">SSL</span>' : '') +
+        (p.kind === "ssl" ? '<span class="profile-kind ssl">SSL</span>'
+                          : '<span class="profile-kind ipsec">IPsec</span>') +
         '</div>' +
         '<div class="profile-gw"></div>';
       b.querySelector(".profile-name").textContent = p.name;
@@ -1070,7 +1095,8 @@
     return new Promise(function (resolve) {
       var overlay = $("portal-overlay"), user = $("portal-user"), pass = $("portal-pass"), err = $("portal-err");
       $("portal-why").innerHTML = "This provisioning file points at a user portal. Sign in to <b>" +
-        esc(target.url) + "</b> and the IPsec profile will be downloaded and imported.";
+        esc(target.url) + "</b> and your VPN profile will be downloaded and imported " +
+        "(the SSL VPN profile if the portal offers one, otherwise IPsec).";
       user.value = ""; pass.value = ""; err.textContent = "";
       if (target.otp) {
         err.textContent = "This portal requires a one-time code as well, which isn't supported yet.";
@@ -1663,6 +1689,27 @@
   $("view-toggle").addEventListener("click", function () {
     setView(document.body.classList.contains("compact") ? "full" : "compact");
   });
+  // Window controls for the undecorated window. Close goes through the normal
+  // CloseRequested path, so it hides to the tray like the native X did.
+  (function () {
+    var wapi = window.__TAURI__ && window.__TAURI__.window;
+    if (!wapi || !wapi.getCurrentWindow) { return; }
+    var win = wapi.getCurrentWindow();
+    $("win-min").addEventListener("click", function () { win.minimize().catch(function () {}); });
+    $("win-max").addEventListener("click", function () { win.toggleMaximize().catch(function () {}); });
+    $("win-close").addEventListener("click", function () { win.close().catch(function () {}); });
+    // Swap the maximize icon for the restore icon while maximized.
+    function syncMax() {
+      win.isMaximized().then(function (m) {
+        document.body.classList.toggle("maximized", m);
+        var b = $("win-max");
+        b.title = m ? "Restore" : "Maximize";
+        b.setAttribute("aria-label", b.title);
+      }).catch(function () {});
+    }
+    win.onResized(syncMax).catch(function () {});
+    syncMax();
+  })();
   $("cpick-btn").addEventListener("click", function () { cpickOpen ? closeCpick() : openCpick(); });
   $("cpick-search").addEventListener("input", function (e) {
     cpickQuery = e.target.value.trim(); cpickHi = 0; renderCompactSelect();

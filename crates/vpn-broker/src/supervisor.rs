@@ -93,7 +93,13 @@ impl Broker {
                         *self.ssl.lock().unwrap() = Some((name, tunnel));
                         Response::ok(ip)
                     }
-                    Err(e) => Response::err(e),
+                    // Encode the failure as JSON so the GUI can show the short
+                    // reason in the banner and openvpn's log in the panel,
+                    // instead of one wall-of-text error. (A plain-string failure
+                    // — e.g. a transport error — is still handled on the far side.)
+                    Err(e) => Response::err(
+                        serde_json::json!({ "reason": e.reason, "log": e.log }).to_string(),
+                    ),
                 }
             }
             Request::SslDisconnect => {
