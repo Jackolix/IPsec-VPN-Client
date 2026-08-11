@@ -8,10 +8,15 @@
 //!
 //!   * IPsec, served as an Apple `.mobileconfig` — [`download_ipsec_profile`],
 //!     which [`sophos_profile`] already imports.
-//!   * SSL VPN, served as an OpenVPN `.ovpn` — [`download_ssl_profile`]. This is
-//!     a stock OpenVPN config with an embedded per-user client certificate; the
-//!     IPsec datapath cannot carry it, so for now it is downloaded for
-//!     inspection ahead of a dedicated OpenVPN engine.
+//!   * SSL VPN, served as an OpenVPN `.ovpn` — [`download_ssl_profile`]. A stock
+//!     OpenVPN config with an embedded per-user client certificate, run by the
+//!     broker's OpenVPN engine.
+//!
+//! [`download_preferred`] signs in once and returns the better of the two: the
+//! SSL VPN `.ovpn` when the portal offers it, else the IPsec `.mobileconfig`.
+//! The SSL profile is self-contained — the gateway pushes its routes and DNS —
+//! whereas the portal's IPsec profile lists no subnets, so it would need them
+//! added by hand before it could connect.
 //!
 //! SECURITY: both downloads carry live secrets — the `.mobileconfig` a
 //! pre-shared key, the `.ovpn` a private key. They are handled exactly like an
@@ -168,6 +173,61 @@ pub fn services(portal_url: &str, username: &str, password: &str) -> Result<Stri
     Ok(lines.join("\n"))
 }
 
+/// A profile downloaded from the portal, tagged with the file extension the
+/// caller should store it under — `"ovpn"` (SSL VPN) or `"mobileconfig"` (IPsec)
+/// — which is also what the rest of the app dispatches the datapath on.
+pub struct DownloadedProfile {
+    /// File extension to store it under: `"ovpn"` or `"mobileconfig"`.
+    pub ext: &'static str,
+    /// The profile text (carries a live key — handled like any imported file).
+    pub text: String,
+}
+
+/// Sign in once and download the best profile the portal offers, **preferring
+/// the SSL VPN `.ovpn`** and falling back to the IPsec `.mobileconfig`.
+///
+/// SSL is preferred because the portal's SSL profile is self-contained — the
+/// gateway pushes its routes and DNS on connect — whereas the portal's IPsec
+/// profile carries no subnets, so it can't connect until they are added by hand.
+/// IPsec is used when the portal doesn't offer SSL VPN for this user (or its SSL
+/// download fails and IPsec is available), so a portal that only serves one
+/// still provisions.
+pub fn download_preferred(
+    portal_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<DownloadedProfile, String> {
+    let base = normalized_base(portal_url)?;
+    validate_credentials(username, password)?;
+
+    let client = portal_client()?;
+    sign_in(&client, &base, username, password)?;
+    let (csrf, cfg) = session_config(&client, &base)?;
+
+    // The portal advertises each service as on/off; an unknown/absent flag is not
+    // treated as off, so a portal that names it differently is still attempted.
+    let ssl_off = cfg.get("sslvpn").and_then(|v| v.as_str()) == Some("off");
+    let ipsec_off = cfg.get("ipsec").and_then(|v| v.as_str()) == Some("off");
+
+    if !ssl_off {
+        match fetch_ssl(&client, &base, &cfg) {
+            Ok(text) => return Ok(DownloadedProfile { ext: "ovpn", text }),
+            // No IPsec to fall back to — surface the SSL error as it stands.
+            Err(e) if ipsec_off => return Err(e),
+            // SSL was advertised but the download failed; try IPsec before giving up.
+            Err(_) => {}
+        }
+    }
+
+    if ipsec_off {
+        return Err(
+            "this portal offers neither an SSL VPN nor an IPsec profile for this user".to_string(),
+        );
+    }
+    let text = fetch_ipsec(&client, &base, &csrf, &cfg)?;
+    Ok(DownloadedProfile { ext: "mobileconfig", text })
+}
+
 /// Sign in to the portal and download the IPsec profile, returning the
 /// `.mobileconfig` text.
 pub fn download_ipsec_profile(
@@ -181,7 +241,35 @@ pub fn download_ipsec_profile(
     let client = portal_client()?;
     sign_in(&client, &base, username, password)?;
     let (csrf, cfg) = session_config(&client, &base)?;
+    fetch_ipsec(&client, &base, &csrf, &cfg)
+}
 
+/// Sign in to the portal and download the SSL VPN profile, returning the
+/// `.ovpn` text. A stock OpenVPN configuration with an embedded per-user client
+/// certificate and key, run by the broker's OpenVPN engine.
+pub fn download_ssl_profile(
+    portal_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, String> {
+    let base = normalized_base(portal_url)?;
+    validate_credentials(username, password)?;
+
+    let client = portal_client()?;
+    sign_in(&client, &base, username, password)?;
+    let (_csrf, cfg) = session_config(&client, &base)?;
+    fetch_ssl(&client, &base, &cfg)
+}
+
+/// Download the IPsec `.mobileconfig` over an already-signed-in session. Split
+/// out so [`download_ipsec_profile`] and [`download_preferred`] share it without
+/// signing in twice.
+fn fetch_ipsec(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    csrf: &str,
+    cfg: &serde_json::Value,
+) -> Result<String, String> {
     if cfg.get("ipsec").and_then(|v| v.as_str()) == Some("off") {
         return Err("IPsec is disabled for this user on the portal".to_string());
     }
@@ -233,25 +321,14 @@ pub fn download_ipsec_profile(
     Ok(text)
 }
 
-/// Sign in to the portal and download the SSL VPN profile, returning the
-/// `.ovpn` text.
-///
-/// This is a stock OpenVPN configuration with an embedded per-user client
-/// certificate and key. The IPsec datapath cannot carry it — driving it needs a
-/// separate OpenVPN engine — so today this exists to pull the real config for
-/// inspection ahead of that engine.
-pub fn download_ssl_profile(
-    portal_url: &str,
-    username: &str,
-    password: &str,
+/// Download the SSL VPN `.ovpn` over an already-signed-in session. Split out so
+/// [`download_ssl_profile`] and [`download_preferred`] share it without signing
+/// in twice.
+fn fetch_ssl(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    cfg: &serde_json::Value,
 ) -> Result<String, String> {
-    let base = normalized_base(portal_url)?;
-    validate_credentials(username, password)?;
-
-    let client = portal_client()?;
-    sign_in(&client, &base, username, password)?;
-    let (_csrf, cfg) = session_config(&client, &base)?;
-
     // The portal reports SSL VPN availability under `sslvpn`; when it is
     // explicitly off there is nothing to download. An unknown/absent field is
     // not treated as off, so a portal that names it differently still proceeds.

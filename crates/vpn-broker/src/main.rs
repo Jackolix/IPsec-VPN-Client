@@ -128,7 +128,11 @@ fn ovpn_connect(args: &[String]) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", e.reason);
+            if !e.log.is_empty() {
+                eprintln!("--- openvpn log ---");
+                eprintln!("{}", e.log);
+            }
             1
         }
     }

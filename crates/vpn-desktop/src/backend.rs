@@ -599,9 +599,14 @@ fn save_imported_text(
     Ok(stem.to_string())
 }
 
-/// Sign in to the user portal a `.pro` points at, download the IPsec profile,
-/// and import it — the automated version of "download it from the portal
+/// Sign in to the user portal a `.pro` points at, download the profile it
+/// serves, and import it — the automated version of "download it from the portal
 /// yourself and import that file". Returns the new profile's id.
+///
+/// Prefers the portal's SSL VPN (`.ovpn`) over its IPsec (`.mobileconfig`): the
+/// SSL profile is self-contained (the gateway pushes routes and DNS), while the
+/// portal's IPsec profile carries no subnets and can't connect until they are
+/// added by hand. Falls back to IPsec when the portal offers no SSL VPN.
 pub fn import_from_portal(
     state: &AppState,
     portal_url: String,
@@ -609,11 +614,12 @@ pub fn import_from_portal(
     password: String,
     name: String,
 ) -> std::result::Result<String, String> {
-    let text = crate::portal::download_ipsec_profile(&portal_url, &username, &password)?;
-    // The portal profile is a .mobileconfig; keep the extension so the format is
-    // obvious in the profile folder and re-parses the same way on load.
+    let profile = crate::portal::download_preferred(&portal_url, &username, &password)?;
+    // Keep the extension matching the format so it is obvious in the profile
+    // folder and re-parses the same way on load (`.ovpn` → SSL, `.mobileconfig`
+    // → IPsec).
     let stem = if name.trim().is_empty() { "Sophos VPN" } else { name.trim() };
-    save_imported_text(state, stem, "mobileconfig", &text)
+    save_imported_text(state, stem, profile.ext, &profile.text)
 }
 
 /// Classify a file the user picked for import: a provisioning `.pro` becomes a
@@ -848,11 +854,54 @@ fn ssl_connect(
                 log: vec![note_line(&name, 2, msg)],
             })
         }
-        Err(e) => Ok(vpn_control::ConnectOutcome {
-            connected: false,
-            error: Some(e.clone()),
-            log: vec![note_line(&name, 0, format!("SSL VPN connect failed: {e}"))],
-        }),
+        Err(e) => {
+            // Short reason in the banner; openvpn's own output as its own log
+            // lines in the panel, rather than one wall-of-text error.
+            let mut log = vec![note_line(&name, 0, format!("SSL VPN connect failed: {}", e.reason))];
+            for raw in e.log.lines() {
+                let line = strip_ovpn_timestamp(raw.trim());
+                if !line.is_empty() {
+                    log.push(ovpn_log_line(&name, line));
+                }
+            }
+            Ok(vpn_control::ConnectOutcome {
+                connected: false,
+                error: Some(e.reason),
+                log,
+            })
+        }
+    }
+}
+
+/// One openvpn output line as a log entry for the panel. Tagged `OVP` so it
+/// reads as coming from the OpenVPN engine rather than charon; the UI colours
+/// the message by wording, as it does charon's.
+fn ovpn_log_line(name: &str, msg: &str) -> vpn_control::LogLine {
+    vpn_control::LogLine {
+        group: "OVP".to_string(),
+        level: 1,
+        ikesa: Some(name.to_string()),
+        msg: msg.to_string(),
+    }
+}
+
+/// Drop openvpn's own leading `YYYY-MM-DD HH:MM:SS ` timestamp: the log panel
+/// stamps every line itself, so keeping openvpn's would double it up.
+fn strip_ovpn_timestamp(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    // "2026-08-10 15:49:14 " — date, space, time, space.
+    if bytes.len() > 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b' '
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b' '
+        && bytes[..19].iter().all(|&b| b.is_ascii_digit() || b == b'-' || b == b' ' || b == b':')
+    {
+        line[20..].trim_start()
+    } else {
+        line
     }
 }
 
@@ -1158,5 +1207,28 @@ fn synth_ssl_sa(s: &crate::ssl::SslStatus) -> IkeSa {
             local_ts: if s.ip.is_empty() { Vec::new() } else { vec![format!("{}/32", s.ip)] },
             remote_ts: Vec::new(),
         }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_openvpn_timestamp() {
+        assert_eq!(
+            strip_ovpn_timestamp("2026-08-10 15:49:15 AUTH: Received control message: AUTH_FAILED"),
+            "AUTH: Received control message: AUTH_FAILED"
+        );
+    }
+
+    #[test]
+    fn leaves_untimestamped_lines_alone() {
+        assert_eq!(strip_ovpn_timestamp("VERIFY OK: depth=0"), "VERIFY OK: depth=0");
+        assert_eq!(strip_ovpn_timestamp(""), "");
+        // A short line the length check must not index past.
+        assert_eq!(strip_ovpn_timestamp("done"), "done");
+        // Looks date-ish but isn't the full stamp — left as-is, no panic.
+        assert_eq!(strip_ovpn_timestamp("2026-08-10 partial"), "2026-08-10 partial");
     }
 }

@@ -343,6 +343,27 @@ fn dev(args: &[String]) {
                 .map(|_| format!("wrote SSL VPN profile to {out}"))
             }
         }
+        // `download-ipsec <url> <username> <password> <outfile>` — the IPsec
+        // counterpart of `download-ssl`: sign in and write the `.mobileconfig`
+        // the portal serves to a file. Exercises the fallback the provisioning
+        // import uses when a portal offers no SSL VPN. The file holds a live PSK:
+        // only its path is printed, never its contents.
+        Some("download-ipsec") => {
+            let out = args.get(4).cloned().unwrap_or_default();
+            if out.is_empty() {
+                Err("usage: download-ipsec <url> <username> <password> <outfile>".to_string())
+            } else {
+                portal::download_ipsec_profile(
+                    args.get(1).map(String::as_str).unwrap_or(""),
+                    args.get(2).map(String::as_str).unwrap_or(""),
+                    args.get(3).map(String::as_str).unwrap_or(""),
+                )
+                .and_then(|cfg| {
+                    std::fs::write(&out, cfg).map_err(|e| format!("could not write {out}: {e}"))
+                })
+                .map(|_| format!("wrote IPsec profile to {out}"))
+            }
+        }
         // `portal-services <url> <username> <password>` — print the portal's
         // advertised, non-secret service flags (which of IPsec / SSL VPN are on,
         // and how they authenticate). Diagnosis only; no secrets are printed.
@@ -494,7 +515,7 @@ fn main() {
             _ => {}
         })
         .run(tauri::generate_context!())
-        .expect("error while running the IPsec VPN Client");
+        .expect("error while running the VPN Client");
 }
 
 /// System-tray icon + menu, so the app keeps running (and the tunnel stays up)
@@ -521,7 +542,7 @@ mod tray {
 
         TrayIconBuilder::with_id("main-tray")
             .icon(app.default_window_icon().expect("bundled window icon").clone())
-            .tooltip("IPsec VPN Client")
+            .tooltip("VPN Client")
             .menu(&menu)
             .show_menu_on_left_click(false)
             .on_menu_event(|app, event| match event.id.as_ref() {
