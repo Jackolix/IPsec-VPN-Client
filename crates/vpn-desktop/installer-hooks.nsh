@@ -1,4 +1,4 @@
-; NSIS installer hooks for the IPsec VPN Client.
+; NSIS installer hooks for the VPN Client.
 ;
 ; Registering the broker creates a Windows service, which needs Administrator
 ; rights — so this only works because the installer is per-machine (see

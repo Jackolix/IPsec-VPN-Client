@@ -121,6 +121,42 @@ warn) until a code-signing cert is added. DPD/auto-reconnect is on by default
 (probe every 30s; charon re-establishes the tunnel after a dead peer or link
 flap).
 
+### Updating the app
+
+The desktop app updates itself. Eight seconds after launch it fetches
+`latest.json` from the newest GitHub Release, and if that names a newer version
+than the running build, a strip appears under the titlebar offering it; the
+sidebar also carries the running version and a manual **Check for updates**.
+Accepting downloads that release's NSIS installer and runs it — which means an
+update replaces *everything* the product ships at once (GUI, broker, charon,
+OpenVPN), so the unelevated app and the privileged service it talks to can never
+end up on different versions. Two consequences the UI states up front: the
+installer's PREINSTALL hook stops the broker, so **a live tunnel drops**, and
+the bundle is per-machine, so **Windows raises a UAC prompt**. The app closes
+and the installer reopens it.
+
+Trust rests on the signature, not on the transport. `latest.json` carries a
+minisign signature for the installer, and the updater verifies it against the
+public key pinned in `tauri.conf.json` before executing anything — so whoever
+serves the release cannot get code run on a client without the private key.
+
+That private key lives only in the repository's Actions secrets, and the
+release build **fails without it** (the bundle sets `createUpdaterArtifacts`):
+
+| secret | value |
+| --- | --- |
+| `TAURI_SIGNING_PRIVATE_KEY` | the contents of the private key file |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | the key's password; empty if it has none |
+
+A fresh pair comes from `cargo tauri signer generate -w <path>`; the public half
+then replaces `plugins.updater.pubkey` in `crates/vpn-desktop/tauri.conf.json`.
+Lose the private key and no already-installed client will accept an update
+again — they pin the old public key — so every user would have to reinstall by
+hand. Back it up.
+
+Clients only reach the updater once they are *on* a build that has it: anyone on
+v0.2.2 or earlier installs the next version manually, once.
+
 The responder side (test gateway) must accept: IKEv2, PSK, the profile's
 identity, IKE `aes256-sha256-prfsha256-modp3072`, ESP `aes256-sha256` with
 PFS group 15 (modp3072), and assign a virtual IP.
