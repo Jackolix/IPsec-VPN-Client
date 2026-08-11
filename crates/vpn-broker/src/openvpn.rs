@@ -128,11 +128,27 @@ pub fn sweep_stale_configs() {
     }
 }
 
+/// A failed SSL VPN connect, split so the GUI can show a short `reason` in the
+/// banner and openvpn's full output (`log`) in the log panel, rather than one
+/// giant string. `log` is empty when the failure happened before openvpn
+/// produced any output. Neither field carries a secret (the credentials go
+/// through the auth file, never the log at `--verb 3`).
+pub struct ConnectError {
+    pub reason: String,
+    pub log: String,
+}
+
+impl From<String> for ConnectError {
+    fn from(reason: String) -> Self {
+        ConnectError { reason, log: String::new() }
+    }
+}
+
 /// Bring up an SSL VPN tunnel from an `.ovpn` config, supplying `username`/
 /// `password` for its `auth-user-pass` round via a transient file. Returns once
-/// openvpn reports CONNECTED, or an error that carries no secret and is safe to
-/// show.
-pub fn connect(config: &str, username: &str, password: &str) -> Result<Tunnel, String> {
+/// openvpn reports CONNECTED, or a [`ConnectError`] whose `reason` is safe to
+/// show and whose `log` holds openvpn's own output for the panel.
+pub fn connect(config: &str, username: &str, password: &str) -> Result<Tunnel, ConnectError> {
     sanitize(config)?;
 
     let exe = openvpn_exe()?;
@@ -212,7 +228,7 @@ pub fn connect(config: &str, username: &str, password: &str) -> Result<Tunnel, S
         Ok(s) => s,
         Err(e) => {
             stop_child(&mut child, None);
-            return Err(with_log(e, &log_path));
+            return Err(ConnectError { reason: e, log: read_log(&log_path) });
         }
     };
     // A cleanup handle to the management socket, so a failed connect can stop
@@ -227,7 +243,7 @@ pub fn connect(config: &str, username: &str, password: &str) -> Result<Tunnel, S
         }
         Err(e) => {
             stop_child(&mut child, cleanup);
-            Err(with_log(e, &log_path))
+            Err(ConnectError { reason: e, log: read_log(&log_path) })
         }
     }
 }
@@ -563,16 +579,18 @@ fn work_dir() -> PathBuf {
     base.join("ipsec-vpn")
 }
 
-/// Append openvpn's captured output to an error, when we have a log to add.
-fn with_log(err: String, log_path: &Path) -> String {
-    match std::fs::read_to_string(log_path) {
-        Ok(s) if !s.trim().is_empty() => {
-            let s = s.trim();
-            let tail = &s[s.len().saturating_sub(1500)..];
-            format!("{err}; openvpn said: {tail}")
-        }
-        _ => err,
-    }
+/// openvpn's captured output for the log panel — trimmed, and capped to the last
+/// lines so a pathological log can't bloat the response. Empty when there is
+/// nothing to show (e.g. the failure preceded any output). Splitting by line
+/// avoids slicing through a UTF-8 boundary.
+fn read_log(log_path: &Path) -> String {
+    let Ok(s) = std::fs::read_to_string(log_path) else {
+        return String::new();
+    };
+    let s = s.trim();
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(120);
+    lines[start..].join("\n")
 }
 
 /// Render the recent-log ring as a trailing " (…)" clause, or nothing.

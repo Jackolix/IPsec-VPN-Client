@@ -31,6 +31,14 @@ pub struct SslStatus {
     pub ip: String,
 }
 
+/// A failed SSL connect: a short `reason` for the banner, and openvpn's captured
+/// output (`log`, possibly empty and multi-line) for the log panel.
+#[derive(Debug, Clone)]
+pub struct SslError {
+    pub reason: String,
+    pub log: String,
+}
+
 /// Cheap structural check that `text` is an OpenVPN client config, not an HTML
 /// error page or an IPsec profile. An `.ovpn` names a `remote` and declares
 /// itself a `client`/`dev tun` or inlines its CA.
@@ -75,19 +83,38 @@ pub fn connect(
     config: &str,
     username: &str,
     password: &str,
-) -> Result<String, String> {
+) -> Result<String, SslError> {
     let resp = vpn_broker::client::request(&vpn_broker::protocol::Request::SslConnect {
         name: name.to_string(),
         config: config.to_string(),
         username: username.to_string(),
         password: password.to_string(),
     })
-    .map_err(|e| format!("the VPN broker is not reachable: {e}"))?;
+    .map_err(|e| SslError {
+        reason: format!("the VPN broker is not reachable: {e}"),
+        log: String::new(),
+    })?;
     if resp.ok {
         Ok(resp.msg)
     } else {
-        Err(resp.msg)
+        Err(parse_ssl_error(&resp.msg))
     }
+}
+
+/// The broker encodes an SSL connect failure as JSON `{"reason","log"}` so the
+/// short reason and openvpn's output travel separately. A failure that isn't
+/// that shape (a transport-level error) is taken verbatim as the reason.
+#[cfg(windows)]
+fn parse_ssl_error(msg: &str) -> SslError {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(msg) {
+        if let Some(reason) = v.get("reason").and_then(|s| s.as_str()) {
+            return SslError {
+                reason: reason.to_string(),
+                log: v.get("log").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+            };
+        }
+    }
+    SslError { reason: msg.to_string(), log: String::new() }
 }
 
 /// Ask the broker to tear down the SSL tunnel, if one is up.
@@ -124,8 +151,11 @@ pub fn status() -> Result<Option<SslStatus>, String> {
 // On non-Windows the broker (and thus SSL VPN) is unavailable; keep the surface
 // present so the rest of the app builds on CI.
 #[cfg(not(windows))]
-pub fn connect(_name: &str, _config: &str, _username: &str, _password: &str) -> Result<String, String> {
-    Err("SSL VPN is only supported on Windows".to_string())
+pub fn connect(_name: &str, _config: &str, _username: &str, _password: &str) -> Result<String, SslError> {
+    Err(SslError {
+        reason: "SSL VPN is only supported on Windows".to_string(),
+        log: String::new(),
+    })
 }
 #[cfg(not(windows))]
 pub fn disconnect() -> Result<(), String> {
@@ -164,5 +194,18 @@ mod tests {
         let m = parse_meta("remote a.example 1\nremote b.example 2\n");
         assert_eq!(m.gateway, "a.example");
         assert_eq!(m.port, "1");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_structured_and_plain_failures() {
+        // The broker's JSON shape splits into reason + log.
+        let e = parse_ssl_error(r#"{"reason":"the gateway rejected the username or password","log":"line1\nline2"}"#);
+        assert_eq!(e.reason, "the gateway rejected the username or password");
+        assert_eq!(e.log, "line1\nline2");
+        // A non-JSON failure is taken verbatim as the reason, with no log.
+        let e = parse_ssl_error("the VPN broker is not reachable: pipe closed");
+        assert_eq!(e.reason, "the VPN broker is not reachable: pipe closed");
+        assert!(e.log.is_empty());
     }
 }
