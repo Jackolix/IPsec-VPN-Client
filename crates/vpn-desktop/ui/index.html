@@ -36,7 +36,7 @@
   }
   .brand { display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: var(--fs-sm); letter-spacing: .04em; min-width: 0; }
   .brand > * { pointer-events: none; } /* clicks fall through to the drag region */
-  .brand .glyph { width: 20px; height: 20px; display: grid; place-items: center; color: var(--accent); flex: 0 0 auto; }
+  .brand .logo { height: 21px; width: auto; display: block; flex: 0 0 auto; }
   .brand b { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .titlebar .spacer { flex: 1; }
   .win-controls { display: flex; align-self: stretch; flex: 0 0 auto; }
@@ -334,7 +334,7 @@
 <div class="app">
   <div class="titlebar" data-tauri-drag-region>
     <div class="brand" data-tauri-drag-region>
-      <span class="glyph" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.5 8 8 11 4.5-3 8-6 8-11V5l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg></span>
+      <img class="logo" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIEAAAA/CAYAAADHYKtVAAAEzklEQVR42u3dW6gVVRzH8e827R4VRZCdl+BERRfoZvXggwXZDcFuhF2hAoMSKh96MLJIRCgRyY5WVkoWFd0euhP1ElHR9RBU5IM9RAQmZRdFj9v9P/73cVzNPszMXnPZ+PuBuPc5Z8+smfXZs2etWWt2q91ut9mTduIfwf/tlOf9PO71u6rXF+PxVOB5YLk/p9VqUVX2Vt947gRuB3YmytcrVsixzoPFrXawFKVQtgPzgNeqhBBU3aXAq8ChORdzgxDEy2bgCuCzKiAE1XY68B4wPedi7EhwkxDEzY/AbGBTmRCCKjsOeBs4p8CihKCkfATMAf6uAME04CVgbsFFCUGJWQ/cUsbRIKiux4B7+1icEJSch+zMOyaElJbAE30uUggqyK3AuhgQUloCrwMHC0Hz8w9wJfBxvxAS1XQa8H6BloAQ1JhfgEu85VAIQqKKjgXeLdgSEIKa8zlwGfBHXgiJ6rGeyZf7aAkIQQNivXnXe5duJgRB1TwK3Be5TBMItjRgB9nWHgYcWOC1vwO/AVMilOMAYNjb32XEmnQLsxwNAgDzgZESyjOB4JQGINjV2fFLgGsKvPbhzj570Cuw3zIcA3wNDJW4rXcBqyaDEACw84k3gEPKRNCUw+WTwB0FXrfY2+QxchQwWjKCbY79rTQIQX2cCnwAnFBSWfYgqP1zYO9GPw3cVhRBv50xXo6jge9KRoB/fNmJ4jdJCAEAOyq908FyXonlEIIaEeDrMQi/pvzOWgIvANeWXAYhqBkB/k6/Gvgv+PnSzsfG/RWsP845QaSdv78isKzxs/9ubGTQUxWtWwgaggB/1y8DLgbe9OZypQgWACd6EylTvfsZ7uP2eSYE49npn+NFs92bunbB6aQK8U0g+Kqj76wCGz3D2tRCMJ6fgVf8HV3XedaHwNm+DbkRfApckHOFWzsrnQl8KwTj+cnfSNbPsaIGADba+QHgk5xXF4Ug8pHAruz9BdwNrKwQwHrfb0cAP/iYQyGoCcG5wJ/+fL53DU8pGcBaH2G0wyt/VAiagwDfltV9njBOlhE/6oz5cyFoIALLzb5dsa9K2sfNPUGLTggaigCfmbQ2wnjAbpb75eiwg0cImoIg5UKQ5Trg2QJTxMIsC7uTE+sTgiYh4P+XhC1X+cjjwwsW0cZbLAoBJNYlBE1DkLJ9+Mwka9IdmXP5+8xhIH0MghA0FUEKhMu9cydrz94iPwqkAhCCAUFA+pCxDT6EfLJ0Lyz1BCAEA4QgBcJFwIuTVNpCH5jas/KFYAARpECY6bOKj0/8bJf3AazMAkAIBhBBCoQLfVLJkFfKguRE0xzLE4JBQpAC4XzgGR+jMZIHgBAMMIIUCLbuLXkBCMGAI+jRqVR0wqoQDCqCGBECIRACIRACIRACIRACIRACIRACIRACIRACIRACIRACIRACIRACIYiFwEYx3WgIvvR57XmywwdCxLw/wXPJ7wjIkUdsWnZEBKMFbhm30Wcl143g+wyDV/d5afc7kOwOGSfnvFPJvz4WflNEBLOAM7u3fc2YaT4n/4tI5ZjqdxE/KMO3iSX3xzavgLEaEVjZz/B90s5Ybvu7jU26Z5HKUVPZa7+FnVJ/hEChtXloWHtBCIbnaTcIgb70QgiEQAiEYL/Pbv2jgdK7SABWAAAAAElFTkSuQmCC" width="43" height="21" alt="ITM">
       <b>VPN&nbsp;Client</b>
     </div>
     <div class="spacer" data-tauri-drag-region></div>
