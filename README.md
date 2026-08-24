@@ -157,6 +157,37 @@ hand. Back it up.
 Clients only reach the updater once they are *on* a build that has it: anyone on
 v0.2.2 or earlier installs the next version manually, once.
 
+### Upgrading across the product rename
+
+That one manual install crosses a **product rename**: up to v0.2.2 the app was
+called *IPsec VPN Client*. Tauri's NSIS installer keys the Add/Remove entry, the
+recorded install directory and its "a previous version is installed" page on the
+**product name**, not on the bundle identifier — and v0.2.2 additionally moved
+those keys from `HKCU` to `HKLM` by switching from a per-user to a per-machine
+install. Left alone, the current installer would not see such an install at all:
+it lands in `C:\Program Files\VPN Client` *beside* `C:\Program Files\IPsec VPN
+Client`, leaves a second Add/Remove entry, and — the part that actually breaks —
+the `ipsec-vpn-broker` service, keyed by service *name* and so untouched by any
+of this, keeps running the OLD directory's `vpn-broker.exe` underneath the new
+GUI.
+
+The installer migrates instead. Its PREINSTALL hook looks for an install
+registered under the old name, in both registry contexts, and runs that
+install's own `uninstall.exe /S _?=<dir>` first — silent, and waited on, because
+`_?=` is what stops an NSIS uninstaller from relaunching itself out of `%TEMP%`.
+App data is left alone (that checkbox defaults to off), so profiles and saved
+credentials survive; the old directory, registry keys and shortcuts are then
+cleared. Should the old uninstaller fail, its Add/Remove entry is deliberately
+kept — it is the only remaining handle for removing that install by hand — and
+setup continues.
+
+Registering the broker is idempotent to match: `vpn-broker install` over a
+service that already exists now rewrites the service's binary path to the
+directory it was run from (stopping the old process first, so the change takes
+effect without a reboot). A machine whose old uninstall failed, or an MSI
+upgrade — the MSI has no installer hooks — therefore still ends up with the
+service pointing at the current install rather than a stale one.
+
 The responder side (test gateway) must accept: IKEv2, PSK, the profile's
 identity, IKE `aes256-sha256-prfsha256-modp3072`, ESP `aes256-sha256` with
 PFS group 15 (modp3072), and assign a virtual IP.

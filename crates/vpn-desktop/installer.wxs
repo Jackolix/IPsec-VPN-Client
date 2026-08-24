@@ -32,7 +32,15 @@
 
     <!-- `install` creates the auto-start LocalSystem service and starts it, so no
          reboot is needed; `uninstall` stops it (letting it revert DNS and kill
-         charon) and deletes it. -->
+         charon) and deletes it.
+
+         `install` is also idempotent: over an existing service it repoints the
+         binary path at this INSTALLDIR. That matters more here than for NSIS,
+         because installer hooks are an NSIS-only feature — the MSI has no way to
+         run the old install's uninstaller first, so an MSI laid down beside an
+         install made under the app's previous product name would otherwise leave
+         the service running the other directory's vpn-broker.exe. See
+         installer-hooks.nsh for that migration. -->
     <CustomAction Id="RegisterVpnBroker"
                   Directory="INSTALLDIR"
                   ExeCommand="&quot;[INSTALLDIR]vpn-broker.exe&quot; install"
