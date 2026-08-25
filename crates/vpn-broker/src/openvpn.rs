@@ -266,6 +266,9 @@ fn stop_child(child: &mut Child, mgmt: Option<TcpStream>) {
     let _ = child.wait();
 }
 
+/// The management commands that get openvpn moving, in the order they are sent.
+const SETUP: [&str; 3] = ["state on", "log on", "hold release"];
+
 /// Enable state reporting, release the hold, and wait for CONNECTED (the login
 /// comes from the `--auth-user-pass` file). On success returns the assigned IP
 /// and the write half of the management socket (kept for the eventual
@@ -275,11 +278,11 @@ fn drive(
     mut stream: TcpStream,
 ) -> Result<(Option<String>, TcpStream), String> {
     // Single-threaded read+write on the one socket, polling with a short read
-    // timeout. A background reader thread with a cloned writer looked equivalent
-    // but did not work: openvpn accepted `state on`/`log on` yet never saw the
-    // following `hold release` (no SUCCESS, no progress) and stayed paused. Doing
-    // it the way the interface expects — one owner, read then write — is
-    // reliable, matching a hand-driven session.
+    // timeout: one owner, read then write, the way the interface expects and the
+    // way a hand-driven session behaves. A background reader thread with a cloned
+    // writer looked equivalent but did not work — openvpn accepted `state on`/
+    // `log on` yet never acted on the `hold release` that followed, and stayed
+    // paused.
     stream
         .set_read_timeout(Some(Duration::from_millis(300)))
         .map_err(|e| format!("management socket error: {e}"))?;
@@ -288,11 +291,22 @@ fn drive(
     let mut recent: VecDeque<String> = VecDeque::with_capacity(LOG_RING);
     let mut rbuf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
-    // The setup commands are sent only *after* openvpn's first line: it opens the
-    // management port a moment before it is ready to parse commands, and anything
-    // sent into that gap (notably "hold release") is silently dropped, leaving it
-    // paused. Its banner is the "ready" signal.
-    let mut setup_sent = false;
+    // [`SETUP`] is sent only *after* openvpn's first line: it opens the management
+    // port a moment before it is ready to parse commands, and anything sent into
+    // that gap (notably "hold release") is silently dropped, leaving it paused.
+    // Its banner is the "ready" signal.
+    //
+    // The commands then go one at a time, each after the previous one's SUCCESS.
+    // That is not politeness: while openvpn is held it drains the socket in a
+    // standalone read loop, and commands written back-to-back arrive in a single
+    // read where it sometimes loses the boundary between them — the pair comes
+    // out as one line ("hold releasehold release", or "log on" wearing the next
+    // command as its parameters). The `hold release` inside such a line is never
+    // executed, so openvpn stays paused and the connect dies on the timeout with
+    // nothing to show for it. One command per read cannot be misread.
+    let mut setup_next = 0usize;
+    // A command is out and its SUCCESS/ERROR has not come back yet.
+    let mut awaiting_ack = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -317,6 +331,25 @@ fn drive(
             // shows the real dialogue.
             push_recent(&mut recent, &line);
 
+            // The reply to the command in flight. Only a bare `SUCCESS:`/`ERROR:`
+            // is one — the same text inside a `>LOG:` line is openvpn quoting
+            // itself back to us, not answering.
+            if awaiting_ack && (line.starts_with("SUCCESS:") || line.starts_with("ERROR:")) {
+                if let Some(rest) = line.strip_prefix("ERROR:") {
+                    // Fail now rather than sitting out the whole connect timeout:
+                    // a rejected command (above all `hold release`) means openvpn
+                    // is never going to start, and the timeout hides why.
+                    return Err(format!(
+                        "openvpn rejected `{}`: {}{}",
+                        SETUP[setup_next.saturating_sub(1)],
+                        rest.trim(),
+                        tail(&recent)
+                    ));
+                }
+                awaiting_ack = false;
+                continue;
+            }
+
             // A state notification may arrive raw (`>STATE:…`, from `state on`) or
             // wrapped in a log echo (`>LOG:…,MANAGEMENT: >STATE:…`, from `log on`);
             // match it wherever it appears so detection never hinges on which one
@@ -339,9 +372,14 @@ fn drive(
                     }
                     _ => {}
                 }
-            } else if setup_sent && line.starts_with(">HOLD:") {
-                // A reconnect re-entered hold — let it proceed again.
+            } else if setup_next == SETUP.len() && !awaiting_ack && line.starts_with(">HOLD:") {
+                // A reconnect re-entered hold — let it proceed again. Gated on the
+                // setup batch being finished, so the *start-up* `>HOLD:` — which
+                // lands in its own read whenever it misses the banner's chunk,
+                // after we have already sent our own release — cannot queue a
+                // second, duplicate one.
                 send(&mut stream, "hold release")?;
+                awaiting_ack = true;
             } else if line.strip_prefix(">PASSWORD:").is_some_and(|r| r.contains("Verification Failed"))
             {
                 return Err("the gateway rejected the username or password".to_string());
@@ -351,12 +389,11 @@ fn drive(
         }
 
         // openvpn has spoken and is ready: enable state + real-time log reporting
-        // and release the start-up hold, once.
-        if !setup_sent && !recent.is_empty() {
-            send(&mut stream, "state on")?;
-            send(&mut stream, "log on")?;
-            send(&mut stream, "hold release")?;
-            setup_sent = true;
+        // and release the start-up hold, one command per round trip.
+        if setup_next < SETUP.len() && !awaiting_ack && !recent.is_empty() {
+            send(&mut stream, SETUP[setup_next])?;
+            setup_next += 1;
+            awaiting_ack = true;
         }
 
         // Read more, tolerating the poll timeout.
@@ -423,10 +460,12 @@ fn connect_mgmt(port: u16, child: &mut Child) -> Result<TcpStream, String> {
     }
 }
 
-/// Send one management command (newline-terminated).
+/// Send one management command. The command and its terminating newline go out
+/// in a single write: openvpn reads the socket as a byte stream, and splitting
+/// the two invites it to read a command and its neighbour as one line.
 fn send(w: &mut TcpStream, cmd: &str) -> Result<(), String> {
-    w.write_all(cmd.as_bytes())
-        .and_then(|_| w.write_all(b"\n"))
+    let line = format!("{cmd}\n");
+    w.write_all(line.as_bytes())
         .and_then(|_| w.flush())
         .map_err(|e| format!("management socket write failed: {e}"))
 }
