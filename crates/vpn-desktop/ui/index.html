@@ -186,11 +186,15 @@
 
   .overlay { position: fixed; inset: 0; background: rgba(6,10,16,.72); display: none; align-items: center; justify-content: center; padding: 24px; z-index: 50; }
   .overlay.show { display: flex; }
-  .modal { width: min(560px,100%); background: var(--window); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 30px 80px -20px rgba(0,0,0,.8); }
-  .modal h3 { margin: 0; padding: 16px 18px; border-bottom: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-md); }
-  .modal .mbody { padding: 16px 18px; font-size: var(--fs-sm); color: var(--muted); }
+  /* A column that never outgrows the window: the compact view is 400x330 and
+     locked non-resizable, so an unconstrained modal would push its own footer —
+     the Cancel/confirm buttons — off-screen with no way to reach them. The body
+     scrolls instead; the title and the buttons always stay put. */
+  .modal { width: min(560px,100%); max-height: 100%; display: flex; flex-direction: column; background: var(--window); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; box-shadow: 0 30px 80px -20px rgba(0,0,0,.8); }
+  .modal h3 { margin: 0; padding: 16px 18px; border-bottom: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-md); flex: 0 0 auto; }
+  .modal .mbody { padding: 16px 18px; font-size: var(--fs-sm); color: var(--muted); overflow-y: auto; }
   .modal .mbody code { font-family: var(--mono); color: var(--accent); background: var(--accent-soft); padding: 1px 5px; border-radius: 4px; }
-  .modal .mfoot { display: flex; gap: 10px; justify-content: flex-end; padding: 16px 18px; border-top: 1px solid var(--line-soft); }
+  .modal .mfoot { display: flex; gap: 10px; justify-content: flex-end; padding: 16px 18px; border-top: 1px solid var(--line-soft); flex: 0 0 auto; }
 
   @media (max-width: 820px) {
     .body { grid-template-columns: 1fr; }
@@ -508,6 +512,23 @@
       <div class="hint" id="portal-err" style="color:var(--bad);margin-top:8px"></div>
     </div>
     <div class="mfoot"><button class="btn btn-ghost" id="portal-cancel">Cancel</button><button class="btn btn-primary" id="portal-ok">Sign in and download</button></div>
+  </div>
+</div>
+
+<!-- A profile handed over by an itmvpn:// link from the config website. Any page
+     can open such a link, so nothing is written until this dialog is confirmed —
+     and it names the gateway and networks, so a profile nobody asked for is
+     recognisable as one. -->
+<div class="overlay" id="link-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="link-title">
+    <h3 id="link-title" class="mono">Import <span id="link-name">a profile</span>?</h3>
+    <div class="mbody">
+      <div id="link-why"></div>
+      <div class="kv" id="link-kv" style="padding-left:0;padding-right:0"></div>
+      <div class="warns" id="link-warns" style="padding:0"></div>
+      <div class="hint" id="link-err" style="color:var(--bad);margin-top:8px"></div>
+    </div>
+    <div class="mfoot"><button class="btn btn-ghost" id="link-cancel">Cancel</button><button class="btn btn-primary" id="link-ok">Import profile</button></div>
   </div>
 </div>
 
@@ -1153,6 +1174,115 @@
       overlay.classList.add("show");
       user.focus();
     });
+  }
+
+  // Confirm a profile that arrived over an itmvpn:// link. The link is untrusted
+  // input — the browser will happily open one from any page — so this shows what
+  // the profile would actually do (which gateway, which networks) rather than a
+  // bare yes/no.
+  function askLinkImport(p) {
+    return new Promise(function (resolve) {
+      var overlay = $("link-overlay"), err = $("link-err");
+      $("link-name").textContent = p.name || p.id;
+      $("link-why").innerHTML = "A link opened from your browser wants to add this VPN profile. " +
+        "Check that it is the one you asked for — only a site you trust should be sending you profiles.";
+      var rows = [
+        ["Gateway", esc(p.gateway || "—")],
+        ["Format", esc(p.format || "—")],
+        ["Sign-in", esc(p.auth || "—")],
+        ["Networks", (p.remote && p.remote.length) ? esc(p.remote.join(", ")) : "<span class=\"redacted\">none — add them before connecting</span>"]
+      ];
+      if (p.dns && p.dns.length) { rows.push(["DNS", esc(p.dns.join(", "))]); }
+      rows.push(["Saved as", esc(p.id)]);
+      $("link-kv").innerHTML = rows.map(function (r) {
+        return '<div class="kv-row"><span class="kk">' + r[0] + '</span><span class="vv">' + r[1] + "</span></div>";
+      }).join("");
+      $("link-warns").innerHTML = (p.warnings || []).map(function (w) {
+        return '<div class="warn-row ' + esc(w.level) + '"><span class="wled"></span><div><div class="wt">' +
+          esc(w.text) + "</div>" + (w.note ? '<div class="wn">' + esc(w.note) + "</div>" : "") + "</div></div>";
+      }).join("");
+      // Landing on top of an installed profile is a bigger deal than adding one,
+      // so it is said here rather than discovered afterwards.
+      if (p.collision === "replace") {
+        // A warning, not a failure: it will work, it just lands on something.
+        err.style.color = "var(--warn)";
+        err.textContent = "This replaces the profile “" + p.id + "” you already have — its saved sign-in stays.";
+        $("link-ok").textContent = "Replace profile";
+      } else if (p.collision === "refuse") {
+        err.style.color = "var(--bad)";
+        err.textContent = "A profile named “" + p.id + "” already exists in another format. Delete it first, or this import will be refused.";
+        $("link-ok").textContent = "Import profile";
+      } else {
+        err.textContent = "";
+        $("link-ok").textContent = "Import profile";
+      }
+
+      function close(result) {
+        overlay.classList.remove("show");
+        document.removeEventListener("keydown", onKey);
+        $("link-ok").removeEventListener("click", onOk);
+        $("link-cancel").removeEventListener("click", onCancel);
+        resolve(result);
+      }
+      function onOk() { close(true); }
+      function onCancel() { close(false); }
+      function onKey(e) {
+        if (e.key === "Escape") { onCancel(); }
+        if (e.key === "Enter" && overlay.classList.contains("show")) { onOk(); }
+      }
+      $("link-ok").addEventListener("click", onOk);
+      $("link-cancel").addEventListener("click", onCancel);
+      document.addEventListener("keydown", onKey);
+      overlay.classList.add("show");
+      $("link-cancel").focus();   // nothing is imported by leaning on Enter
+    });
+  }
+
+  // Confirm and import a profile an itmvpn:// link brought in. The Rust side has
+  // parsed it and is holding it in memory; it only reaches disk if the dialog is
+  // confirmed here.
+  async function handleLinkImport(preview) {
+    // This dialog is a security control — the gateway, the networks and the
+    // warnings have to be readable at a glance, and the compact window (400x330,
+    // locked non-resizable) can only show them a scroll at a time. Take the
+    // window to the full view first; switching back is one click.
+    if (document.body.classList.contains("compact")) {
+      await setView("full");
+    }
+    var accepted = await askLinkImport(preview);
+    if (!accepted) {
+      TAURI.invoke("cancel_link_import").catch(function () {});
+      showNotice('<span class="led" style="box-shadow:none"></span><div>Import cancelled — nothing was saved.</div>', "");
+      return;
+    }
+    try {
+      var id = await TAURI.invoke("confirm_link_import", { token: preview.token });
+      await refresh();
+      var p = profiles.filter(function (x) { return x.id === id; })[0];
+      if (p) { current = p; renderAll(); }
+      showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported <b>' + esc(id) + "</b> from the link.</div>", "");
+    } catch (err) {
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(err)) + "</div>", "bad");
+    }
+  }
+
+  // A .pro — dropped on the window or carried by a link — names a user portal
+  // rather than holding a connection: sign in and the profile is downloaded.
+  async function handleProvisioning(target) {
+    try {
+      var login = await askPortalLogin(target);
+      if (!login) { return; }
+      showNotice('<span class="led" style="box-shadow:none"></span><div>Signing in to the portal and downloading…</div>', "");
+      var id = await TAURI.invoke("import_from_portal", {
+        portalUrl: target.url, username: login.username, password: login.password, name: target.name
+      });
+      await refresh();
+      var p = profiles.filter(function (x) { return x.id === id; })[0];
+      if (p) { current = p; renderAll(); }
+      showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported <b>' + esc(id) + "</b>. Add the networks you need to reach in its settings before connecting.</div>", "");
+    } catch (err) {
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(err)) + "</div>", "bad");
+    }
   }
 
   async function onForgetUserLogin() {
@@ -1918,26 +2048,22 @@
       $("dropzone").classList.remove("show");
       showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String((e && e.payload) || "that file could not be imported")) + "</div>", "bad");
     });
+    // A profile carried in by an itmvpn:// link, while the window was already
+    // open. One that launched the app is collected below instead.
+    EVT.listen("link-import", function (e) { if (e && e.payload) { handleLinkImport(e.payload); } });
     // A dropped .pro can't open a modal from the Rust side, so it arrives here.
-    EVT.listen("provisioning-dropped", async function (e) {
+    EVT.listen("provisioning-dropped", function (e) {
       $("dropzone").classList.remove("show");
-      var target = e && e.payload;
-      if (!target) { return; }
-      try {
-        var login = await askPortalLogin(target);
-        if (!login) { return; }
-        showNotice('<span class="led" style="box-shadow:none"></span><div>Signing in to the portal and downloading…</div>', "");
-        var id = await TAURI.invoke("import_from_portal", {
-          portalUrl: target.url, username: login.username, password: login.password, name: target.name
-        });
-        await refresh();
-        var p = profiles.filter(function (x) { return x.id === id; })[0];
-        if (p) { current = p; renderAll(); }
-        showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported <b>' + esc(id) + "</b>. Add the networks you need to reach in its settings before connecting.</div>", "");
-      } catch (err) {
-        showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(err)) + "</div>", "bad");
-      }
+      if (e && e.payload) { handleProvisioning(e.payload); }
     });
+    // A link that launched the app was staged before this web view existed, so
+    // it could not have been emitted at anything — collect it here instead.
+    TAURI.invoke("take_link_request").then(function (req) {
+      if (!req) { return; }
+      if (req.kind === "confirm") { return handleLinkImport(req); }
+      if (req.kind === "provisioning") { return handleProvisioning(req); }
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(req.message || "that link could not be imported")) + "</div>", "bad");
+    }).catch(function () {});
   }
 
   // Show where profiles live (used in the empty state + the info modal).

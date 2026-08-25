@@ -302,6 +302,50 @@ from, so its gateway may be a private address that will never answer from
 outside; the import warns rather than leaving the user with a connection that
 only times out.
 
+## Importing from the web (`itmvpn://` links)
+
+The config-download website can hand a profile straight to the client instead of
+leaving a file in `Downloads`. The installer registers the `itmvpn://` scheme;
+a link carries the profile inside it, base64url-encoded:
+
+```
+itmvpn://import?data=<base64url>&ext=<ini|scx|tgb|mobileconfig|ovpn|pro>&name=<display name>
+```
+
+`ext` and `name` are optional (`ini` and the profile's own name). Formats are
+still dispatched on content, so `ext` only decides what the file is called on
+disk. A `.pro` in the link opens the portal sign-in rather than importing
+anything. The full contract the website is built against — encoding, sizes, the
+button, what it cannot detect — is in
+[`docs/website-deeplink-integration.md`](docs/website-deeplink-integration.md).
+
+**Nothing a link brings reaches disk on its own.** Any page can open an
+`itmvpn://` link, so the payload is decoded and parsed in memory
+(`backend::stage_link_import`) and held there until the user confirms a dialog
+naming the gateway, the networks and what happens to a profile already installed
+under that name. The confirmation carries a token identifying the staging, so a
+second link arriving while the dialog is open cannot slip its own profile past a
+confirmation meant for another. The client never connects on its own.
+
+Only the inline form is implemented. A `url=` form — the client downloading from
+a short-lived one-time link, which keeps a profile's pre-shared key off the
+Windows command line, where EDR agents and event 4688 record it — is specified
+in the same document and is the intended next step.
+
+Drive the whole path headlessly, without a window or the browser:
+
+```powershell
+# Stage a link and print what the confirmation dialog would show:
+$d = [Convert]::ToBase64String([IO.File]::ReadAllBytes("ITM-TEST01.ini")).Replace('+','-').Replace('/','_').TrimEnd('=')
+cargo run -p vpn-desktop -- --dev link "itmvpn://import?data=$d&ext=ini&name=Test"
+# …and again with `import` appended to actually land the profile.
+```
+
+A dev build is not installed and so owns no scheme. Set `VPN_REGISTER_SCHEME=1`
+to have it claim `itmvpn://` for the current user at startup — deliberately
+opt-in, because that registration lives in the user hive and *shadows* an
+installed client's. Undo it by deleting `HKCU\Software\Classes\itmvpn`.
+
 ## Code-mapping caveat
 
 The NCP format is proprietary; every numeric-code interpretation in
