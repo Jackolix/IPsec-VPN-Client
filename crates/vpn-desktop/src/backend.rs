@@ -14,6 +14,10 @@ use vpn_control::{IkeSa, Transport};
 pub struct AppState {
     pub profile_dir: PathBuf,
     pub transport: Transport,
+    /// What an `itmvpn://` link brought in, until the user has dealt with it.
+    /// Held in memory rather than written out, because a link can come from any
+    /// web page — see [`stage_link_import`].
+    pending_link: std::sync::Arc<std::sync::Mutex<Staged>>,
 }
 
 impl AppState {
@@ -33,6 +37,7 @@ impl AppState {
         AppState {
             profile_dir,
             transport,
+            pending_link: Default::default(),
         }
     }
 }
@@ -92,7 +97,7 @@ pub fn daemon_stop(state: &AppState) -> std::result::Result<(), String> {
     crate::daemon::stop(&vici_addr(state))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WarnItem {
     pub level: String,
     pub text: String,
@@ -649,6 +654,252 @@ pub fn classify_import(
 pub enum ImportOutcome {
     Profile { id: String },
     Provisioning { url: String, name: String, otp: bool },
+}
+
+/// A profile carried in by an `itmvpn://` link: decoded and parsed, but not yet
+/// on disk. It lives in [`AppState::pending_link`] until the user confirms.
+struct PendingImport {
+    /// Identifies this staging, so a confirmation can only import the profile
+    /// the dialog actually described — see [`ImportPreview::token`].
+    token: u64,
+    stem: String,
+    ext: String,
+    text: String,
+}
+
+/// Everything an `itmvpn://` link left behind for the UI to act on.
+#[derive(Default)]
+struct Staged {
+    /// A request the window has not been told about yet. A link that *launched*
+    /// the app is staged before the web view has attached its event listeners,
+    /// so it would miss an emitted event; it collects the request from here
+    /// instead, once, on load ([`take_link_request`]).
+    undelivered: Option<LinkRequest>,
+    /// The profile itself, held until it is confirmed or declined.
+    profile: Option<PendingImport>,
+}
+
+/// What a deep link turned out to be asking for.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum LinkRequest {
+    /// A profile is staged; the UI shows this and calls [`commit_link_import`]
+    /// if the user agrees.
+    Confirm(ImportPreview),
+    /// The link carried a `.pro`, which names a portal rather than holding a
+    /// connection — the same sign-in the GUI runs for a dropped `.pro`.
+    Provisioning { url: String, name: String, otp: bool },
+    /// The link was malformed or carried something that is not a profile. Kept
+    /// as a request of its own so a link that launched the app can still explain
+    /// itself once the window is up, instead of the launch looking like nothing
+    /// happened.
+    Failed { message: String },
+}
+
+/// What the confirmation dialog shows about a staged profile. Enough for a user
+/// to recognise a profile they were expecting — and to notice one they were not,
+/// which is the whole point of confirming: an `itmvpn://` link can come from any
+/// page, not only from the config site.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportPreview {
+    /// Handed back to [`commit_link_import`] on confirm. A second link staged
+    /// while this dialog is open replaces what is staged, and without the token
+    /// the confirmation would import that newer profile while showing this one.
+    pub token: u64,
+    /// The id (file stem) the profile would land under.
+    pub id: String,
+    pub name: String,
+    pub gateway: String,
+    /// The networks the profile would route over the tunnel.
+    pub remote: Vec<String>,
+    pub dns: Vec<String>,
+    /// Human-readable format, as in the profile list.
+    pub format: String,
+    pub auth: String,
+    pub warnings: Vec<WarnItem>,
+    /// What this would do to a profile that is already installed under the same
+    /// name: `none`, `replace` (same file, overwritten in place — the id keeps
+    /// its stored credentials), or `refuse` (one of that name exists in another
+    /// format, which [`save_imported_text`] will not clobber). Said up front,
+    /// because "import" quietly meaning "replace" is exactly what a link from a
+    /// page nobody vetted should not get to do unannounced.
+    pub collision: String,
+}
+
+/// Decode-and-check a profile a deep link brought in, and park it for
+/// confirmation. Nothing is written to disk here: the link is untrusted input,
+/// so the file only lands once the user has seen what is in it and agreed
+/// ([`commit_link_import`]).
+///
+/// Validation is the same as for a file import — junk is rejected here rather
+/// than after the confirmation, so a broken link fails with a reason instead of
+/// an empty dialog.
+pub fn stage_link_import(
+    state: &AppState,
+    link: crate::deeplink::LinkImport,
+) -> std::result::Result<LinkRequest, String> {
+    if let Some(target) = crate::portal::target(&link.text) {
+        return Ok(LinkRequest::Provisioning {
+            url: target.url,
+            name: target.name,
+            otp: target.otp,
+        });
+    }
+
+    // `format_label` reads the extension off a file name, which a link has no
+    // real one of; name the format from the extension it claims.
+    let format = format_label(&format!("profile.{}", link.ext)).to_string();
+    // Two different names: `stem` is what the file (and therefore the profile id)
+    // is called, which the link may set; `display` is the name the profile
+    // carries inside itself, which is what the profile list shows. Titling the
+    // dialog with the stem would name something the user never sees again.
+    let (stem, display, preview) = if link.ext == "ovpn" {
+        // An `.ovpn` is not an IPsec profile — check it against OpenVPN's own
+        // markers, exactly as `import_path` does for a picked file.
+        if !crate::ssl::looks_like_ovpn(&link.text) {
+            return Err("that link does not contain a valid OpenVPN configuration".to_string());
+        }
+        let meta = crate::ssl::parse_meta(&link.text);
+        let name = link.name.clone().unwrap_or_else(|| "Sophos SSL VPN".to_string());
+        let gateway = if meta.port.is_empty() {
+            meta.gateway.clone()
+        } else {
+            format!("{}:{}", meta.gateway, meta.port)
+        };
+        let auth = if meta.needs_user {
+            "Certificate + username and password".to_string()
+        } else {
+            "Certificate".to_string()
+        };
+        let warnings = vec![WarnItem {
+            level: "info".to_string(),
+            text: "Routes and DNS are pushed by the gateway on connect".to_string(),
+            note: String::new(),
+        }];
+        // An SSL profile carries no name of its own — the list shows its id — so
+        // both names are the same here.
+        (
+            name.clone(),
+            name,
+            (gateway, Vec::new(), Vec::new(), auth, warnings),
+        )
+    } else {
+        let imported = parse_text(&link.text)?;
+        let config = &imported.config;
+        let stem = link.name.clone().unwrap_or_else(|| config.name.clone());
+        let auth = match config.user_auth.as_ref() {
+            Some(_) => match config.ike_version {
+                vpn_core::IkeVersion::V1 => "Pre-shared key + XAuth login".to_string(),
+                vpn_core::IkeVersion::V2 => "Pre-shared key + EAP login".to_string(),
+            },
+            None => "Pre-shared key".to_string(),
+        };
+        (
+            stem,
+            config.name.clone(),
+            (
+                config.gateway.clone(),
+                config.remote_subnets.iter().map(|n| n.to_string()).collect(),
+                config.dns.servers.iter().map(|s| s.to_string()).collect(),
+                auth,
+                imported
+                    .warnings
+                    .iter()
+                    .map(|w| to_warn_item(&w.to_string()))
+                    .collect(),
+            ),
+        )
+    };
+
+    let (gateway, remote, dns, auth, warnings) = preview;
+    let id = sanitize_stem(&stem).trim_matches('.').to_string();
+    if id.is_empty() {
+        return Err("the profile in that link has no usable name".to_string());
+    }
+    let dest = state.profile_dir.join(format!("{id}.{}", link.ext));
+    let installed: Vec<PathBuf> = PROFILE_EXTENSIONS
+        .iter()
+        .map(|e| state.profile_dir.join(format!("{id}.{e}")))
+        .filter(|p| p.exists())
+        .collect();
+    let collision = match installed.as_slice() {
+        [] => "none",
+        [only] if *only == dest => "replace",
+        _ => "refuse",
+    }
+    .to_string();
+
+    // Wraps only after 2^64 links; a repeat would have to coincide with a
+    // dialog left open across all of them.
+    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    pending_slot(state).profile = Some(PendingImport {
+        token,
+        stem,
+        ext: link.ext,
+        text: link.text,
+    });
+
+    Ok(LinkRequest::Confirm(ImportPreview {
+        token,
+        id,
+        name: display,
+        gateway,
+        remote,
+        dns,
+        format,
+        auth,
+        warnings,
+        collision,
+    }))
+}
+
+/// Park a request for the window to collect when it is ready, instead of
+/// emitting it at a window that may not be listening yet (see [`Staged`]).
+pub fn defer_link_request(state: &AppState, request: LinkRequest) {
+    pending_slot(state).undelivered = Some(request);
+}
+
+/// Hand the window whatever a link left for it, once.
+pub fn take_link_request(state: &AppState) -> Option<LinkRequest> {
+    pending_slot(state).undelivered.take()
+}
+
+/// Write the staged profile out — the user said yes. `token` is the one the
+/// confirmed preview carried, so a link that arrived while the dialog was open
+/// cannot slip its own profile past a confirmation meant for another.
+/// Returns the new id.
+pub fn commit_link_import(state: &AppState, token: u64) -> std::result::Result<String, String> {
+    let mut slot = pending_slot(state);
+    match slot.profile.as_ref() {
+        Some(p) if p.token == token => {}
+        Some(_) => {
+            return Err(
+                "another link came in while this was open — open the link you want again"
+                    .to_string(),
+            )
+        }
+        None => return Err("that import is no longer waiting — open the link again".to_string()),
+    }
+    let pending = slot.profile.take().expect("checked just above");
+    drop(slot);
+    save_imported_text(state, &pending.stem, &pending.ext, &pending.text)
+}
+
+/// Drop the staged profile — the user said no, or closed the dialog.
+pub fn cancel_link_import(state: &AppState) {
+    *pending_slot(state) = Staged::default();
+}
+
+/// The staging slot, surviving a panic in whoever held the lock last: a poisoned
+/// mutex here would otherwise make every later deep link fail until restart, and
+/// what it guards is a single replaceable profile.
+fn pending_slot(state: &AppState) -> std::sync::MutexGuard<'_, Staged> {
+    state
+        .pending_link
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Remove an imported profile and everything that trails it: the profile file,
@@ -1230,5 +1481,168 @@ mod tests {
         assert_eq!(strip_ovpn_timestamp("done"), "done");
         // Looks date-ish but isn't the full stamp — left as-is, no panic.
         assert_eq!(strip_ovpn_timestamp("2026-08-10 partial"), "2026-08-10 partial");
+    }
+
+    /// A throwaway state whose profile directory is empty and per-test.
+    fn scratch_state(tag: &str) -> AppState {
+        let dir = std::env::temp_dir().join(format!("vpn_link_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch profile dir");
+        AppState {
+            profile_dir: dir,
+            transport: Transport::Tcp("127.0.0.1:0".to_string()),
+            pending_link: Default::default(),
+        }
+    }
+
+    /// Minimal NCP profile the importer accepts — no real key, no real gateway.
+    const SAMPLE: &str = "[PROFILE1]\n\
+                          Name=Link Test\n\
+                          Gateway=vpn.example.test\n\
+                          Secret=\"not-a-real-key\"\n\
+                          IkeIdType=3\n\
+                          IkeIdStr=user@example.test\n\
+                          ExchMode=34\n\
+                          IKEv2Auth=2\n\
+                          IkeDhGroup=14\n\
+                          PFS=14\n\
+                          IKEv2Policy=P\n\
+                          IPSEC-Policy=P\n\
+                          Network1=10.0.0.0\n\
+                          SubMask1=255.255.255.0\n\
+                          [IKEV2POLICY1]\n\
+                          Ikev2Name=P\nIkev2Crypt=6\nIkev2PRF=5\nIkev2IntAlgo=12\n\
+                          [IPSECPOLICY1]\n\
+                          IPSecName=P\nIpsecCrypt=6\nIpsecAuth=5\n";
+
+    fn sample_link(ext: &str, name: Option<&str>) -> crate::deeplink::LinkImport {
+        crate::deeplink::LinkImport {
+            name: name.map(str::to_string),
+            ext: ext.to_string(),
+            text: SAMPLE.to_string(),
+        }
+    }
+
+    /// The point of staging: a link describes a profile without writing one.
+    #[test]
+    fn a_staged_link_reaches_disk_only_once_confirmed() {
+        let state = scratch_state("confirm");
+        let request = stage_link_import(&state, sample_link("ini", Some("Kanzlei"))).expect("stages");
+        let LinkRequest::Confirm(preview) = request else {
+            panic!("expected a profile to confirm");
+        };
+        // The link names the file; the profile names itself. Both are shown, so
+        // the dialog's title matches what the profile list will call it.
+        assert_eq!(preview.id, "Kanzlei");
+        assert_eq!(preview.name, "Link Test");
+        assert_eq!(preview.gateway, "vpn.example.test");
+        assert_eq!(preview.collision, "none");
+        assert_eq!(preview.remote, vec!["10.0.0.0/24"]);
+        assert!(
+            !state.profile_dir.join("Kanzlei.ini").exists(),
+            "staging must not write the profile out"
+        );
+
+        assert_eq!(commit_link_import(&state, preview.token).as_deref(), Ok("Kanzlei"));
+        assert!(state.profile_dir.join("Kanzlei.ini").exists());
+        // The staged copy is spent: a second confirm has nothing to import.
+        assert!(commit_link_import(&state, preview.token).is_err());
+        let _ = std::fs::remove_dir_all(&state.profile_dir);
+    }
+
+    /// Declining must leave nothing behind for a later dialog to import.
+    #[test]
+    fn declining_drops_the_staged_profile() {
+        let state = scratch_state("cancel");
+        let request = stage_link_import(&state, sample_link("ini", Some("Kanzlei"))).expect("stages");
+        let LinkRequest::Confirm(preview) = request else { panic!("expected a profile") };
+        cancel_link_import(&state);
+        assert!(commit_link_import(&state, preview.token).is_err());
+        assert!(!state.profile_dir.join("Kanzlei.ini").exists());
+        let _ = std::fs::remove_dir_all(&state.profile_dir);
+    }
+
+    /// A link arriving while the dialog is open replaces what is staged, so the
+    /// confirmation must not import the newcomer in the shown profile's place.
+    #[test]
+    fn confirming_imports_the_profile_that_was_shown() {
+        let state = scratch_state("token");
+        let first = stage_link_import(&state, sample_link("ini", Some("Shown"))).expect("stages");
+        let LinkRequest::Confirm(shown) = first else { panic!("expected a profile") };
+        // A second link lands while the first dialog is still open.
+        let second = stage_link_import(&state, sample_link("ini", Some("Sneaky"))).expect("stages");
+        let LinkRequest::Confirm(newer) = second else { panic!("expected a profile") };
+
+        assert!(commit_link_import(&state, shown.token).is_err(), "stale confirmation");
+        assert!(!state.profile_dir.join("Sneaky.ini").exists());
+        assert!(!state.profile_dir.join("Shown.ini").exists());
+        // The newer one is still confirmable on its own terms.
+        assert_eq!(commit_link_import(&state, newer.token).as_deref(), Ok("Sneaky"));
+        let _ = std::fs::remove_dir_all(&state.profile_dir);
+    }
+
+    /// Landing on top of an installed profile is announced before the user
+    /// commits — replacing one in place, and being refused across formats.
+    #[test]
+    fn a_collision_with_an_installed_profile_is_reported_up_front() {
+        let state = scratch_state("collide");
+        let first = stage_link_import(&state, sample_link("ini", Some("Kanzlei"))).expect("stages");
+        let LinkRequest::Confirm(first) = first else { panic!("expected a profile") };
+        commit_link_import(&state, first.token).expect("imports");
+
+        let same = stage_link_import(&state, sample_link("ini", Some("Kanzlei"))).expect("stages");
+        let LinkRequest::Confirm(preview) = same else { panic!("expected a profile") };
+        assert_eq!(preview.collision, "replace");
+        assert!(
+            commit_link_import(&state, preview.token).is_ok(),
+            "same file is overwritten in place"
+        );
+
+        let other = stage_link_import(&state, sample_link("scx", Some("Kanzlei"))).expect("stages");
+        let LinkRequest::Confirm(preview) = other else { panic!("expected a profile") };
+        assert_eq!(preview.collision, "refuse");
+        assert!(
+            commit_link_import(&state, preview.token).is_err(),
+            "a second format under the same id must not land"
+        );
+        let _ = std::fs::remove_dir_all(&state.profile_dir);
+    }
+
+    /// A link that launched the app is parked, then collected exactly once.
+    #[test]
+    fn a_deferred_request_is_delivered_once() {
+        let state = scratch_state("defer");
+        assert!(take_link_request(&state).is_none());
+        defer_link_request(
+            &state,
+            LinkRequest::Failed { message: "nope".to_string() },
+        );
+        assert!(matches!(
+            take_link_request(&state),
+            Some(LinkRequest::Failed { .. })
+        ));
+        assert!(take_link_request(&state).is_none());
+        let _ = std::fs::remove_dir_all(&state.profile_dir);
+    }
+
+    /// A `.pro` names a portal instead of carrying a connection, so it must not
+    /// be staged as an importable profile.
+    #[test]
+    fn a_provisioning_file_becomes_a_portal_sign_in() {
+        let state = scratch_state("pro");
+        let link = crate::deeplink::LinkImport {
+            name: Some("Portal".to_string()),
+            ext: "pro".to_string(),
+            text: "[{\"display_name\":\"Example VPN\",\"gateway\":\"portal.example.test\"}]"
+                .to_string(),
+        };
+        match stage_link_import(&state, link) {
+            Ok(LinkRequest::Provisioning { url, .. }) => {
+                assert!(url.contains("portal.example.test"), "{url}")
+            }
+            other => panic!("expected a portal sign-in, got {other:?}"),
+        }
+        assert!(commit_link_import(&state, 1).is_err(), "nothing to import");
+        let _ = std::fs::remove_dir_all(&state.profile_dir);
     }
 }

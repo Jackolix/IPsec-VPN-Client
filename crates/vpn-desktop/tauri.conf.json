@@ -38,6 +38,11 @@
     ]
   },
   "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["itmvpn"]
+      }
+    },
     "updater": {
       "endpoints": [
         "https://github.com/Jackolix/IPsec-VPN-Client/releases/latest/download/latest.json"

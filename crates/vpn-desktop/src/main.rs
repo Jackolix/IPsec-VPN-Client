@@ -9,6 +9,7 @@
 mod backend;
 mod creds;
 mod daemon;
+mod deeplink;
 mod dns;
 mod overrides;
 mod portal;
@@ -84,6 +85,37 @@ async fn import_from_portal(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Collect what an `itmvpn://` link left for the window, if anything. Called
+/// once on load: a link that *launched* the app is staged before the web view
+/// exists, so it cannot be delivered as an event.
+#[tauri::command]
+async fn take_link_request(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<backend::LinkRequest>, String> {
+    Ok(backend::take_link_request(state.inner()))
+}
+
+/// Import the profile an `itmvpn://` link brought in, after the user confirmed
+/// it. Returns the new profile id.
+#[tauri::command]
+async fn confirm_link_import(
+    state: tauri::State<'_, AppState>,
+    token: u64,
+) -> Result<String, String> {
+    let s = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || backend::commit_link_import(&s, token))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Throw away the profile an `itmvpn://` link brought in — the user declined it,
+/// so it should not linger in memory waiting to be confirmed by a later dialog.
+#[tauri::command]
+async fn cancel_link_import(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    backend::cancel_link_import(state.inner());
+    Ok(())
 }
 
 /// Delete an imported profile: its `.ini`, its saved edits, and its stored PSK.
@@ -299,6 +331,29 @@ fn dev(args: &[String]) {
             backend::connect(&state, args.get(1).cloned().unwrap_or_default(), login)
                 .map(|o| serde_json::to_string(&o).expect("serialize outcome"))
         }
+        // `link <itmvpn://…> [import]` — run a deep link through the same
+        // staging the GUI does, printing what the confirmation dialog would
+        // show. Without `import` nothing is written, which is the point: it
+        // exercises the untrusted path without landing a profile.
+        Some("link") => url::Url::parse(args.get(1).map(String::as_str).unwrap_or(""))
+            .map_err(|e| format!("bad url: {e}"))
+            .and_then(|u| deeplink::parse(&u))
+            .and_then(|link| backend::stage_link_import(&state, link))
+            .and_then(|request| {
+                let staged = serde_json::to_string_pretty(&request).expect("serialize request");
+                let token = match &request {
+                    backend::LinkRequest::Confirm(preview) => Some(preview.token),
+                    _ => None,
+                };
+                match (args.get(2).map(String::as_str), token) {
+                    (Some("import"), Some(token)) => backend::commit_link_import(&state, token)
+                        .map(|id| format!("{staged}\nimported: {id}")),
+                    _ => {
+                        backend::cancel_link_import(&state);
+                        Ok(staged)
+                    }
+                }
+            }),
         Some("needs-user-login") => Ok(
             if backend::needs_user_login(&state, args.get(1).map(String::as_str).unwrap_or("")) {
                 "yes".to_string()
@@ -453,6 +508,10 @@ fn main() {
             tray::reveal(app);
         }))
         .plugin(tauri_plugin_dialog::init())
+        // Registered after single-instance, whose `deep-link` feature hands a
+        // second launch's `itmvpn://` URL to this plugin instead of letting it
+        // start a second copy of the app.
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::from_env())
         .invoke_handler(tauri::generate_handler![
@@ -475,6 +534,9 @@ fn main() {
             get_profile_edit,
             save_profile_edit,
             reset_profile_edit,
+            take_link_request,
+            confirm_link_import,
+            cancel_link_import,
             app_version,
             check_update,
             install_update
@@ -482,6 +544,7 @@ fn main() {
         .setup(|app| {
             tray::build(app.handle())?;
             update::watch(app.handle());
+            deeplink::watch(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| match event {
