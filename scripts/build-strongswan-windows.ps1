@@ -31,6 +31,19 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
+# Remove a container that may not exist, without letting that end the script.
+#
+# Under $ErrorActionPreference='Stop' a native command writing to stderr becomes
+# a terminating error — in Windows PowerShell 5.1 as a NativeCommandError, and in
+# PowerShell 7.3+ via $PSNativeCommandUseErrorActionPreference. On a clean
+# machine the export container does not exist yet, so `docker rm -f` says so on
+# stderr and the script dies *after* the very long image build has succeeded.
+# Failure here is genuinely uninteresting; where it isn't, $LASTEXITCODE is
+# checked explicitly.
+function Remove-ContainerQuietly([string]$Name) {
+    try { docker rm -f $Name 2>&1 | Out-Null } catch { }
+}
+
 $dockerfile = "docker/strongswan-windows/Dockerfile"
 $confSrc    = "docker/strongswan-windows/strongswan.conf"
 
@@ -40,7 +53,7 @@ if ($LASTEXITCODE -ne 0) { throw "docker build failed ($LASTEXITCODE)" }
 
 # Export /dist out of a throwaway container.
 $container = "$Tag-export"
-docker rm -f $container 2>$null | Out-Null
+Remove-ContainerQuietly $container
 docker create --name $container $Tag | Out-Null
 try {
     if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
@@ -50,7 +63,7 @@ try {
     docker cp "${container}:/dist/." $OutDir
     if ($LASTEXITCODE -ne 0) { throw "docker cp failed ($LASTEXITCODE)" }
 } finally {
-    docker rm -f $container 2>$null | Out-Null
+    Remove-ContainerQuietly $container
 }
 
 # Drop the Windows strongswan.conf into etc\ (the daemon reads etc\strongswan.conf
