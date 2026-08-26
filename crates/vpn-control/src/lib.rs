@@ -13,6 +13,7 @@ pub use status::{ChildSa, IkeSa};
 
 use serde::Serialize;
 use std::io::{Read, Write};
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 use thiserror::Error;
 use vici::{Client, Message};
@@ -181,8 +182,11 @@ pub fn connect_logged(
     }
 
     let mut client = open(transport)?;
+    // Resolved once for the whole connect: the version fallback below runs a
+    // second attempt, and a cold lookup costs about a second.
+    let peers = peer_ids(&config.gateway);
     let primary = config.ike_version;
-    let mut outcome = attempt(&mut client, config, name, primary, user_password)?;
+    let mut outcome = attempt(&mut client, config, name, primary, user_password, &peers)?;
 
     // The IKE version is not stated in a Sophos `.scx` (and a `.mobileconfig`
     // states it, but old gateways still disagree), so the version we import can
@@ -201,7 +205,7 @@ pub fn connect_logged(
                 alternate.swanctl_value()
             ),
         ));
-        let retry = attempt(&mut client, config, name, alternate, user_password)?;
+        let retry = attempt(&mut client, config, name, alternate, user_password, &peers)?;
 
         let mut log = outcome.log;
         log.extend(retry.log);
@@ -230,20 +234,21 @@ fn attempt(
     name: &str,
     version: IkeVersion,
     user_password: Option<&Secret>,
+    peers: &[String],
 ) -> Result<ConnectOutcome> {
     check(
         client.request("load-conn", bridge::load_conn_message_for(config, name, version))?,
         "load-conn",
     )?;
     check(
-        client.request("load-shared", bridge::load_shared_message(config, name))?,
+        client.request("load-shared", bridge::load_shared_message(config, name, peers))?,
         "load-shared",
     )?;
     if let Some(password) = user_password.filter(|_| config.user_auth.is_some()) {
         check(
             client.request(
                 "load-shared",
-                bridge::load_shared_user_auth_message_for(config, name, password, version),
+                bridge::load_shared_user_auth_message_for(config, name, password, version, peers),
             )?,
             "load-shared (user auth)",
         )?;
@@ -257,6 +262,7 @@ fn attempt(
     let mut first_error: Option<String> = None;
 
     for child in &children {
+        let before = log.len();
         let (events, response) = client.stream_request(
             "initiate",
             "log",
@@ -270,16 +276,36 @@ fn attempt(
         }
         if response.get_str("success").as_deref() == Some("yes") {
             established += 1;
-        } else {
-            let err = response
-                .get_str("errmsg")
-                .unwrap_or_else(|| "charon declined to initiate the connection".to_string());
-            // Which subnet failed matters when the others came up: the tunnel
-            // looks fine but part of the remote network is unreachable.
+            continue;
+        }
+
+        let err = response
+            .get_str("errmsg")
+            .unwrap_or_else(|| "charon declined to initiate the connection".to_string());
+        // Which subnet failed matters when the others came up: the tunnel
+        // looks fine but part of the remote network is unreachable.
+        if children.len() > 1 {
+            log.push(note(name, format!("{child} did not come up: {err}")));
+        }
+        first_error.get_or_insert(err);
+
+        // Credentials the gateway just rejected will be rejected again: every
+        // remaining child would open its own IKE_SA and repeat the same login.
+        // That cannot succeed, and it is actively harmful — a gateway that
+        // locks an account after N bad attempts (Sophos does) gets N tries
+        // burned per click, so a mistyped password locks the user out and the
+        // profile then fails even once it is corrected. A rejected subnet is
+        // different: the others are still worth trying.
+        if suggests_auth_failure(&log[before..]) {
             if children.len() > 1 {
-                log.push(note(name, format!("{child} did not come up: {err}")));
+                log.push(note(
+                    name,
+                    "the gateway rejected these credentials — not trying the remaining \
+                     networks, so a repeated attempt cannot lock the account"
+                        .to_string(),
+                ));
             }
-            first_error.get_or_insert(err);
+            break;
         }
     }
 
@@ -326,6 +352,25 @@ fn suggests_wrong_ike_version(log: &[LogLine]) -> bool {
     log.iter().any(|line| {
         let msg = line.msg.to_ascii_uppercase();
         msg.contains("NO_PROPOSAL_CHOSEN") || msg.contains("NO_PROP")
+    })
+}
+
+/// Did the peer reject who we are, rather than what we asked for? Covers both
+/// authentication rounds charon reports separately: the IKE authentication
+/// itself (`AUTHENTICATION_FAILED`, IKEv1 or IKEv2) and the interactive second
+/// round on top of it (`XAuth authentication of '...' failed`, and the EAP
+/// equivalent).
+///
+/// This is deliberately narrow. It gates *stopping early*, and stopping early
+/// on a failure that was not about credentials would leave working subnets
+/// unreachable.
+fn suggests_auth_failure(log: &[LogLine]) -> bool {
+    log.iter().any(|line| {
+        let msg = line.msg.to_ascii_uppercase();
+        msg.contains("AUTHENTICATION_FAILED")
+            || msg.contains("AUTHENTICATION FAILED")
+            || (msg.contains("XAUTH") && msg.contains("FAILED"))
+            || (msg.contains("EAP") && msg.contains("FAILED"))
     })
 }
 
@@ -379,13 +424,52 @@ pub fn status(transport: &Transport) -> Result<Vec<IkeSa>> {
     Ok(status::parse_sas(&events))
 }
 
-/// Terminate the named IKE SA.
+/// Every identity charon may use for the far end of a connection to `gateway`.
+///
+/// A connection that does not pin the peer's identity gets the gateway's
+/// *address* as the remote ID, so a profile that names its gateway by hostname
+/// needs the resolved addresses among its secret's owners too — the hostname
+/// alone would match nothing and charon would report no shared key at all.
+/// Resolution is best effort: charon has to resolve the same name to reach the
+/// gateway, so a failure here is a failure there, and the hostname stays in the
+/// list either way.
+fn peer_ids(gateway: &str) -> Vec<String> {
+    let mut ids = vec![gateway.to_string()];
+    if gateway.parse::<std::net::IpAddr>().is_ok() {
+        return ids;
+    }
+    // The port is irrelevant — `to_socket_addrs` is just the resolver.
+    if let Ok(addrs) = (gateway, 500u16).to_socket_addrs() {
+        for addr in addrs {
+            let ip = addr.ip().to_string();
+            if !ids.contains(&ip) {
+                ids.push(ip);
+            }
+        }
+    }
+    ids
+}
+
+/// Terminate the named IKE SA and drop the credentials it was loaded with.
 pub fn disconnect(transport: &Transport, name: &str) -> Result<()> {
     let mut client = open(transport)?;
-    check(
+    let terminated = check(
         client.request("terminate", Message::new().str("ike", name))?,
         "terminate",
-    )
+    );
+
+    // Everything pushed over vici outlives the SA it was pushed for: charon
+    // holds loaded connections and secrets until they are unloaded or it
+    // restarts. A disconnected profile's PSK left in the credential set still
+    // competes for every later connection (see `bridge::secret_owners`), so
+    // retire it along with the tunnel. Failures are uninteresting here — "not
+    // loaded" is the state being asked for.
+    for id in [format!("ike-{name}"), format!("user-{name}")] {
+        let _ = client.request("unload-shared", Message::new().str("id", id));
+    }
+    let _ = client.request("unload-conn", Message::new().str("name", name));
+
+    terminated
 }
 
 #[cfg(test)]
@@ -464,6 +548,33 @@ mod tests {
 
         let unreachable = [log_line("retransmit 5 of request with message ID 0")];
         assert!(!suggests_wrong_ike_version(&unreachable));
+    }
+
+    /// The counterpart to the test above: what must *not* trigger the fallback
+    /// is exactly what must stop the per-subnet loop, so a rejected login is
+    /// tried once rather than once per remote network.
+    #[test]
+    fn auth_failure_stops_the_per_subnet_loop() {
+        assert!(suggests_auth_failure(&[log_line(
+            "XAuth authentication of 'ikoelbl' (myself) failed"
+        )]));
+        assert!(suggests_auth_failure(&[log_line(
+            "received AUTHENTICATION_FAILED notify error"
+        )]));
+        assert!(suggests_auth_failure(&[log_line("EAP-MSCHAPv2 authentication failed")]));
+
+        // A subnet the gateway has no policy for, or a peer that never answered,
+        // says nothing about our credentials — the remaining subnets are still
+        // worth initiating.
+        assert!(!suggests_auth_failure(&[log_line(
+            "no acceptable traffic selectors found"
+        )]));
+        assert!(!suggests_auth_failure(&[log_line(
+            "retransmit 5 of request with message ID 0"
+        )]));
+        assert!(!suggests_auth_failure(&[log_line(
+            "received NO_PROPOSAL_CHOSEN notify error"
+        )]));
     }
 
     #[test]
