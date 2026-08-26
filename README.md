@@ -71,10 +71,16 @@ cargo test --workspace
 
 ### Native Windows tunnel (no container)
 
-The tunnel can terminate on the Windows host itself, via strongSwan's native
-`charon-svc.exe` on the Windows Filtering Platform. This is needed because
-Windows' built-in IKEv2 client can't negotiate the profile's suite (PSK auth +
-DH group 15 / modp3072).
+The tunnel terminates on the Windows host itself, via strongSwan's native
+`charon-svc.exe`. This is needed because Windows' built-in IKEv2 client can't
+negotiate the profile's suite (PSK auth + DH group 15 / modp3072).
+
+ESP runs in **userland** (`kernel-libipsec`) over a Wintun adapter, with
+`kernel-iph` managing addresses and routes. Windows' own IPsec engine
+(`kernel-wfp`) is deliberately not built: it drops UDP-encapsulated ESP in
+tunnel mode, and behind NAT that encapsulation is not optional — so it cannot
+carry a road-warrior tunnel at all. See the rationale at the top of
+`docker/strongswan-windows/Dockerfile`.
 
 ```powershell
 # 1. Cross-build charon-svc.exe + plugins (Docker + MinGW) and export to out\:
@@ -99,8 +105,37 @@ container backend. `charon-svc.exe` + its DLLs ship as bundled app resources
 they resolve from `out\strongswan-windows`. Run
 `scripts\build-strongswan-windows.ps1` before `tauri build` so the artifacts
 exist to bundle. Verified against the LANCOM: IKEv2/PSK/modp3072 negotiated,
-virtual IP and route installed on a host adapter (WFP + IP Helper), ESP data
-plane live.
+virtual IP and route installed on a Wintun adapter (libipsec + IP Helper), ESP
+data plane live.
+
+#### Running several tunnels at once
+
+Several tunnels can be connected together — IPsec and SSL, in any mix. Only one
+of them may be a *full* tunnel, since there is one default route to take; that
+is refused up front rather than resolved silently by interface metric.
+
+**Every tunnel needs its own adapter, and this is not cosmetic.** Windows
+selects a source address **per interface, not per route**, and uses the strong
+host model on send. Put two virtual IPs on one adapter and Windows hands the
+first one to every destination; the second tunnel's packets then match none of
+its own policies, libipsec drops them, and the tunnel sits there reporting
+established while carrying nothing. So:
+
+- SSL gets one `openvpn` process and one adapter per slot (`OpenVPN Data
+  Channel`, ` 2`, ` 3`, …).
+- IPsec gets one Wintun adapter per virtual IP, via
+  `0003-per-tunnel-wintun-adapter.patch`. `kernel_libipsec_router` keys its TUN
+  devices by virtual IP and names the route interface from that, so a tunnel's
+  routes follow its address onto its own adapter.
+
+`kernel-libipsec` still creates one device for itself at startup, which takes
+the `strongSwan` name and stays idle; tunnels get `strongSwan 2`, `strongSwan
+3`, and so on. The ceiling is 8 concurrent IPsec tunnels
+(`WINTUN_MAX_ADAPTERS`).
+
+If a tunnel is ever up and reachable only with `ping -S <its virtual IP>`, this
+is what regressed: check that its routes and its address are on the *same*
+adapter (`Get-NetRoute -InterfaceAlias 'strongSwan*'`).
 
 If the app icons are ever regenerated: `powershell.exe -File scripts\gen-icons.ps1`.
 
