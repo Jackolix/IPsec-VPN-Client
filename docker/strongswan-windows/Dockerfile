@@ -73,11 +73,16 @@ RUN wget -q "https://download.strongswan.org/strongswan-${STRONGSWAN_VER}.tar.bz
 #       registry on lib->tun, so a plugin can supply the device) comes from
 #       upstream's `wintun` branch; the device itself is ours — upstream's has
 #       never been compiled, and its packet I/O is empty stubs returning TRUE.
+# 0003: one adapter per virtual IP. Without it a second concurrent tunnel comes
+#       up and carries nothing: Windows picks a source address per interface,
+#       so every tunnel sharing one adapter gets the first one's address.
 COPY docker/strongswan-windows/0001-kernel-iph-install-virtual-ips.patch /src/
 COPY docker/strongswan-windows/0002-wintun-tun-device-plugin.patch /src/
+COPY docker/strongswan-windows/0003-per-tunnel-wintun-adapter.patch /src/
 RUN cd "strongswan-${STRONGSWAN_VER}" \
     && patch -p1 --fuzz=0 < /src/0001-kernel-iph-install-virtual-ips.patch \
-    && patch -p1 --fuzz=0 < /src/0002-wintun-tun-device-plugin.patch
+    && patch -p1 --fuzz=0 < /src/0002-wintun-tun-device-plugin.patch \
+    && patch -p1 --fuzz=0 < /src/0003-per-tunnel-wintun-adapter.patch
 
 # The wintun patch touches configure.ac/Makefile.am, so regenerate the build
 # system (the release tarball ships pre-generated ones).
