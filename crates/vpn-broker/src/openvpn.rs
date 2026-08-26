@@ -30,6 +30,10 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
+// Why a connect was abandoned at the gateway's push because it wanted the
+// default route and something else already has it. Defined in the protocol,
+// since the GUI matches on it to name the tunnel that is in the way.
+use vpn_broker::protocol::FULL_TUNNEL_REFUSED;
 
 /// Overall budget for reaching CONNECTED: TLS, `auth-user-pass`, the server's
 /// config push and route installation all fit inside this.
@@ -43,7 +47,21 @@ const LOG_RING: usize = 40;
 /// The wintun adapter openvpn uses. Named distinctly so it never collides with
 /// charon's own wintun device ("strongSwan Tunnel"); pre-created via tapctl
 /// because openvpn reuses an existing adapter rather than making one.
-const ADAPTER_NAME: &str = "OpenVPN Data Channel";
+///
+/// One adapter carries one tunnel, so concurrent tunnels each need their own:
+/// the caller passes a slot and [`adapter_name`] turns it into a distinct
+/// device. Slot 0 keeps the original, unsuffixed name so an adapter created by
+/// an earlier version is reused rather than orphaned.
+const ADAPTER_BASE: &str = "OpenVPN Data Channel";
+
+/// The wintun adapter for tunnel slot `slot` (see [`ADAPTER_BASE`]).
+pub fn adapter_name(slot: usize) -> String {
+    if slot == 0 {
+        ADAPTER_BASE.to_string()
+    } else {
+        format!("{ADAPTER_BASE} {}", slot + 1)
+    }
+}
 
 /// A live (or connecting) OpenVPN tunnel. Dropping it tears the tunnel down and
 /// deletes the on-disk config, so a lost handle never leaks a running process or
@@ -57,6 +75,47 @@ pub struct Tunnel {
     auth_path: PathBuf,
     /// The virtual IP the gateway assigned, from the CONNECTED state line.
     pub vpn_ip: Option<String>,
+    /// What the gateway pushed at connect time (see [`Pushed`]).
+    pub pushed: Pushed,
+}
+
+/// The parts of the gateway's `PUSH_REPLY` the rest of the app needs to know
+/// about. Everything else in it is openvpn's own business.
+#[derive(Debug, Clone, Default)]
+pub struct Pushed {
+    /// The gateway asked to take the default route (`redirect-gateway`) — this
+    /// is a full tunnel, and only one of those can win on a machine.
+    pub full: bool,
+    /// The DNS search domain (`dhcp-option DOMAIN`), when the gateway named one.
+    pub domain: Option<String>,
+}
+
+/// Pull [`Pushed`] out of a management line carrying the gateway's PUSH_REPLY.
+/// Returns `None` for any other line.
+///
+/// The line arrives as openvpn quoting itself:
+/// `>LOG:<t>,,PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,
+/// dhcp-option DOMAIN corp.example,...'` — so find the marker, then read the
+/// comma-separated options after it.
+fn parse_push_reply(line: &str) -> Option<Pushed> {
+    let idx = line.find("PUSH_REPLY")?;
+    let rest = &line[idx + "PUSH_REPLY".len()..];
+    // Stop at the closing quote openvpn wraps the message in, when there is one.
+    let body = rest.split('\'').next().unwrap_or(rest);
+
+    let mut pushed = Pushed::default();
+    for opt in body.split(',') {
+        let mut it = opt.split_whitespace();
+        match (it.next(), it.next()) {
+            // `redirect-gateway`, with or without flags (`def1`, `bypass-dhcp`).
+            (Some("redirect-gateway"), _) => pushed.full = true,
+            (Some("dhcp-option"), Some(kind)) if kind.eq_ignore_ascii_case("DOMAIN") => {
+                pushed.domain = it.next().map(str::to_string).filter(|d| !d.is_empty());
+            }
+            _ => {}
+        }
+    }
+    Some(pushed)
 }
 
 impl Tunnel {
@@ -148,11 +207,25 @@ impl From<String> for ConnectError {
 /// `password` for its `auth-user-pass` round via a transient file. Returns once
 /// openvpn reports CONNECTED, or a [`ConnectError`] whose `reason` is safe to
 /// show and whose `log` holds openvpn's own output for the panel.
-pub fn connect(config: &str, username: &str, password: &str) -> Result<Tunnel, ConnectError> {
+///
+/// `slot` picks the wintun adapter this tunnel takes (see [`adapter_name`]);
+/// the caller is responsible for handing out a slot no live tunnel holds.
+///
+/// `allow_full` is the caller's answer to "may this tunnel take the default
+/// route?" — with it `false`, a gateway that pushes `redirect-gateway` is
+/// refused at the push, before openvpn installs the routes.
+pub fn connect(
+    config: &str,
+    username: &str,
+    password: &str,
+    slot: usize,
+    allow_full: bool,
+) -> Result<Tunnel, ConnectError> {
     sanitize(config)?;
 
     let exe = openvpn_exe()?;
-    ensure_adapter(&exe)?;
+    let adapter = adapter_name(slot);
+    ensure_adapter(&exe, &adapter)?;
     let dir = work_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     let port = free_port()?;
@@ -200,8 +273,10 @@ pub fn connect(config: &str, username: &str, password: &str) -> Result<Tunnel, C
         // A distinctly named adapter so openvpn creates its own rather than
         // grabbing charon's wintun device (both use wintun; without this openvpn
         // finds charon's "strongSwan Tunnel" adapter and reports it "in use").
+        // One per slot, so a second concurrent tunnel doesn't collide with the
+        // first's adapter the same way.
         .arg("--dev-node")
-        .arg(ADAPTER_NAME)
+        .arg(&adapter)
         .arg("--auth-user-pass")
         .arg(&auth_path)
         .args(["--management", "127.0.0.1", &port.to_string()])
@@ -236,10 +311,10 @@ pub fn connect(config: &str, username: &str, password: &str) -> Result<Tunnel, C
     // and the leaked adapters then block the next attempt.
     let cleanup = stream.try_clone().ok();
 
-    match drive(&mut child, stream) {
-        Ok((vpn_ip, mgmt)) => {
+    match drive(&mut child, stream, allow_full) {
+        Ok((vpn_ip, pushed, mgmt)) => {
             guard.disarm();
-            Ok(Tunnel { child, mgmt, config_path, auth_path, vpn_ip })
+            Ok(Tunnel { child, mgmt, config_path, auth_path, vpn_ip, pushed })
         }
         Err(e) => {
             stop_child(&mut child, cleanup);
@@ -270,13 +345,14 @@ fn stop_child(child: &mut Child, mgmt: Option<TcpStream>) {
 const SETUP: [&str; 3] = ["state on", "log on", "hold release"];
 
 /// Enable state reporting, release the hold, and wait for CONNECTED (the login
-/// comes from the `--auth-user-pass` file). On success returns the assigned IP
-/// and the write half of the management socket (kept for the eventual
-/// disconnect).
+/// comes from the `--auth-user-pass` file). On success returns the assigned IP,
+/// what the gateway pushed, and the write half of the management socket (kept
+/// for the eventual disconnect).
 fn drive(
     child: &mut Child,
     mut stream: TcpStream,
-) -> Result<(Option<String>, TcpStream), String> {
+    allow_full: bool,
+) -> Result<(Option<String>, Pushed, TcpStream), String> {
     // Single-threaded read+write on the one socket, polling with a short read
     // timeout: one owner, read then write, the way the interface expects and the
     // way a hand-driven session behaves. A background reader thread with a cloned
@@ -307,6 +383,9 @@ fn drive(
     let mut setup_next = 0usize;
     // A command is out and its SUCCESS/ERROR has not come back yet.
     let mut awaiting_ack = false;
+    // What the gateway pushed, once it has. PUSH_REPLY always precedes
+    // CONNECTED, so this is filled in by the time we return.
+    let mut pushed = Pushed::default();
 
     loop {
         if Instant::now() >= deadline {
@@ -350,6 +429,16 @@ fn drive(
                 continue;
             }
 
+            // The gateway's pushed options. Caught here rather than after
+            // CONNECTED because refusing a full tunnel has to happen *before*
+            // openvpn acts on the push and installs the routes.
+            if let Some(p) = parse_push_reply(&line) {
+                if p.full && !allow_full {
+                    return Err(FULL_TUNNEL_REFUSED.to_string());
+                }
+                pushed = p;
+            }
+
             // A state notification may arrive raw (`>STATE:…`, from `state on`) or
             // wrapped in a log echo (`>LOG:…,MANAGEMENT: >STATE:…`, from `log on`);
             // match it wherever it appears so detection never hinges on which one
@@ -364,7 +453,7 @@ fn drive(
                             .map(|s| s.trim())
                             .filter(|s| !s.is_empty())
                             .map(str::to_string);
-                        return Ok((vpn_ip, stream));
+                        return Ok((vpn_ip, pushed, stream));
                     }
                     "EXITING" => {
                         let reason = fields.get(2).copied().unwrap_or("");
@@ -567,7 +656,7 @@ fn openvpn_exe() -> Result<PathBuf, String> {
 /// `tapctl` ships beside openvpn in the bundle. If it is absent (the dev
 /// fallback to Sophos Connect's openvpn has none), this is skipped and openvpn
 /// falls back to whatever adapter is available.
-fn ensure_adapter(openvpn_exe: &Path) -> Result<(), String> {
+fn ensure_adapter(openvpn_exe: &Path, adapter: &str) -> Result<(), String> {
     let Some(tapctl) = openvpn_exe.parent().map(|d| d.join("tapctl.exe")).filter(|p| p.is_file())
     else {
         return Ok(());
@@ -577,21 +666,23 @@ fn ensure_adapter(openvpn_exe: &Path) -> Result<(), String> {
         .arg("list")
         .output()
         .map_err(|e| format!("could not run tapctl: {e}"))?;
-    // `tapctl list` prints "<guid>\t<name>" per adapter.
+    // `tapctl list` prints "<guid>\t<name>" per adapter. Match the name exactly:
+    // the slot names share a prefix, so a `contains` check would take "OpenVPN
+    // Data Channel 2" as proof that "OpenVPN Data Channel" exists.
     if String::from_utf8_lossy(&listing.stdout)
         .lines()
-        .any(|l| l.contains(ADAPTER_NAME))
+        .any(|l| l.split('\t').any(|f| f.trim() == adapter))
     {
         return Ok(());
     }
 
     let created = Command::new(&tapctl)
-        .args(["create", "--name", ADAPTER_NAME, "--hwid", "wintun"])
+        .args(["create", "--name", adapter, "--hwid", "wintun"])
         .output()
         .map_err(|e| format!("could not create the wintun adapter: {e}"))?;
     if !created.status.success() {
         return Err(format!(
-            "could not create the '{ADAPTER_NAME}' wintun adapter: {}",
+            "could not create the '{adapter}' wintun adapter: {}",
             String::from_utf8_lossy(&created.stderr).trim()
         ));
     }
@@ -696,5 +787,40 @@ mod tests {
     #[test]
     fn sanitize_case_insensitive() {
         assert!(sanitize("client\nUP /tmp/evil\n").is_err());
+    }
+
+    #[test]
+    fn reads_the_gateway_push() {
+        // The real shape: openvpn quoting the control message back at us.
+        let line = ">LOG:1712,,PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,\
+                    route-gateway 10.8.0.1,dhcp-option DNS 10.228.184.51,\
+                    dhcp-option DOMAIN kanzlei.local,ifconfig 10.8.0.6 255.255.255.0'";
+        let p = parse_push_reply(line).expect("a PUSH_REPLY line");
+        assert!(p.full);
+        assert_eq!(p.domain.as_deref(), Some("kanzlei.local"));
+    }
+
+    #[test]
+    fn a_split_tunnel_push_is_not_full() {
+        // Explicit routes and no redirect-gateway: the gateway is not asking for
+        // the default route, so this tunnel never blocks another one.
+        let line = ">LOG:1,,PUSH: Received control message: 'PUSH_REPLY,\
+                    route 10.98.43.0 255.255.255.0,dhcp-option DNS 10.228.184.51'";
+        let p = parse_push_reply(line).expect("a PUSH_REPLY line");
+        assert!(!p.full);
+        assert_eq!(p.domain, None);
+        // `redirect-gateway` with no flags counts just the same as `def1`.
+        assert!(parse_push_reply("PUSH_REPLY,redirect-gateway").unwrap().full);
+        // Anything that isn't a push reply is not one.
+        assert!(parse_push_reply(">STATE:1,CONNECTED,SUCCESS,10.8.0.6,1.2.3.4").is_none());
+    }
+
+    #[test]
+    fn adapter_names_are_distinct_and_keep_the_original() {
+        // Slot 0 must stay unsuffixed: an adapter created by a version that only
+        // knew one tunnel is reused rather than orphaned beside a new one.
+        assert_eq!(adapter_name(0), "OpenVPN Data Channel");
+        assert_eq!(adapter_name(1), "OpenVPN Data Channel 2");
+        assert_ne!(adapter_name(1), adapter_name(2));
     }
 }

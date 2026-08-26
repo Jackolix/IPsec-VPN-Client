@@ -918,9 +918,10 @@ pub fn delete_profile(state: &AppState, id: String) -> std::result::Result<(), S
     // there before the file that names it is gone. (The IPsec teardown below is
     // skipped for SSL, since it can't be parsed as an IPsec profile.)
     if is_ssl_path(&path) {
-        if let Ok(Some(s)) = crate::ssl::status() {
-            if s.name == conn_name(&id) {
-                if let Err(e) = crate::ssl::disconnect() {
+        let name = conn_name(&id);
+        if let Ok(list) = crate::ssl::status() {
+            if list.iter().any(|s| s.name == name) {
+                if let Err(e) = crate::ssl::disconnect(&name) {
                     eprintln!("SSL disconnect before deleting {id} failed: {e}");
                 }
             }
@@ -992,6 +993,18 @@ pub fn connect(
     let user_password = resolve_user_login(&id, &mut imported.config, login)?;
     let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
 
+    // There is one default route, so two full tunnels cannot both have it —
+    // whichever won would be decided by interface metric, silently. Refuse
+    // before initiating rather than bring up a tunnel that carries nothing.
+    if is_full_tunnel_profile(&imported.config) {
+        if let Some(other) = full_tunnel_up(state, &name) {
+            return Err(format!(
+                "this profile routes all traffic over the tunnel, and \"{other}\" already does. \
+                 Disconnect {other} first."
+            ));
+        }
+    }
+
     // charon's `initiate` is unconditional: called against a connection that is
     // already up, it negotiates a *second* CHILD_SA on the same IKE_SA rather
     // than refusing. They stack up (and only one gets torn down on disconnect),
@@ -1042,11 +1055,54 @@ pub fn connect(
                 dns.servers.push(server);
             }
         }
+        // A profile that names no domain of its own takes the one the gateway
+        // pushed. Without this it would fall back to the catch-all namespace,
+        // which only one connection on the machine can hold — so a second
+        // tunnel would either steal DNS from the first or go without.
+        if dns.domain.is_none() {
+            dns.domain = crate::dns::pushed_domain();
+        }
         if !dns.servers.is_empty() {
-            apply_dns(state, &name, &dns, &mut outcome);
+            apply_dns(state, &name, &dns, &remote_subnets(&imported.config), &mut outcome);
         }
     }
     Ok(outcome)
+}
+
+/// A profile's protected subnets as CIDR text, for the DNS fallback: a
+/// connection refused the catch-all namespace claims the reverse zones of these
+/// instead. The default route is dropped — it covers everything and so names
+/// nothing this tunnel can be said to own.
+fn remote_subnets(config: &vpn_core::ConnectionConfig) -> Vec<String> {
+    config
+        .remote_subnets
+        .iter()
+        .filter(|n| n.prefix_len > 0)
+        .map(|n| format!("{}/{}", n.addr, n.prefix_len))
+        .collect()
+}
+
+/// Does this profile route *everything* over the tunnel? Only one connection on
+/// the machine can, since there is one default route to take.
+fn is_full_tunnel_profile(config: &vpn_core::ConnectionConfig) -> bool {
+    config.remote_subnets.iter().any(|n| n.prefix_len == 0)
+}
+
+/// The name of a live tunnel that has taken the default route, if one has.
+/// `except` is the connection being (re)connected, which does not block itself.
+///
+/// Both datapaths report this the same way: charon's CHILD_SAs carry
+/// `0.0.0.0/0` as a remote traffic selector, and an SSL tunnel whose gateway
+/// pushed `redirect-gateway` is rendered with the same selector by
+/// [`synth_ssl_sa`].
+fn full_tunnel_up(state: &AppState, except: &str) -> Option<String> {
+    status(state).ok()?.into_iter().find(|sa| {
+        sa.name != except
+            && sa
+                .children
+                .iter()
+                .any(|c| c.remote_ts.iter().any(|ts| ts == "0.0.0.0/0"))
+    }).map(|sa| sa.name)
 }
 
 /// Bring up an SSL VPN (OpenVPN) profile via the broker. The `.ovpn` (which
@@ -1092,7 +1148,13 @@ fn ssl_connect(
         }
     };
 
-    match crate::ssl::connect(&name, &config, &username, &password) {
+    // Unlike an IPsec profile, an `.ovpn` doesn't say whether it is a full
+    // tunnel — the gateway decides at connect time. So the answer travels the
+    // other way: tell the broker whether taking the default route is allowed,
+    // and it refuses the gateway's `redirect-gateway` at the push, before any
+    // route is installed.
+    let blocker = full_tunnel_up(state, &name);
+    match crate::ssl::connect(&name, &config, &username, &password, blocker.is_none()) {
         Ok(ip) => {
             let msg = if ip.is_empty() {
                 "SSL VPN connected".to_string()
@@ -1106,9 +1168,18 @@ fn ssl_connect(
             })
         }
         Err(e) => {
+            // The broker's full-tunnel refusal is generic — it doesn't know
+            // what else is up. Name the tunnel that is actually in the way.
+            let reason = match blocker {
+                Some(other) if e.reason == vpn_broker::protocol::FULL_TUNNEL_REFUSED => format!(
+                    "this gateway routes all traffic over the tunnel, and \"{other}\" already \
+                     does. Disconnect {other} first."
+                ),
+                _ => e.reason,
+            };
             // Short reason in the banner; openvpn's own output as its own log
             // lines in the panel, rather than one wall-of-text error.
-            let mut log = vec![note_line(&name, 0, format!("SSL VPN connect failed: {}", e.reason))];
+            let mut log = vec![note_line(&name, 0, format!("SSL VPN connect failed: {reason}"))];
             for raw in e.log.lines() {
                 let line = strip_ovpn_timestamp(raw.trim());
                 if !line.is_empty() {
@@ -1117,7 +1188,7 @@ fn ssl_connect(
             }
             Ok(vpn_control::ConnectOutcome {
                 connected: false,
-                error: Some(e.reason),
+                error: Some(reason),
                 log,
             })
         }
@@ -1360,9 +1431,10 @@ fn apply_dns(
     _state: &AppState,
     name: &str,
     dns: &vpn_core::DnsConfig,
+    subnets: &[String],
     outcome: &mut vpn_control::ConnectOutcome,
 ) {
-    let (msg, bad) = match crate::dns::apply(name, &dns.servers, dns.domain.as_deref()) {
+    let (msg, bad) = match crate::dns::apply(name, &dns.servers, dns.domain.as_deref(), subnets) {
         Ok(summary) if !summary.is_empty() => (summary, false),
         Ok(_) => return,
         Err(e) => (format!("DNS setup failed: {e}"), true),
@@ -1399,11 +1471,12 @@ pub fn forget_credentials(_state: &AppState, id: String) -> std::result::Result<
 }
 
 pub fn disconnect(state: &AppState, name: String) -> std::result::Result<(), String> {
-    // If this name is the live SSL tunnel, tear it down through the broker; the
-    // broker also drops the OpenVPN routes and DNS it installed.
-    if let Ok(Some(s)) = crate::ssl::status() {
-        if s.name == name {
-            return crate::ssl::disconnect();
+    // If this name is a live SSL tunnel, tear it down through the broker; the
+    // broker also drops the OpenVPN routes and DNS it installed, and leaves any
+    // other SSL tunnel up.
+    if let Ok(list) = crate::ssl::status() {
+        if list.iter().any(|s| s.name == name) {
+            return crate::ssl::disconnect(&name);
         }
     }
     // Undo any DNS we applied for this connection first (best-effort — a stale
@@ -1414,26 +1487,24 @@ pub fn disconnect(state: &AppState, name: String) -> std::result::Result<(), Str
     vpn_control::disconnect(&state.transport, &name).map_err(|e| e.to_string())
 }
 
-/// Live connections across both datapaths: charon's IKE SAs plus, if one is up,
-/// the broker's SSL VPN tunnel rendered as a synthetic SA so the UI shows and
-/// can tear it down the same way.
+/// Live connections across both datapaths: charon's IKE SAs plus each of the
+/// broker's SSL VPN tunnels rendered as a synthetic SA, so the UI shows them and
+/// can tear them down the same way. Both datapaths carry several tunnels at
+/// once, so this is a list on either side.
 pub fn status(state: &AppState) -> std::result::Result<Vec<IkeSa>, String> {
-    let ssl = crate::ssl::status().ok().flatten();
+    let ssl = crate::ssl::status().unwrap_or_default();
     let mut sas = match vpn_control::status(&state.transport) {
         Ok(sas) => sas,
         // charon may be down while an SSL tunnel is up (SSL needs no charon):
         // don't report the backend as unreachable in that case.
         Err(e) => {
-            if ssl.is_some() {
-                Vec::new()
-            } else {
+            if ssl.is_empty() {
                 return Err(e.to_string());
             }
+            Vec::new()
         }
     };
-    if let Some(s) = ssl {
-        sas.push(synth_ssl_sa(&s));
-    }
+    sas.extend(ssl.iter().map(synth_ssl_sa));
     Ok(sas)
 }
 
@@ -1456,7 +1527,10 @@ fn synth_ssl_sa(s: &crate::ssl::SslStatus) -> IkeSa {
             packets_in: 0,
             packets_out: 0,
             local_ts: if s.ip.is_empty() { Vec::new() } else { vec![format!("{}/32", s.ip)] },
-            remote_ts: Vec::new(),
+            // A gateway that pushed `redirect-gateway` took the default route.
+            // Rendered as the traffic selector charon would show for the same
+            // thing, so one check spots a full tunnel on either datapath.
+            remote_ts: if s.full { vec!["0.0.0.0/0".to_string()] } else { Vec::new() },
         }],
     }
 }
