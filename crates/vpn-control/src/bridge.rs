@@ -159,8 +159,36 @@ pub fn load_shared_user_auth_message(
     config: &ConnectionConfig,
     name: &str,
     password: &Secret,
+    peers: &[String],
 ) -> Message {
-    load_shared_user_auth_message_for(config, name, password, config.ike_version)
+    load_shared_user_auth_message_for(config, name, password, config.ike_version, peers)
+}
+
+/// Scope a shared secret to the identities of the SA it belongs to.
+///
+/// charon does not look a secret up by connection — it asks its credential set
+/// for the best match against the two identities being authenticated, ranking
+/// candidates by how well they match the **far end** first. An owner of `%any`
+/// matches every peer, so a single `%any` secret outranks every
+/// profile-specific one and charon then signs an unrelated connection's AUTH
+/// payload with it; the gateway answers `AUTHENTICATION_FAILED`. Secrets loaded
+/// over vici also outlive their SA, so one such profile poisons every later
+/// connection until the daemon restarts.
+///
+/// Naming the gateway keeps each secret matchable for its own peer and
+/// unmatchable for anyone else's. `%any` survives only as a last resort, for a
+/// connection that offers no identity at all.
+fn secret_owners(local: Option<String>, peers: &[String]) -> Vec<String> {
+    let mut owners: Vec<String> = Vec::new();
+    for id in local.into_iter().chain(peers.iter().cloned()) {
+        if !id.is_empty() && !owners.contains(&id) {
+            owners.push(id);
+        }
+    }
+    if owners.is_empty() {
+        owners.push("%any".to_string());
+    }
+    owners
 }
 
 /// [`load_shared_user_auth_message`] for an explicit IKE version: the secret is
@@ -171,35 +199,35 @@ pub fn load_shared_user_auth_message_for(
     name: &str,
     password: &Secret,
     version: IkeVersion,
+    peers: &[String],
 ) -> Message {
     let kind = match version {
         IkeVersion::V1 => "XAUTH",
         IkeVersion::V2 => "EAP",
     };
-    let owner = config
+    let user = config
         .user_auth
         .as_ref()
-        .and_then(|ua| ua.username.clone())
-        .unwrap_or_else(|| "%any".to_string());
+        .and_then(|ua| ua.username.clone());
     Message::new()
         .str("id", format!("user-{name}"))
         .str("type", kind)
         .str("data", password.expose())
-        .list("owners", [owner])
+        .list("owners", secret_owners(user, peers))
 }
 
 /// Build the `load-shared` argument carrying the PSK. The plaintext lives
 /// only in the returned message (and is dropped once sent).
-pub fn load_shared_message(config: &ConnectionConfig, name: &str) -> Message {
+///
+/// `peers` are the identities charon may use for the far end — see
+/// [`secret_owners`] for why the gateway has to be among the secret's owners.
+pub fn load_shared_message(config: &ConnectionConfig, name: &str, peers: &[String]) -> Message {
     let AuthMethod::PresharedKey(psk) = &config.auth;
-    let owner = config
-        .local_id_wire()
-        .unwrap_or_else(|| "%any".to_string());
     Message::new()
         .str("id", format!("ike-{name}"))
         .str("type", "IKE")
         .str("data", psk.expose())
-        .list("owners", [owner])
+        .list("owners", secret_owners(config.local_id_wire(), peers))
 }
 
 #[cfg(test)]
@@ -446,7 +474,7 @@ pub(crate) mod tests {
 
         // And the user-auth secret is typed for XAuth, too.
         let pw = Secret::new("pa55word".to_string());
-        let shared = load_shared_user_auth_message_for(&cfg, "c", &pw, IkeVersion::V1);
+        let shared = load_shared_user_auth_message_for(&cfg, "c", &pw, IkeVersion::V1, &peers());
         assert_eq!(shared.get_str("type").as_deref(), Some("XAUTH"));
     }
 
@@ -470,27 +498,68 @@ pub(crate) mod tests {
             otp: false,
         });
         let pw = Secret::new("pa55word".to_string());
-        let msg = load_shared_user_auth_message(&cfg, "c", &pw);
+        let msg = load_shared_user_auth_message(&cfg, "c", &pw, &peers());
         assert_eq!(msg.get_str("type").as_deref(), Some("EAP"));
-        assert_eq!(msg.get_list("owners"), Some(vec!["vpnuser".to_string()]));
+        assert_eq!(
+            msg.get_list("owners"),
+            Some(vec!["vpnuser".to_string(), "gw.example.test".to_string(), "203.0.113.7".to_string()])
+        );
         // The PSK message keeps its own id, so loading one cannot clobber the
         // other in charon's credential set.
         assert_eq!(msg.get_str("id").as_deref(), Some("user-c"));
         assert_eq!(
-            load_shared_message(&cfg, "c").get_str("id").as_deref(),
+            load_shared_message(&cfg, "c", &peers()).get_str("id").as_deref(),
             Some("ike-c")
+        );
+    }
+
+    /// The identities charon might use for the far end, as `peer_ids` builds
+    /// them: the gateway as written, plus what it resolves to.
+    fn peers() -> Vec<String> {
+        vec!["gw.example.test".to_string(), "203.0.113.7".to_string()]
+    }
+
+    /// A secret owned by `%any` matches *every* peer, and charon ranks shared
+    /// keys by how well they match the far end — so one such secret outranks
+    /// every profile-specific one and gets used to sign an unrelated
+    /// connection's AUTH payload, which the gateway rejects. Loaded secrets
+    /// outlive their SA, so this poisons every later connection until charon
+    /// restarts. Observed live: connecting a profile with no local ID broke
+    /// every other IPsec profile until the daemon was restarted.
+    #[test]
+    fn a_secret_is_never_owned_by_any_peer() {
+        // A profile that states no local ID is the case that used to fall back
+        // to `%any`; it must still end up scoped to its own gateway.
+        let mut cfg = sample();
+        cfg.local_id = None;
+        let owners = load_shared_message(&cfg, "c", &peers()).get_list("owners").unwrap();
+        assert_eq!(owners, peers());
+        assert!(!owners.contains(&"%any".to_string()));
+
+        // `%any` remains only for a connection that offers no identity at all,
+        // where a secret nothing can match would be strictly worse.
+        assert_eq!(secret_owners(None, &[]), vec!["%any".to_string()]);
+        // An owner is never repeated (a gateway that is its own local ID).
+        assert_eq!(
+            secret_owners(Some("gw.example.test".to_string()), &peers()),
+            peers()
         );
     }
 
     #[test]
     fn load_shared_carries_psk_and_owner() {
-        let msg = load_shared_message(&sample(), "vRouter-TEST-1");
+        let msg = load_shared_message(&sample(), "vRouter-TEST-1", &peers());
         assert_eq!(msg.get_str("type").as_deref(), Some("IKE"));
         assert_eq!(msg.get_str("data").as_deref(), Some("s3cr3t"));
         assert_eq!(msg.get_str("id").as_deref(), Some("ike-vRouter-TEST-1"));
+        // The profile's own identity first, then the peer it belongs to.
         assert_eq!(
             msg.get_list("owners"),
-            Some(vec!["test-1@test.local".to_string()])
+            Some(vec![
+                "test-1@test.local".to_string(),
+                "gw.example.test".to_string(),
+                "203.0.113.7".to_string(),
+            ])
         );
     }
 }
