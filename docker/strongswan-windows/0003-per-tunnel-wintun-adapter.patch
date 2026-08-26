@@ -1,0 +1,646 @@
+Give every virtual IP its own Wintun adapter.
+
+0001 installs virtual IPs on the single TUN device kernel-libipsec creates for
+itself, which is correct for one tunnel and wrong for two. Windows selects a
+source address per *interface*, not per route: with two virtual IPs on one
+adapter -- both /32, so no on-link prefix covers either remote network -- it
+hands the first address to every destination. The second tunnel's packets then
+carry a source matching none of its policies, libipsec drops them, and the
+tunnel reports established while carrying nothing.
+
+Measured with two tunnels up (virtual IPs 172.16.17.11 and 10.98.32.91 on one
+adapter): `ping 10.98.32.9` lost every packet while `ping -S 10.98.32.91
+10.98.32.9` answered in 13ms over the same tunnel, and Find-NetRoute gave
+172.16.17.11 as the source for every destination, including the second
+tunnel's own subnet.
+
+So create a TUN device per virtual IP and register it with charon, exactly as
+kernel_pfroute_net.c does on macOS. kernel_libipsec_router already keys its
+devices by virtual IP and hands the matching device's name to install_route(),
+so the tunnel's routes follow its address onto its own adapter, and Windows --
+which uses the strong host model on send -- has only that adapter's single
+address to choose from.
+
+That needs adapters to be distinct, so the fixed adapter name and GUID become
+per-slot. Slot 0 keeps the original pair, so the adapter (and the network
+profile Windows derived from it) left behind by an earlier run is reused
+rather than a new one accumulating on every start. Slots are released on
+destroy and reused lowest-first, so names stay stable across connect/
+disconnect cycles.
+
+kernel-iph also has to say which of its addresses are virtual. It reported
+none ("we currently have no virtual, but regular IPs only"), so
+get_address_by_ts() classified a virtual IP as a regular one and
+install_route() took the default device anyway -- every tunnel's routes landed
+on the idle default adapter while the addresses sat on the per-tunnel ones.
+The TUN device list is the record of which addresses are virtual, so the
+address enumerator now splits on it.
+
+Registration happens before the address is installed, and add_ip() waits for
+the address to appear in the interface list before returning: that list is fed
+by NotifyIpInterfaceChange() and is asynchronous, so without the wait the
+first CHILD_SA of a connection installs its route before charon can see the
+address it belongs to -- and lands on the default device again.
+diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c
+--- orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-08-26 16:06:25.772121200 +0200
++++ work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-08-26 16:28:09.350593600 +0200
+@@ -28,6 +28,7 @@
+ #include <daemon.h>
+ #include <threading/mutex.h>
+ #include <collections/linked_list.h>
++#include <networking/tun_device.h>
+ #include <processing/jobs/callback_job.h>
+ 
+ 
+@@ -67,6 +68,12 @@
+ 	linked_list_t *ifaces;
+ 
+ 	/**
++	 * TUN devices created for virtual IPs, as tun_device_t. One per virtual IP,
++	 * so each tunnel gets an adapter of its own -- see add_ip().
++	 */
++	linked_list_t *tuns;
++
++	/**
+ 	 * Earliest time of the next roam event
+ 	 */
+ 	timeval_t roam_next;
+@@ -451,6 +458,34 @@
+ }
+ 
+ /**
++ * Is this one of the addresses we installed as a virtual IP?
++ *
++ * The TUN device list is the record of that: add_ip() creates exactly one
++ * device per virtual IP, holding that address. Caller must hold the mutex.
++ */
++static bool is_virtual_ip(private_kernel_iph_net_t *this, host_t *ip)
++{
++	enumerator_t *enumerator;
++	tun_device_t *tun;
++	host_t *addr;
++	bool found = FALSE;
++
++	enumerator = this->tuns->create_enumerator(this->tuns);
++	while (enumerator->enumerate(enumerator, &tun))
++	{
++		addr = tun->get_address(tun, NULL);
++		if (addr && addr->ip_equals(addr, ip))
++		{
++			found = TRUE;
++			break;
++		}
++	}
++	enumerator->destroy(enumerator);
++
++	return found;
++}
++
++/**
+  * Address enumerator
+  */
+ typedef struct {
+@@ -462,6 +497,8 @@
+ 	enumerator_t *ifaces;
+ 	/** current enumerator over addresses, or NULL */
+ 	enumerator_t *addrs;
++	/** backend, to tell virtual addresses from regular ones */
++	private_kernel_iph_net_t *net;
+ 	/** mutex to unlock on destruction */
+ 	mutex_t *mutex;
+ } addr_enumerator_t;
+@@ -471,6 +508,7 @@
+ {
+ 	iface_t *entry;
+ 	host_t **host;
++	bool virtual;
+ 
+ 	VA_ARGS_VGET(args, host);
+ 
+@@ -496,6 +534,18 @@
+ 		}
+ 		if (this->addrs->enumerate(this->addrs, host))
+ 		{
++			/* charon asks for the two kinds separately, and takes a traffic
++			 * selector's local address being *virtual* as the signal to route
++			 * that tunnel over its own TUN device rather than the default one */
++			virtual = is_virtual_ip(this->net, *host);
++			if (virtual && !(this->which & ADDR_TYPE_VIRTUAL))
++			{
++				continue;
++			}
++			if (!virtual && !(this->which & ADDR_TYPE_REGULAR))
++			{
++				continue;
++			}
+ 			return TRUE;
+ 		}
+ 		this->addrs->destroy(this->addrs);
+@@ -517,9 +567,8 @@
+ {
+ 	addr_enumerator_t *enumerator;
+ 
+-	if (!(which & ADDR_TYPE_REGULAR))
++	if (!(which & (ADDR_TYPE_REGULAR | ADDR_TYPE_VIRTUAL)))
+ 	{
+-		/* we currently have no virtual, but regular IPs only */
+ 		return enumerator_create_empty();
+ 	}
+ 
+@@ -533,6 +582,7 @@
+ 		},
+ 		.which = which,
+ 		.ifaces = this->ifaces->create_enumerator(this->ifaces),
++		.net = this,
+ 		.mutex = this->mutex,
+ 	);
+ 	return &enumerator->public;
+@@ -610,28 +660,79 @@
+ }
+ 
+ /**
+- * Look up the index of an interface by name
++ * Parse the LUID of an interface out of its name.
++ *
++ * TUN devices are named after their adapter's GUID ("{8F1A...}"), which is how
++ * charon refers to them everywhere. Going straight from that to the LUID avoids
++ * waiting for the interface list to catch up: an adapter created a moment ago
++ * has not necessarily been announced by NotifyIpInterfaceChange() yet, and the
++ * address has to go on it now.
+  */
+-static DWORD find_ifindex(private_kernel_iph_net_t *this, char *name)
++static bool luid_from_ifname(const char *name, NET_LUID *luid)
+ {
+-	enumerator_t *enumerator;
+-	iface_t *entry;
+-	DWORD ifindex = 0;
++	unsigned long d1;
++	unsigned int d2, d3, b[8];
++	GUID guid;
++	int i;
+ 
+-	this->mutex->lock(this->mutex);
+-	enumerator = this->ifaces->create_enumerator(this->ifaces);
+-	while (enumerator->enumerate(enumerator, &entry))
++	if (sscanf(name, "{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
++			   &d1, &d2, &d3, &b[0], &b[1], &b[2], &b[3], &b[4], &b[5],
++			   &b[6], &b[7]) != 11)
+ 	{
+-		if (streq(name, entry->ifname))
++		return FALSE;
++	}
++	guid.Data1 = d1;
++	guid.Data2 = d2;
++	guid.Data3 = d3;
++	for (i = 0; i < 8; i++)
++	{
++		guid.Data4[i] = b[i];
++	}
++	return ConvertInterfaceGuidToLuid(&guid, luid) == NO_ERROR;
++}
++
++/** how long to wait for an installed address to show up, and how often to look */
++#define ADDR_WAIT_MS 2000
++#define ADDR_POLL_MS 20
++
++/**
++ * Wait for an address we just installed to appear in our interface list.
++ *
++ * That list is fed by NotifyIpInterfaceChange(), which is asynchronous, so an
++ * address installed a moment ago is not in it yet. It has to be before this
++ * returns: install_route() asks get_address_by_ts() whether a child's local
++ * traffic selector is one of our addresses and virtual, and falls back to the
++ * *default* TUN device when it is not -- which would put this tunnel's routes
++ * on an adapter that does not hold its address.
++ */
++static bool wait_for_addr(private_kernel_iph_net_t *this, host_t *ip)
++{
++	int waited;
++
++	for (waited = 0; waited < ADDR_WAIT_MS; waited += ADDR_POLL_MS)
++	{
++		this->mutex->lock(this->mutex);
++		if (address2entry(this, ip))
+ 		{
+-			ifindex = entry->ifindex;
+-			break;
++			this->mutex->unlock(this->mutex);
++			return TRUE;
+ 		}
++		this->mutex->unlock(this->mutex);
++		Sleep(ADDR_POLL_MS);
+ 	}
+-	enumerator->destroy(enumerator);
+-	this->mutex->unlock(this->mutex);
++	return FALSE;
++}
+ 
+-	return ifindex;
++/**
++ * Unregister and destroy a TUN device add_ip() could not finish setting up
++ */
++static void drop_tun(private_kernel_iph_net_t *this, tun_device_t *tun)
++{
++	this->mutex->lock(this->mutex);
++	this->tuns->remove(this->tuns, tun, NULL);
++	charon->kernel->tun(charon->kernel, tun, FALSE);
++	this->mutex->unlock(this->mutex);
++	tun->destroy(tun);
+ }
+ 
+ METHOD(kernel_net_t, add_ip, status_t,
+@@ -639,42 +740,65 @@
+ 	char *iface_name)
+ {
+ 	MIB_UNICASTIPADDRESS_ROW row;
+-	DWORD ifindex;
++	tun_device_t *tun;
++	NET_LUID luid;
+ 	ULONG ret;
+-	char *iface;
++	int mtu;
+ 
+-	/* charon hands us the interface its outer address sits on, which is what a
+-	 * kernel datapath wants. A userland one (kernel-libipsec) instead needs the
+-	 * address on its own TUN device, and points this setting at it. ike_sa.c
+-	 * does not apply the setting, every networking backend has to do it itself
+-	 * -- kernel-netlink does the same thing here. */
+-	iface = lib->settings->get_str(lib->settings, "%s.install_virtual_ip_on",
+-								   iface_name, lib->ns);
+-	if (!iface)
+-	{
+-		return NOT_SUPPORTED;
+-	}
+-	ifindex = find_ifindex(this, iface);
+-	if (!ifindex && iface_name && !streq(iface, iface_name))
+-	{	/* the configured device is gone, use the one charon picked */
+-		DBG1(DBG_KNL, "interface '%s' not found, installing %H on '%s' instead",
+-			 iface, virtual_ip, iface_name);
+-		iface = iface_name;
+-		ifindex = find_ifindex(this, iface);
++	/* Give every virtual IP a TUN device -- and so an adapter -- of its own.
++	 *
++	 * charon hands us the interface its *outer* address sits on, which is what
++	 * a kernel datapath wants; a userland one (kernel-libipsec) needs the
++	 * address on a TUN device instead. Putting them all on the one device
++	 * kernel-libipsec creates for itself does not work with more than one
++	 * tunnel: Windows selects a source address per interface, not per route, so
++	 * it gives every destination the first virtual IP on the adapter. The
++	 * second tunnel's packets then match none of its policies and libipsec
++	 * drops them, while the tunnel itself looks established.
++	 *
++	 * kernel_libipsec_router keys its TUN devices by virtual IP and hands the
++	 * matching device's name to install_route(), so registering the device
++	 * below is what puts this tunnel's routes on this tunnel's adapter. Same
++	 * shape as kernel_pfroute_net.c, which does this on macOS. */
++	if (prefix == -1)
++	{
++		prefix = (virtual_ip->get_family(virtual_ip) == AF_INET) ? 32 : 128;
+ 	}
+-	if (!ifindex)
++	tun = lib->tun->create(lib->tun, NULL);
++	if (!tun)
+ 	{
+-		DBG1(DBG_KNL, "interface '%s' not found, unable to install %H",
+-			 iface, virtual_ip);
+-		return NOT_FOUND;
++		DBG1(DBG_KNL, "creating a TUN device for %H failed", virtual_ip);
++		return FAILED;
+ 	}
+-	if (prefix == -1)
++	/* the MTU kernel-libipsec uses for its own device: ESP goes out UDP
++	 * encapsulated, so the plaintext side has to leave room for the overhead */
++	mtu = lib->settings->get_int(lib->settings, "%s.plugins.kernel-iph.tun_mtu",
++								 1400, lib->ns);
++	if (!tun->up(tun) || !tun->set_address(tun, virtual_ip, prefix) ||
++		!tun->set_mtu(tun, mtu))
+ 	{
+-		prefix = (virtual_ip->get_family(virtual_ip) == AF_INET) ? 32 : 128;
++		DBG1(DBG_KNL, "configuring the TUN device for %H failed", virtual_ip);
++		tun->destroy(tun);
++		return FAILED;
++	}
++	if (!luid_from_ifname(tun->get_name(tun), &luid))
++	{
++		DBG1(DBG_KNL, "resolving TUN device '%s' failed, unable to install %H",
++			 tun->get_name(tun), virtual_ip);
++		tun->destroy(tun);
++		return FAILED;
+ 	}
+ 
++	/* register before installing the address: the device list is what marks an
++	 * address as virtual (see is_virtual_ip()), and that has to be true by the
++	 * time the address becomes visible, not after */
++	this->mutex->lock(this->mutex);
++	this->tuns->insert_last(this->tuns, tun);
++	charon->kernel->tun(charon->kernel, tun, TRUE);
++	this->mutex->unlock(this->mutex);
++
+ 	InitializeUnicastIpAddressEntry(&row);
+-	row.InterfaceIndex = ifindex;
++	row.InterfaceLuid = luid;
+ 	memcpy(&row.Address, virtual_ip->get_sockaddr(virtual_ip),
+ 		   *virtual_ip->get_sockaddr_len(virtual_ip));
+ 	row.OnLinkPrefixLength = prefix;
+@@ -689,11 +813,20 @@
+ 	if (ret != NO_ERROR)
+ 	{
+ 		DBG1(DBG_KNL, "adding virtual IP %H on '%s' failed: 0x%08lx",
+-			 virtual_ip, iface, ret);
++			 virtual_ip, tun->get_name(tun), ret);
++		drop_tun(this, tun);
+ 		return FAILED;
+ 	}
+-	DBG2(DBG_KNL, "installed virtual IP %H/%d on '%s' (interface %lu)",
+-		 virtual_ip, prefix, iface, ifindex);
++	if (!wait_for_addr(this, virtual_ip))
++	{
++		DBG1(DBG_KNL, "virtual IP %H did not appear on '%s'",
++			 virtual_ip, tun->get_name(tun));
++		drop_tun(this, tun);
++		return FAILED;
++	}
++
++	DBG2(DBG_KNL, "installed virtual IP %H/%d on '%s'",
++		 virtual_ip, prefix, tun->get_name(tun));
+ 	return SUCCESS;
+ }
+ 
+@@ -701,53 +834,41 @@
+ 	private_kernel_iph_net_t *this, host_t *virtual_ip, int prefix,
+ 	bool wait)
+ {
+-	MIB_UNICASTIPADDRESS_TABLE *table;
+-	MIB_UNICASTIPADDRESS_ROW *row;
+-	status_t status = NOT_FOUND;
+-	host_t *host;
+-	ULONG ret, i;
++	enumerator_t *enumerator;
++	tun_device_t *tun, *found = NULL;
++	host_t *addr;
+ 
+-	/* del_ip gets no interface name, so find the address in the table */
+-	ret = GetUnicastIpAddressTable(AF_UNSPEC, &table);
+-	if (ret != NO_ERROR)
+-	{
+-		DBG1(DBG_KNL, "getting address table failed: 0x%08lx", ret);
+-		return FAILED;
+-	}
+-	for (i = 0; i < table->NumEntries; i++)
++	/* del_ip gets no interface name, so find the device by its address */
++	this->mutex->lock(this->mutex);
++	enumerator = this->tuns->create_enumerator(this->tuns);
++	while (enumerator->enumerate(enumerator, &tun))
+ 	{
+-		row = &table->Table[i];
+-		host = host_create_from_sockaddr((struct sockaddr*)&row->Address);
+-		if (!host)
+-		{
+-			continue;
+-		}
+-		if (host->ip_equals(host, virtual_ip))
++		addr = tun->get_address(tun, NULL);
++		if (addr && addr->ip_equals(addr, virtual_ip))
+ 		{
+-			ret = DeleteUnicastIpAddressEntry(row);
+-			if (ret != NO_ERROR)
+-			{
+-				DBG1(DBG_KNL, "removing virtual IP %H failed: 0x%08lx",
+-					 virtual_ip, ret);
+-				status = FAILED;
+-			}
+-			else
+-			{
+-				DBG2(DBG_KNL, "removed virtual IP %H", virtual_ip);
+-				status = SUCCESS;
+-			}
+-			host->destroy(host);
++			this->tuns->remove_at(this->tuns, enumerator);
++			charon->kernel->tun(charon->kernel, tun, FALSE);
++			found = tun;
+ 			break;
+ 		}
+-		host->destroy(host);
+ 	}
+-	FreeMibTable(table);
++	enumerator->destroy(enumerator);
++	this->mutex->unlock(this->mutex);
+ 
+-	if (status == NOT_FOUND)
++	if (found)
++	{	/* outside the lock: removing an adapter takes a moment, and this mutex
++		 * also serialises the interface-change callbacks. Destroying it takes
++		 * the adapter down with the address and any route left on it, and
++		 * frees the adapter slot for the next tunnel. */
++		found->destroy(found);
++	}
++	else
+ 	{
+ 		DBG1(DBG_KNL, "virtual IP %H not found, nothing to remove", virtual_ip);
++		return NOT_FOUND;
+ 	}
+-	return status;
++	DBG2(DBG_KNL, "removed virtual IP %H", virtual_ip);
++	return SUCCESS;
+ }
+ 
+ /**
+@@ -865,6 +986,8 @@
+ 	CloseHandle(this->router.hEvent);
+ 	this->mutex->destroy(this->mutex);
+ 	this->ifaces->destroy_function(this->ifaces, (void*)iface_destroy);
++	/* takes the adapters down with them, so none is left behind on shutdown */
++	this->tuns->destroy_offset(this->tuns, offsetof(tun_device_t, destroy));
+ 	free(this);
+ }
+ 
+@@ -895,6 +1018,7 @@
+ 		},
+ 		.mutex = mutex_create(MUTEX_TYPE_DEFAULT),
+ 		.ifaces = linked_list_create(),
++		.tuns = linked_list_create(),
+ 	);
+ 	/* PIPINTERFACE_CHANGE_CALLBACK is not using WINAPI in MinGW, which seems
+ 	 * to be wrong. Force a cast to our WINAPI call */
+diff -ruN orig/src/libstrongswan/plugins/wintun/wintun_device.c work/src/libstrongswan/plugins/wintun/wintun_device.c
+--- orig/src/libstrongswan/plugins/wintun/wintun_device.c	2026-08-26 16:06:25.723527500 +0200
++++ work/src/libstrongswan/plugins/wintun/wintun_device.c	2026-08-26 16:07:34.566616400 +0200
+@@ -27,6 +27,7 @@
+ #include "wintun_device.h"
+ 
+ #include <utils/debug.h>
++#include <threading/mutex.h>
+ #include <threading/thread.h>
+ 
+ #ifndef WIN32
+@@ -76,6 +77,70 @@
+ #define WINTUN_TUNNEL_TYPE   L"strongSwan"
+ 
+ /**
++ * How many adapters may exist at once: one per tunnel that gets a virtual IP,
++ * plus the device kernel-libipsec creates for itself as the default. Kept to a
++ * single digit so a slot number is one character in the adapter name.
++ */
++#define WINTUN_MAX_ADAPTERS 9
++
++/**
++ * Adapter slots in use.
++ *
++ * Every device needs its *own* adapter, because Windows selects a source
++ * address per interface rather than per route: with two virtual IPs on one
++ * adapter it hands the first one to every destination, and the second tunnel's
++ * packets then match none of its policies and are dropped by libipsec.
++ *
++ * Slot 0 keeps the original name and GUID, so the adapter an earlier run left
++ * behind -- and the network profile Windows derived from it -- is reused
++ * instead of a new one accumulating on every start.
++ */
++static bool adapter_slots[WINTUN_MAX_ADAPTERS];
++
++/**
++ * Protects adapter_slots: virtual IPs are installed from IKE threads, so
++ * devices can be created and destroyed concurrently.
++ */
++static mutex_t *adapter_mutex;
++
++/**
++ * Claim the lowest free adapter slot, or -1 if all of them are taken.
++ */
++static int claim_adapter_slot()
++{
++	int i, slot = -1;
++
++	adapter_mutex->lock(adapter_mutex);
++	for (i = 0; i < WINTUN_MAX_ADAPTERS; i++)
++	{
++		if (!adapter_slots[i])
++		{
++			adapter_slots[i] = TRUE;
++			slot = i;
++			break;
++		}
++	}
++	adapter_mutex->unlock(adapter_mutex);
++
++	return slot;
++}
++
++/**
++ * Return a slot so the next device reuses it, keeping adapter names stable
++ * across connect/disconnect cycles.
++ */
++static void release_adapter_slot(int slot)
++{
++	if (slot < 0)
++	{
++		return;
++	}
++	adapter_mutex->lock(adapter_mutex);
++	adapter_slots[slot] = FALSE;
++	adapter_mutex->unlock(adapter_mutex);
++}
++
++/**
+  * Capacity of the send/receive rings, 2 MiB each (must be a power of two
+  * between 128 KiB and 64 MiB)
+  */
+@@ -118,6 +183,11 @@
+ 	char if_name[TUN_NAME_LEN];
+ 
+ 	/**
++	 * Adapter slot this device holds, released on destroy
++	 */
++	int slot;
++
++	/**
+ 	 * The current MTU
+ 	 */
+ 	int mtu;
+@@ -418,6 +488,7 @@
+ 		close(this->fds[1]);
+ 	}
+ 	DESTROY_IF(this->address);
++	release_adapter_slot(this->slot);
+ 	free(this);
+ }
+ 
+@@ -427,14 +498,30 @@
+ static bool init_wintun(private_wintun_device_t *this)
+ {
+ 	/* a fixed GUID keeps the adapter, and the network profile Windows derives
+-	 * from it, stable across runs */
+-	static const GUID req_guid = { 0x8f1a5c2e, 0x4b3d, 0x4a91,
++	 * from it, stable across runs. Both the name and the GUID vary by slot, so
++	 * every device gets an adapter of its own -- reusing either would hand back
++	 * the same interface, which is what we must not have (see adapter_slots). */
++	static const GUID base_guid = { 0x8f1a5c2e, 0x4b3d, 0x4a91,
+ 					{ 0x9d, 0x6c, 0x2a, 0x7e, 0x51, 0x0c, 0x33, 0x84 } };
+-	GUID guid;
++	WCHAR name[countof(WINTUN_ADAPTER_NAME) + 2];
++	GUID req_guid = base_guid, guid;
+ 	DWORD version, ret;
++	size_t len;
+ 
+-	this->adapter = WintunCreateAdapter(WINTUN_ADAPTER_NAME,
+-										WINTUN_TUNNEL_TYPE, &req_guid);
++	req_guid.Data4[7] += this->slot;
++
++	/* built by hand rather than with a wide printf: whether %s there means a
++	 * narrow or a wide string differs between MinGW's C99 mode and MSVCRT */
++	wcscpy(name, WINTUN_ADAPTER_NAME);
++	if (this->slot > 0)
++	{
++		len = wcslen(name);
++		name[len++] = L' ';
++		name[len++] = L'0' + this->slot + 1;
++		name[len] = L'\0';
++	}
++
++	this->adapter = WintunCreateAdapter(name, WINTUN_TUNNEL_TYPE, &req_guid);
+ 	if (!this->adapter)
+ 	{
+ 		DBG1(DBG_LIB, "creating Wintun adapter failed: 0x%08lx",
+@@ -478,6 +565,15 @@
+ wintun_device_t *wintun_device_create(const char *name_tmpl)
+ {
+ 	private_wintun_device_t *this;
++	int slot;
++
++	slot = claim_adapter_slot();
++	if (slot < 0)
++	{
++		DBG1(DBG_LIB, "no free Wintun adapter slot, %d tunnels is the limit",
++			 WINTUN_MAX_ADAPTERS - 1);
++		return NULL;
++	}
+ 
+ 	INIT(this,
+ 		.public = {
+@@ -496,6 +592,7 @@
+ 		},
+ 		.mtu = TUN_DEFAULT_MTU,
+ 		.fds = { -1, -1 },
++		.slot = slot,
+ 	);
+ 
+ 	/* Wintun adapters are named, not numbered, so the template is ignored */
+@@ -559,6 +656,7 @@
+ 		return FALSE;
+ 	}
+ 	DBG2(DBG_LIB, "Wintun library loaded and initialized");
++	adapter_mutex = mutex_create(MUTEX_TYPE_DEFAULT);
+ 	return TRUE;
+ }
+ 
+@@ -567,6 +665,11 @@
+  */
+ void wintun_library_deinit()
+ {
++	if (adapter_mutex)
++	{
++		adapter_mutex->destroy(adapter_mutex);
++		adapter_mutex = NULL;
++	}
+ 	if (Wintun)
+ 	{
+ 		FreeLibrary(Wintun);
