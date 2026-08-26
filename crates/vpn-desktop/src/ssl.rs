@@ -22,13 +22,20 @@ pub struct SslMeta {
     pub needs_user: bool,
 }
 
-/// The live SSL tunnel as the broker reports it.
-#[derive(Debug, Clone)]
+/// A live SSL tunnel as the broker reports it.
+#[derive(Debug, Clone, Default)]
 pub struct SslStatus {
     /// The connection name the tunnel was started under.
     pub name: String,
     /// The assigned virtual IP (may be empty briefly).
     pub ip: String,
+    /// The gateway pushed `redirect-gateway`: this tunnel took the default
+    /// route, so no other tunnel may also claim it.
+    ///
+    /// (The broker also reports the pushed DNS domain, but keeps it to itself:
+    /// it is only needed there, to stop an NRPT rule overriding the resolution
+    /// this tunnel already has on its own adapter.)
+    pub full: bool,
 }
 
 /// A failed SSL connect: a short `reason` for the banner, and openvpn's captured
@@ -83,12 +90,14 @@ pub fn connect(
     config: &str,
     username: &str,
     password: &str,
+    allow_full: bool,
 ) -> Result<String, SslError> {
     let resp = vpn_broker::client::request(&vpn_broker::protocol::Request::SslConnect {
         name: name.to_string(),
         config: config.to_string(),
         username: username.to_string(),
         password: password.to_string(),
+        allow_full,
     })
     .map_err(|e| SslError {
         reason: format!("the VPN broker is not reachable: {e}"),
@@ -117,11 +126,14 @@ fn parse_ssl_error(msg: &str) -> SslError {
     SslError { reason: msg.to_string(), log: String::new() }
 }
 
-/// Ask the broker to tear down the SSL tunnel, if one is up.
+/// Ask the broker to tear down the SSL tunnel called `name`, if it is up. Other
+/// SSL tunnels are left alone.
 #[cfg(windows)]
-pub fn disconnect() -> Result<(), String> {
-    let resp = vpn_broker::client::request(&vpn_broker::protocol::Request::SslDisconnect)
-        .map_err(|e| format!("the VPN broker is not reachable: {e}"))?;
+pub fn disconnect(name: &str) -> Result<(), String> {
+    let resp = vpn_broker::client::request(&vpn_broker::protocol::Request::SslDisconnect {
+        name: name.to_string(),
+    })
+    .map_err(|e| format!("the VPN broker is not reachable: {e}"))?;
     if resp.ok {
         Ok(())
     } else {
@@ -129,41 +141,63 @@ pub fn disconnect() -> Result<(), String> {
     }
 }
 
-/// Ask the broker for the current SSL tunnel, if any.
+/// Ask the broker which SSL tunnels are up. Empty when none is.
 #[cfg(windows)]
-pub fn status() -> Result<Option<SslStatus>, String> {
+pub fn status() -> Result<Vec<SslStatus>, String> {
     let resp = vpn_broker::client::request(&vpn_broker::protocol::Request::SslStatus)
         .map_err(|e| format!("the VPN broker is not reachable: {e}"))?;
     if !resp.ok {
         return Err(resp.msg);
     }
     if resp.msg.trim().is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let v: serde_json::Value = serde_json::from_str(&resp.msg)
         .map_err(|e| format!("could not read the broker's SSL status: {e}"))?;
-    Ok(Some(SslStatus {
-        name: v.get("name").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-        ip: v.get("ip").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-    }))
+    Ok(parse_status(&v))
+}
+
+/// Read the broker's SSL status payload. It is an array since concurrent
+/// tunnels became possible; a bare object is what a broker older than the app
+/// (an upgrade that left the service binary behind) still sends, and is read as
+/// the single tunnel it means.
+#[cfg(windows)]
+fn parse_status(v: &serde_json::Value) -> Vec<SslStatus> {
+    let one = |o: &serde_json::Value| SslStatus {
+        name: o.get("name").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+        ip: o.get("ip").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+        // Absent from an older broker's reply: read as "not a full tunnel",
+        // which is all it could report before it looked.
+        full: o.get("full").and_then(|s| s.as_bool()).unwrap_or(false),
+    };
+    match v.as_array() {
+        Some(items) => items.iter().map(one).collect(),
+        None => vec![one(v)],
+    }
 }
 
 // On non-Windows the broker (and thus SSL VPN) is unavailable; keep the surface
 // present so the rest of the app builds on CI.
 #[cfg(not(windows))]
-pub fn connect(_name: &str, _config: &str, _username: &str, _password: &str) -> Result<String, SslError> {
+pub fn connect(
+    _name: &str,
+    _config: &str,
+    _username: &str,
+    _password: &str,
+    _allow_full: bool,
+) -> Result<String, SslError> {
     Err(SslError {
         reason: "SSL VPN is only supported on Windows".to_string(),
         log: String::new(),
     })
 }
 #[cfg(not(windows))]
-pub fn disconnect() -> Result<(), String> {
+pub fn disconnect(_name: &str) -> Result<(), String> {
     Err("SSL VPN is only supported on Windows".to_string())
 }
 #[cfg(not(windows))]
-pub fn status() -> Result<Option<SslStatus>, String> {
-    Ok(None)
+pub fn status() -> Result<Vec<SslStatus>, String> {
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -207,5 +241,24 @@ mod tests {
         let e = parse_ssl_error("the VPN broker is not reachable: pipe closed");
         assert_eq!(e.reason, "the VPN broker is not reachable: pipe closed");
         assert!(e.log.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_both_status_shapes() {
+        let list: serde_json::Value =
+            serde_json::from_str(r#"[{"name":"a","ip":"10.1.1.2"},{"name":"b","ip":"10.2.2.2"}]"#)
+                .unwrap();
+        let got = parse_status(&list);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].name, "b");
+        assert_eq!(got[1].ip, "10.2.2.2");
+
+        // An older broker (one that predates concurrent tunnels) still sends a
+        // bare object; read it as the single tunnel it means.
+        let one: serde_json::Value = serde_json::from_str(r#"{"name":"a","ip":"10.1.1.2"}"#).unwrap();
+        let got = parse_status(&one);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "a");
     }
 }

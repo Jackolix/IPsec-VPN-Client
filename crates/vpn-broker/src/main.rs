@@ -81,10 +81,12 @@ fn run_windows(cmd: Option<&str>, args: &[String]) -> i32 {
         // so the SSL tunnel is brought up by the LocalSystem service (which can
         // install the adapter and routes an unelevated caller cannot).
         //   ssl-connect <config.ovpn> <username> <password>
-        //   ssl-status | ssl-disconnect
+        //   ssl-status | ssl-disconnect [name]   (no name: every tunnel)
         Some("ssl-connect") => ssl_connect_client(&args[1..]),
         Some("ssl-status") => ssl_client(&protocol::Request::SslStatus),
-        Some("ssl-disconnect") => ssl_client(&protocol::Request::SslDisconnect),
+        Some("ssl-disconnect") => ssl_client(&protocol::Request::SslDisconnect {
+            name: args.get(1).cloned().unwrap_or_default(),
+        }),
         // No args == launched by the SCM.
         Some("run") | None => report(service::run()),
         Some(other) => {
@@ -115,7 +117,8 @@ fn ovpn_connect(args: &[String]) -> i32 {
         }
     };
 
-    match openvpn::connect(&config, user, pass) {
+    // Slot 0 — this foreground test drives one tunnel and owns the machine.
+    match openvpn::connect(&config, user, pass, 0, true) {
         Ok(tunnel) => {
             println!(
                 "connected; assigned IP: {}",
@@ -165,6 +168,8 @@ fn ssl_connect_client(args: &[String]) -> i32 {
         config,
         username: user.clone(),
         password: pass.clone(),
+        // This foreground test drives one tunnel; nothing else can be in its way.
+        allow_full: true,
     })
 }
 

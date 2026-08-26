@@ -1560,18 +1560,46 @@
     startPolling();
   }
 
+  // In real mode the status poll runs continuously (see boot), not just while
+  // the selected profile is up: several tunnels can be live at once, and any of
+  // them can go down without us asking. This only starts the per-second uptime
+  // tick, which belongs to whichever tunnel is on screen.
   function startPolling() {
     stopPolling();
     upTimer = setInterval(updateUptime, 1000);
-    pollTimer = setInterval(pollOnce, 1600);
     pollOnce();
   }
   function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } if (upTimer) { clearInterval(upTimer); upTimer = null; } }
+
+  // Reconcile every profile's state against what charon and the broker actually
+  // report. The state map is otherwise only ever written by this session's own
+  // connects, so a tunnel that outlived the app, or one that dropped while
+  // another profile was selected, would keep showing a green LED. "connecting"
+  // is left alone: a handshake in flight has no SA to be found yet.
+  function reconcile(sas) {
+    var live = {};
+    sas.forEach(function (s) { live[s.name] = true; });
+    var changed = false;
+    profiles.forEach(function (p) {
+      var st = state[p.id] || "disconnected";
+      if (st === "connecting") { return; }
+      var want = live[sanitize(p.name)] ? "established" : "disconnected";
+      if (want !== st) {
+        state[p.id] = want;
+        if (current && p.id === current.id && want === "disconnected") { stopPolling(); }
+        changed = true;
+      }
+    });
+    if (changed && current) { setPill(); setAction(); renderList(); renderTiles(); }
+    else if (changed) { renderList(); }
+  }
 
   async function pollOnce() {
     if (!TAURI) { return; }
     var sas;
     try { sas = await TAURI.invoke("status"); } catch (e) { return; }
+    reconcile(sas);
+    if (!current) { return; }
     var nm = sanitize(current.name);
     var sa = null;
     sas.forEach(function (s) { if (s.name === nm) { sa = s; } });
@@ -2090,6 +2118,12 @@
   setTimeout(showWindow, 2000);
   refresh().then(function () {
     if (savedView === "compact") { renderCompact(); }
+    // One status poll for the whole app, running from here on. It reconciles
+    // every profile against the tunnels that are actually up — including ones
+    // that outlived a previous run of the app — and feeds the selected
+    // profile's tiles. First pass right after profiles land, so a tunnel
+    // already up is shown as such instead of appearing disconnected.
+    if (TAURI) { pollOnce(); setInterval(pollOnce, 1600); }
   });
 })();
 </script>

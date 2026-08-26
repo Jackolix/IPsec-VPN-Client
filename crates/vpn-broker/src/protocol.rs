@@ -26,10 +26,19 @@ pub enum Request {
     Ping,
     /// Route DNS for `conn` over the tunnel via an NRPT rule. `servers` are
     /// IPv4 text; `domain` scopes it to a suffix (split-DNS) when present.
+    ///
+    /// With no `domain` the rule would have to claim the catch-all namespace,
+    /// which is system-wide and cannot be shared — so only the first connection
+    /// gets it. A later one is scoped to the reverse-lookup zones of `subnets`
+    /// instead (`10.0.0.0/8` -> `10.in-addr.arpa`), which at least resolves
+    /// addresses on its own network without hijacking anyone else's names.
+    /// `subnets` is CIDR text and may be empty.
     ApplyDns {
         conn: String,
         servers: Vec<String>,
         domain: Option<String>,
+        #[serde(default)]
+        subnets: Vec<String>,
     },
     /// Remove the NRPT rule previously applied for `conn`.
     RevertDns { conn: String },
@@ -42,18 +51,46 @@ pub enum Request {
     SslConnect {
         /// The connection name the GUI keys this tunnel by (a sanitized profile
         /// name); echoed back by [`Request::SslStatus`] so status/disconnect can
-        /// map to the right profile.
+        /// map to the right profile. Connecting a name that is already up
+        /// replaces that tunnel and leaves any other one alone.
         name: String,
         config: String,
         username: String,
         password: String,
+        /// May this tunnel take the default route? The GUI says no when another
+        /// tunnel — on either datapath — already routes everything, and the
+        /// broker then refuses the gateway's `redirect-gateway` at the push,
+        /// before any route is installed. Defaults to permitting it, which is
+        /// both the old behaviour and what an older GUI's request means.
+        #[serde(default = "permitted")]
+        allow_full: bool,
     },
-    /// Tear down the SSL VPN tunnel, if one is up.
-    SslDisconnect,
-    /// Report the SSL VPN tunnel state. Response `msg` is a JSON object
-    /// `{"name","ip"}` when a tunnel is up, or empty when none is.
+    /// Tear down the SSL VPN tunnel called `name`. An empty name means *all* of
+    /// them — which is also what an older GUI's name-less request decodes to,
+    /// since it predates concurrent tunnels and only ever had one to mean.
+    SslDisconnect {
+        #[serde(default)]
+        name: String,
+    },
+    /// Report the SSL VPN tunnels that are up. Response `msg` is a JSON array of
+    /// `{"name","ip","full","domain"}` objects, or empty when none is up.
     SslStatus,
 }
+
+/// `serde` default for [`Request::SslConnect::allow_full`].
+fn permitted() -> bool {
+    true
+}
+
+/// The failure `reason` a connect carries when it was abandoned at the gateway's
+/// push because it wanted the default route and `allow_full` said no.
+///
+/// It lives in the protocol because both sides need it: the broker sends it, and
+/// the GUI matches on it to say *which* tunnel is in the way — something the
+/// broker cannot know, since charon's tunnels are not its business. It still has
+/// to read sensibly on its own, for any client that doesn't recognise it.
+pub const FULL_TUNNEL_REFUSED: &str =
+    "this gateway routes all traffic, and another VPN already does — disconnect that one first";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {

@@ -50,10 +50,59 @@ fn pushed_dns_path() -> PathBuf {
     base.join("ipsec-vpn").join("resolv.conf")
 }
 
+/// The DNS search domain the gateway pushed over IKE mode config, if our daemon
+/// captured one. Same file as [`pushed_servers`], read from its `search`/
+/// `domain` line.
+///
+/// This matters beyond convenience: a profile that names no domain of its own
+/// otherwise falls back to the catch-all NRPT namespace, which only one
+/// connection on the machine can hold. Taking the domain the gateway already
+/// told us gives each tunnel its own namespace instead, so two of them can
+/// resolve names side by side.
+#[cfg(windows)]
+pub fn pushed_domain() -> Option<String> {
+    std::fs::read_to_string(pushed_dns_path())
+        .ok()
+        .and_then(|text| parse_resolv_domain(&text))
+}
+
+#[cfg(not(windows))]
+pub fn pushed_domain() -> Option<String> {
+    None
+}
+
+/// First `search` or `domain` entry in resolv.conf text. `search` may list
+/// several; the first is the primary one, and the only one a single NRPT
+/// namespace can express.
+#[cfg(windows)]
+fn parse_resolv_domain(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("search").or_else(|| line.strip_prefix("domain")) else {
+            continue;
+        };
+        // Require whitespace after the keyword, so `searchX` does not match.
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        if let Some(tok) = rest.split_whitespace().next() {
+            let d = tok.trim_matches('.');
+            if !d.is_empty() {
+                return Some(d.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Pull the IPv4 `nameserver` entries out of resolv.conf text. Anything else
-/// (comments, `search`/`domain` lines, IPv6 servers we cannot yet apply) is
-/// ignored, so a malformed or partially written file yields whatever valid
-/// servers it does contain rather than an error.
+/// (comments, IPv6 servers we cannot yet apply) is ignored, so a malformed or
+/// partially written file yields whatever valid servers it does contain rather
+/// than an error. The `search`/`domain` line is read separately by
+/// [`pushed_domain`].
 fn parse_resolv_conf(text: &str) -> Vec<Ipv4Addr> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -143,17 +192,26 @@ fn run_elevated(body: &str) -> Result<(), String> {
 /// Route DNS for this connection over the tunnel via an NRPT rule. Returns a
 /// short human summary for the connect log. No-op with no servers.
 #[cfg(windows)]
-pub fn apply(conn: &str, servers: &[Ipv4Addr], domain: Option<&str>) -> Result<String, String> {
+pub fn apply(
+    conn: &str,
+    servers: &[Ipv4Addr],
+    domain: Option<&str>,
+    subnets: &[String],
+) -> Result<String, String> {
     if servers.is_empty() {
         return Ok(String::new());
     }
     // Preferred path: hand it to the broker service (runs as SYSTEM, no UAC).
     // A reachable broker is authoritative — surface its result either way. Only
     // fall back to the elevated PowerShell path when the broker isn't installed.
+    // The broker is also where the namespace policy lives: it holds the durable
+    // record of which connection owns which namespace, so it decides whether
+    // this one may have the catch-all (hence `subnets`, its fallback).
     let req = vpn_broker::protocol::Request::ApplyDns {
         conn: conn.to_string(),
         servers: servers.iter().map(|s| s.to_string()).collect(),
         domain: domain.map(str::to_string),
+        subnets: subnets.to_vec(),
     };
     match vpn_broker::client::request(&req) {
         Ok(r) if r.ok => return Ok(r.msg),
@@ -275,7 +333,12 @@ fn resolvectl(args: &[&str]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn apply(conn: &str, servers: &[Ipv4Addr], domain: Option<&str>) -> Result<String, String> {
+pub fn apply(
+    conn: &str,
+    servers: &[Ipv4Addr],
+    domain: Option<&str>,
+    _subnets: &[String],
+) -> Result<String, String> {
     if servers.is_empty() {
         return Ok(String::new());
     }
@@ -313,7 +376,12 @@ pub fn revert(conn: &str) -> Result<(), String> {
 
 // ---- Other platforms (macOS is build-only for now) ------------------------
 #[cfg(not(any(windows, target_os = "linux")))]
-pub fn apply(_conn: &str, _servers: &[Ipv4Addr], _domain: Option<&str>) -> Result<String, String> {
+pub fn apply(
+    _conn: &str,
+    _servers: &[Ipv4Addr],
+    _domain: Option<&str>,
+    _subnets: &[String],
+) -> Result<String, String> {
     Ok(String::new())
 }
 
@@ -354,6 +422,31 @@ mod tests {
                     nameserverX 10.0.0.99\n\
                     \n";
         assert_eq!(parse_resolv_conf(text), vec![Ipv4Addr::new(10, 0, 0, 53)]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_the_pushed_search_domain() {
+        use super::parse_resolv_domain;
+        // This is what saves a profile with no domain of its own from having to
+        // claim the catch-all namespace.
+        let text = "nameserver 10.228.184.51\nsearch kanzlei.local\n";
+        assert_eq!(parse_resolv_domain(text).as_deref(), Some("kanzlei.local"));
+        // `domain` is the older spelling of the same thing.
+        assert_eq!(
+            parse_resolv_domain("domain corp.example\n").as_deref(),
+            Some("corp.example")
+        );
+        // `search` may list several; the first is the primary one.
+        assert_eq!(
+            parse_resolv_domain("search a.example b.example\n").as_deref(),
+            Some("a.example")
+        );
+        // Nothing to take: no domain line, a keyword that only looks like one,
+        // and a comment.
+        assert_eq!(parse_resolv_domain("nameserver 10.0.0.53\n"), None);
+        assert_eq!(parse_resolv_domain("searchX corp.example\n"), None);
+        assert_eq!(parse_resolv_domain("# search corp.example\n"), None);
     }
 
     #[test]
