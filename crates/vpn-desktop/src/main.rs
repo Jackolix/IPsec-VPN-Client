@@ -248,6 +248,37 @@ fn set_tray_status(
     );
 }
 
+/// Whether the privileged helper is installed and answering.
+///
+/// `supported` is what the UI gates on: only macOS has a helper the app can
+/// offer to install. On Windows the broker is registered by the installer, and
+/// on Linux there is none.
+#[tauri::command]
+async fn helper_status() -> Result<serde_json::Value, String> {
+    let (installed, reachable) = helper::status();
+    Ok(serde_json::json!({
+        "supported": cfg!(target_os = "macos"),
+        "installed": installed,
+        "reachable": reachable,
+    }))
+}
+
+/// Install the helper. Raises one authorization prompt; after it, connect and
+/// disconnect never prompt again.
+#[tauri::command]
+async fn install_helper() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(helper::install)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn uninstall_helper() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(helper::uninstall)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn daemon_running(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let s = state.inner().clone();
@@ -557,6 +588,9 @@ fn main() {
             daemon_running,
             start_daemon,
             stop_daemon,
+            helper_status,
+            install_helper,
+            uninstall_helper,
             save_credentials,
             set_credentials,
             forget_credentials,
