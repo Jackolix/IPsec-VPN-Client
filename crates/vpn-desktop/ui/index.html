@@ -55,6 +55,10 @@
   .win-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .win-btn.close:hover { background: #c42b1c; color: #fff; }
   body.macos .win-controls { display: none; }
+  /* Install/Update and Remove are in the app menu on macOS, beside Uninstall
+     VPN Client. The row keeps the status text — that is information, not an
+     action, and the menu bar has nowhere to show it. */
+  body.macos #sh-action { display: none; }
   body.macos .titlebar { padding-left: 82px; }
   .win-btn .ic-restore { display: none; }
   body.maximized .win-btn .ic-restore { display: block; }
@@ -2257,6 +2261,15 @@
     // is there. Only a healthy, current helper offers removal instead.
     act.textContent = ok ? "Remove" : stale ? "Update" : "Install";
     act.disabled = helperBusy;
+    // On macOS the same two actions are in the app menu, which has to be told
+    // what to say and what to grey out. Derived here so the menu and the row
+    // can never disagree.
+    if (IS_MAC && TAURI) {
+      TAURI.invoke("set_helper_menu", {
+        installed: !!helperState.installed,
+        stale: stale
+      }).catch(function () { /* the menu is a convenience, not the only path */ });
+    }
 
     // The strip only nags while there is something to fix, and only until it
     // is dismissed for this run.
@@ -2801,6 +2814,8 @@
     // reveals the window and emits; everything the confirmation has to say
     // about profiles and saved keys is known here, not in Rust.
     EVT.listen("menu-uninstall", function () { openUninstall(); });
+    EVT.listen("menu-helper-install", function () { doHelper(true); });
+    EVT.listen("menu-helper-remove", function () { doHelper(false); });
     EVT.listen("tray-profile", function (e) {
       var id = e && e.payload;
       if (!id) { return; }

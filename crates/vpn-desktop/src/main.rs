@@ -627,6 +627,45 @@ fn dev(args: &[String]) {
 #[cfg(target_os = "macos")]
 const UNINSTALL_MENU_ID: &str = "uninstall-app";
 
+/// Menu-item ids for the helper's two actions, beside the uninstall item.
+#[cfg(target_os = "macos")]
+const HELPER_INSTALL_MENU_ID: &str = "helper-install";
+#[cfg(target_os = "macos")]
+const HELPER_REMOVE_MENU_ID: &str = "helper-remove";
+
+/// The two helper menu items, kept so their label and enabled state can follow
+/// the helper's actual state. Tauri's `Menu::get` only searches a menu's own
+/// items, and these live inside the app submenu, so the handles are held rather
+/// than looked up again.
+#[cfg(target_os = "macos")]
+struct HelperMenu {
+    install: tauri::menu::MenuItem<tauri::Wry>,
+    remove: tauri::menu::MenuItem<tauri::Wry>,
+}
+
+/// Point the helper menu items at what the helper is currently doing.
+///
+/// The window already works this out to render its own status row, so it tells
+/// us rather than the state being derived twice and drifting apart.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn set_helper_menu(state: tauri::State<'_, HelperMenu>, installed: bool, stale: bool) {
+    // Installing over an existing helper is how it is updated, so that item is
+    // always available; only its wording changes.
+    let _ = state.install.set_text(if stale {
+        "Update Helper…"
+    } else {
+        "Install Helper…"
+    });
+    // Nothing to remove when nothing is installed.
+    let _ = state.remove.set_enabled(installed);
+}
+
+/// No app menu off macOS — see [`with_app_menu`].
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn set_helper_menu(_installed: bool, _stale: bool) {}
+
 /// Put **Uninstall VPN Client…** in the app menu, where a Mac user looks for
 /// it — the menu that already holds About, Services, Hide and Quit.
 ///
@@ -640,6 +679,7 @@ const UNINSTALL_MENU_ID: &str = "uninstall-app";
 #[cfg(target_os = "macos")]
 fn with_app_menu(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
     use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
+    use tauri::Manager;
 
     builder
         .menu(|app| {
@@ -656,24 +696,61 @@ fn with_app_menu(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
                 true,
                 None::<&str>,
             )?;
+            // The helper's own two actions. They are about the background
+            // helper, not the app, so they sit in a group of their own above
+            // the uninstall item rather than beside it. Both ask for a password
+            // before doing anything, hence the ellipses.
+            let helper_install = MenuItem::with_id(
+                app,
+                HELPER_INSTALL_MENU_ID,
+                "Install Helper…",
+                true,
+                None::<&str>,
+            )?;
+            let helper_remove = MenuItem::with_id(
+                app,
+                HELPER_REMOVE_MENU_ID,
+                "Remove Helper…",
+                // Enabled once the window reports a helper is actually there.
+                false,
+                None::<&str>,
+            )?;
             // Directly above Quit, in its own group: the two app-lifecycle
             // actions belong together, and the separator is what stops a
             // mis-aimed click on Quit from starting an uninstall. Positioned
             // from the end rather than at a fixed index, so a future Tauri
             // adding an item to the default menu does not move it somewhere odd.
+            // Each insert goes at the same index, so they are added in reverse
+            // of how they end up reading:
+            //   Install/Update Helper… · Remove Helper… · ---
+            //   Uninstall VPN Client… · --- · Quit
             let quit = app_menu.items()?.len().saturating_sub(1);
             app_menu.insert(&PredefinedMenuItem::separator(app)?, quit)?;
             app_menu.insert(&item, quit)?;
+            app_menu.insert(&PredefinedMenuItem::separator(app)?, quit)?;
+            app_menu.insert(&helper_remove, quit)?;
+            app_menu.insert(&helper_install, quit)?;
+            app.manage(HelperMenu {
+                install: helper_install,
+                remove: helper_remove,
+            });
             Ok(menu)
         })
         .on_menu_event(|app, event| {
-            if event.id() == UNINSTALL_MENU_ID {
-                // The confirmation, and everything it has to name (profile
-                // count, saved keys, open tunnels), lives in the window. Show
-                // it and let the UI run the flow it already has — the menu item
-                // is an entry point, not a second implementation.
+            // Each of these is an entry point, not a second implementation: the
+            // window owns the flow (and the confirmations, and the log lines),
+            // so the item reveals it and hands it the event it already listens
+            // for.
+            let forward = |name: &str| {
                 tray::reveal(app);
-                let _ = tauri::Emitter::emit(app, "menu-uninstall", ());
+                let _ = tauri::Emitter::emit(app, name, ());
+            };
+            if event.id() == UNINSTALL_MENU_ID {
+                forward("menu-uninstall");
+            } else if event.id() == HELPER_INSTALL_MENU_ID {
+                forward("menu-helper-install");
+            } else if event.id() == HELPER_REMOVE_MENU_ID {
+                forward("menu-helper-remove");
             }
         })
 }
@@ -733,6 +810,7 @@ fn main() {
             save_profile_edit,
             reset_profile_edit,
             probe_hosts,
+            set_helper_menu,
             take_link_request,
             confirm_link_import,
             cancel_link_import,
