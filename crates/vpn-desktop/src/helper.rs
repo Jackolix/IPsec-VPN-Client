@@ -32,6 +32,41 @@ fn helper_bin() -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| "the helper binary was not found (build it with `cargo build -p vpn-broker`)".to_string())
 }
 
+/// Should the app install the helper without being asked?
+///
+/// The helper is meant to be the default, the way the Windows installer
+/// registers the broker service: a background daemon that is simply there, not
+/// something a user has to discover. macOS has no installer hook for a `.dmg`
+/// — dragging an app to /Applications runs nothing — so the closest equivalent
+/// is to set it up on first launch.
+///
+/// Returns true at most once per user. The marker is written *before* the
+/// attempt, so declining the authorization prompt is remembered too: being
+/// asked once is setup, being asked at every launch is nagging. The strip and
+/// the sidebar row stay, so a user who said no can still say yes later.
+#[cfg(target_os = "macos")]
+pub fn setup_pending() -> bool {
+    let (installed, reachable) = status();
+    if installed && reachable {
+        return false;
+    }
+    let marker = crate::backend::app_data_dir().join("helper-setup-attempted");
+    if marker.exists() {
+        return false;
+    }
+    if let Some(dir) = marker.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // If the marker cannot be written, don't offer: a prompt on every launch is
+    // worse than no prompt at all.
+    std::fs::write(&marker, "1").is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn setup_pending() -> bool {
+    false
+}
+
 /// Is the helper installed and answering?
 #[cfg(target_os = "macos")]
 pub fn status() -> (bool, bool) {

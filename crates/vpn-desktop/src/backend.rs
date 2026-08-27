@@ -46,6 +46,12 @@ impl AppState {
 /// data dir, so an installed app (whose working directory is unpredictable)
 /// always finds the same stable folder.
 fn default_profile_dir() -> PathBuf {
+    app_data_dir().join("profiles")
+}
+
+/// The app's own per-user directory: profiles live under it, and so does the
+/// small amount of state that has to outlive a run.
+pub fn app_data_dir() -> PathBuf {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(not(windows))]
@@ -55,7 +61,6 @@ fn default_profile_dir() -> PathBuf {
 
     base.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join("ipsec-vpn")
-        .join("profiles")
 }
 
 fn default_transport() -> Transport {

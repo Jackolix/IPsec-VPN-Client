@@ -263,6 +263,13 @@ async fn helper_status() -> Result<serde_json::Value, String> {
     }))
 }
 
+/// Whether the app should set the helper up now without being asked. True at
+/// most once per user — see [`helper::setup_pending`].
+#[tauri::command]
+async fn helper_setup_pending() -> Result<bool, String> {
+    Ok(helper::setup_pending())
+}
+
 /// Install the helper. Raises one authorization prompt; after it, connect and
 /// disconnect never prompt again.
 #[tauri::command]
@@ -589,6 +596,7 @@ fn main() {
             start_daemon,
             stop_daemon,
             helper_status,
+            helper_setup_pending,
             install_helper,
             uninstall_helper,
             save_credentials,

@@ -333,6 +333,43 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: cargo tauri build --target aarch64-apple-darwin
 
+      # Notarisation alone is not enough for a clean install. It records the
+      # approval on Apple's servers; STAPLING attaches the ticket to the file
+      # itself. Without it Gatekeeper has to reach Apple on first launch, so a
+      # user who is offline — or behind a firewall, which VPN users often are —
+      # still gets the "cannot be opened" dialog for an app that was notarised
+      # perfectly well.
+      #
+      # This verifies rather than hopes: if the app is not accepted by
+      # Gatekeeper here, it will not be accepted on a user's Mac either, and the
+      # release fails now instead of on their machine.
+      - name: Staple the notarisation ticket and verify Gatekeeper accepts it
+        run: |
+          set -euo pipefail
+          bundle=target/aarch64-apple-darwin/release/bundle
+          app=$(find "$bundle/macos" -maxdepth 1 -name '*.app' | head -1)
+          dmg=$(find "$bundle/dmg" -maxdepth 1 -name '*.dmg' | head -1)
+          [ -n "$app" ] || { echo "no .app was built" >&2; exit 1; }
+
+          # The .app may already be stapled by the bundler; stapling twice is a
+          # no-op, so this is safe either way.
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+
+          # Every nested Mach-O must carry the same signature, or the whole
+          # bundle is rejected. --deep --strict is what catches a resource that
+          # kept its ad-hoc signature.
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          # The verdict a user's Mac will reach on first launch.
+          spctl --assess --type execute --verbose=4 "$app"
+
+          if [ -n "$dmg" ]; then
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+          fi
+          echo "== stapled and accepted =="
+
       - name: Collect release assets
         run: |
           set -euo pipefail
