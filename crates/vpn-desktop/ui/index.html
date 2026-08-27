@@ -119,7 +119,14 @@
   #daemon-btn.busy { opacity: .6; pointer-events: none; }
 
   .main { min-height: 0; display: flex; flex-direction: column; }
-  .main-scroll { overflow-y: auto; padding: 20px 22px 22px; display: flex; flex-direction: column; gap: 16px; }
+  /* The detail page scrolls as a whole. Every block keeps its natural height
+     (flex-shrink 0) instead of being compressed by the column: a short window
+     scrolls rather than crushing the console down to a line or two. The console
+     is the one block allowed to grow, so a tall window gets a longer log
+     instead of dead space under it. */
+  .main-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 22px 22px; display: flex; flex-direction: column; gap: 16px; }
+  .main-scroll > * { flex: 0 0 auto; }
+  .main-scroll > .console { flex: 1 0 auto; }
   .detail-head { display: flex; align-items: flex-start; gap: 16px; }
   .detail-head .title h1 { margin: 0; font-family: var(--mono); font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.01em; text-wrap: balance; }
   .gw-line { display: flex; align-items: center; gap: 8px; margin-top: 5px; color: var(--muted); font-family: var(--mono); font-size: var(--fs-sm); }
@@ -214,7 +221,7 @@
   .console-head .spacer { flex: 1; }
   .console-head button { font-family: var(--mono); font-size: var(--fs-xs); color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
   .console-head button:hover { color: var(--text); border-color: var(--muted); }
-  .log { margin: 0; padding: 11px 15px; height: 168px; overflow-y: auto; font-family: var(--mono); font-size: var(--fs-sm); line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+  .log { margin: 0; padding: 11px 15px; flex: 1; min-height: 168px; overflow-y: auto; font-family: var(--mono); font-size: var(--fs-sm); line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
   .log-line { display: flex; gap: 10px; }
   .log-line .ts { color: var(--faint); flex: 0 0 auto; }
   .log-line .sys { flex: 0 0 42px; }
