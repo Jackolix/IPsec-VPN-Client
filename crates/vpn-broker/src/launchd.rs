@@ -63,7 +63,34 @@ fn install_root_owned(src: &Path, dst: &Path, mode: u32) -> Result<(), String> {
         .map_err(|e| format!("cannot copy {} to {}: {e}", src.display(), dst.display()))?;
     std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode))
         .map_err(|e| format!("cannot set mode on {}: {e}", dst.display()))?;
+    strip_quarantine(dst);
     chown_root(dst)
+}
+
+/// Drop `com.apple.quarantine` from an installed file.
+///
+/// This matters only for the case that is hardest to test: a *downloaded* app.
+/// Everything in a bundle that arrived from a browser carries the quarantine
+/// attribute, and `std::fs::copy` on macOS preserves extended attributes (it is
+/// `fcopyfile` with `COPYFILE_ALL`) — so without this, charon and openvpn land
+/// in /Library still marked as downloaded, and a root daemon then execs them.
+/// A locally built app has no quarantine attribute at all, which is exactly why
+/// this would never show up in development.
+///
+/// Best-effort: the attribute is usually absent, and `ENOATTR` is the normal
+/// result rather than a failure.
+fn strip_quarantine(path: &Path) {
+    const QUARANTINE: &[u8] = b"com.apple.quarantine\0";
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    unsafe {
+        libc::removexattr(
+            c_path.as_ptr(),
+            QUARANTINE.as_ptr() as *const libc::c_char,
+            0,
+        );
+    }
 }
 
 fn chown_root(path: &Path) -> Result<(), String> {
@@ -228,7 +255,38 @@ pub fn bundled_charon_dir(exe: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::plist_contents;
+    use super::{plist_contents, strip_quarantine};
+
+    /// The failure this prevents cannot happen on a development machine: a
+    /// locally built app is never quarantined, so the attribute is only ever
+    /// present on the downloaded builds real users install.
+    #[test]
+    fn an_installed_file_does_not_stay_quarantined() {
+        let dir = std::env::temp_dir().join("vpn-quarantine-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("staged.bin");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+
+        let set = std::process::Command::new("/usr/bin/xattr")
+            .args(["-w", "com.apple.quarantine", "0083;00000000;Safari;"])
+            .arg(&f)
+            .status()
+            .expect("xattr");
+        assert!(set.success());
+        assert!(has_quarantine(&f), "precondition: the attribute is set");
+
+        strip_quarantine(&f);
+        assert!(!has_quarantine(&f), "quarantine should have been removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn has_quarantine(p: &std::path::Path) -> bool {
+        let out = std::process::Command::new("/usr/bin/xattr")
+            .arg(p)
+            .output()
+            .expect("xattr");
+        String::from_utf8_lossy(&out.stdout).contains("com.apple.quarantine")
+    }
 
     /// launchd silently ignores a malformed plist, which would present as "the
     /// helper installed fine but never starts". Check it parses.
