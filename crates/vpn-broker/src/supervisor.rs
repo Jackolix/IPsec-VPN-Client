@@ -218,6 +218,13 @@ impl Broker {
                     Response::ok(serde_json::Value::Array(up).to_string())
                 }
             }
+            // macOS-only. This service supervises charon-svc.exe as part of its
+            // own lifecycle, so there is nothing for a client to start or stop
+            // here — the request is answered rather than ignored so a client
+            // that sends it gets a reason instead of silence.
+            Request::CharonStart | Request::CharonStop => Response::err(
+                "charon's lifecycle is managed by this service, not by request",
+            ),
         }
     }
 
