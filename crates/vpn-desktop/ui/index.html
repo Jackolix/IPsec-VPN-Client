@@ -406,11 +406,6 @@
       <div class="side-foot"><span id="foot-led" class="led"></span><span id="foot-text">connecting to vici…</span><button id="daemon-btn" class="btn-sm" style="display:none">Start</button></div>
       <div class="side-version" id="side-helper" style="display:none"><span id="sh-text">helper</span><span class="spacer"></span><button type="button" id="sh-action">Install</button></div>
       <div class="side-version"><span>v<span id="app-version">—</span></span><span class="spacer"></span><button type="button" id="check-update">Check for updates</button></div>
-      <!-- macOS only. Dragging the bundle to the Trash is the platform's
-           uninstall, but it cannot remove the LaunchDaemon, the root-owned
-           copies of charon and openvpn, or any /etc/resolver file — all of
-           which need root. So the app removes itself. -->
-      <div class="side-version" id="side-uninstall" style="display:none"><span class="spacer"></span><button type="button" id="uninstall-btn" class="danger">Uninstall VPN Client</button></div>
     </aside>
 
     <section class="main">
@@ -510,9 +505,14 @@
   </div>
 </div>
 
-<!-- Uninstalling is the one action here that removes other people's work along
-     with our own — every profile and every saved key — so it names all of it
-     before asking. -->
+<!-- Opened from "Uninstall VPN Client…" in the macOS app menu (there is no
+     in-window entry point). Dragging the bundle to the Trash is the platform's
+     uninstall and cannot remove the LaunchDaemon, the root-owned copies of
+     charon and openvpn, or any /etc/resolver file — all of which need root, so
+     the app removes itself.
+
+     This is the one action here that removes other people's work along with our
+     own — every profile and every saved key — so it names all of it first. -->
 <div class="overlay" id="uninst-overlay">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="uninst-title">
     <h3 id="uninst-title" class="mono">Uninstall VPN Client?</h3>
@@ -1970,9 +1970,6 @@
   function renderHelper() {
     var row = $("side-helper");
     var bar = $("helper-bar");
-    // `supported` is "this is macOS" — the same condition that gates the
-    // in-app uninstall, since both exist because of the LaunchDaemon.
-    $("side-uninstall").style.display = helperState.supported ? "" : "none";
     if (!helperState.supported) { row.style.display = "none"; bar.className = "helper-bar"; return; }
 
     // Sidebar row: always present on macOS, so the state is visible and the
@@ -2286,7 +2283,6 @@
     $("uninst-quit").focus();
   }
 
-  $("uninstall-btn").addEventListener("click", openUninstall);
   $("uninst-cancel").addEventListener("click", closeUninstall);
   $("uninst-confirm").addEventListener("click", onUninstallConfirm);
   $("uninst-overlay").addEventListener("click", function (e) { if (e.target === $("uninst-overlay")) { closeUninstall(); } });
@@ -2524,6 +2520,10 @@
     // profile — connect when down, tear down when up — so the credential
     // prompts, the IKE-version retry and the error notices all behave exactly
     // as they do from the button.
+    // "Uninstall VPN Client…" in the macOS app menu. The menu item only
+    // reveals the window and emits; everything the confirmation has to say
+    // about profiles and saved keys is known here, not in Rust.
+    EVT.listen("menu-uninstall", function () { openUninstall(); });
     EVT.listen("tray-profile", function (e) {
       var id = e && e.payload;
       if (!id) { return; }

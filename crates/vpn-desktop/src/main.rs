@@ -597,6 +597,66 @@ fn dev(args: &[String]) {
     }
 }
 
+/// Menu-item id for **Uninstall VPN Client…** in the app menu.
+#[cfg(target_os = "macos")]
+const UNINSTALL_MENU_ID: &str = "uninstall-app";
+
+/// Put **Uninstall VPN Client…** in the app menu, where a Mac user looks for
+/// it — the menu that already holds About, Services, Hide and Quit.
+///
+/// macOS only, and not merely because the item is: Windows and Linux run with
+/// `decorations: false` and no menu bar at all, so setting a menu there would
+/// staple a strip inside the window. Tauri only auto-installs its default menu
+/// on macOS for the same reason, and this replaces exactly that default — the
+/// item is inserted into it rather than the menu being rebuilt, so About,
+/// Services, Hide and the Edit/Window submenus stay whatever Tauri says they
+/// should be.
+#[cfg(target_os = "macos")]
+fn with_app_menu(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    use tauri::menu::{Menu, MenuItem, MenuItemKind, PredefinedMenuItem};
+
+    builder
+        .menu(|app| {
+            let menu = Menu::default(app)?;
+            // The app submenu is the first one on macOS.
+            let Some(MenuItemKind::Submenu(app_menu)) = menu.items()?.into_iter().next() else {
+                return Ok(menu);
+            };
+            let item = MenuItem::with_id(
+                app,
+                UNINSTALL_MENU_ID,
+                // The ellipsis is the platform's promise that this asks first.
+                "Uninstall VPN Client…",
+                true,
+                None::<&str>,
+            )?;
+            // Directly above Quit, in its own group: the two app-lifecycle
+            // actions belong together, and the separator is what stops a
+            // mis-aimed click on Quit from starting an uninstall. Positioned
+            // from the end rather than at a fixed index, so a future Tauri
+            // adding an item to the default menu does not move it somewhere odd.
+            let quit = app_menu.items()?.len().saturating_sub(1);
+            app_menu.insert(&PredefinedMenuItem::separator(app)?, quit)?;
+            app_menu.insert(&item, quit)?;
+            Ok(menu)
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == UNINSTALL_MENU_ID {
+                // The confirmation, and everything it has to name (profile
+                // count, saved keys, open tunnels), lives in the window. Show
+                // it and let the UI run the flow it already has — the menu item
+                // is an entry point, not a second implementation.
+                tray::reveal(app);
+                let _ = tauri::Emitter::emit(app, "menu-uninstall", ());
+            }
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_app_menu(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
@@ -605,7 +665,7 @@ fn main() {
         _ => {}
     }
 
-    tauri::Builder::default()
+    with_app_menu(tauri::Builder::default())
         // Must be the first plugin registered: a second launch hands off to
         // this instance (focusing its window) instead of opening a duplicate.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
