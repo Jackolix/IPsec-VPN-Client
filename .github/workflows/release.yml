@@ -182,51 +182,329 @@ jobs:
           Write-Host "== assets =="
           Get-ChildItem dist-assets
 
-      # What the running app polls: the version on offer, and the signature it
-      # must verify before executing the installer it points at. Published as a
-      # release asset so "releases/latest/download/latest.json" — the endpoint in
-      # tauri.conf.json — always resolves to the newest one.
-      - name: Build the updater manifest (latest.json)
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
-        env:
-          TAG: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
-        run: |
-          $ver = $env:TAG -replace '^v', ''
-          # Match on the version rather than taking the first *-setup.exe: a
-          # bundle directory that ever holds two builds must not be able to
-          # publish a manifest pointing at the wrong one.
-          $setup = @(Get-ChildItem -Recurse target\release\bundle\nsis -Filter "*_${ver}_*-setup.exe")
-          if ($setup.Count -ne 1) { throw "expected exactly one $ver NSIS installer, found $($setup.Count)" }
-          $setup = $setup[0]
-          $sig = "$($setup.FullName).sig"
-          if (-not (Test-Path $sig)) { throw "no signature beside $($setup.Name)" }
-          $asset = $setup.Name -replace ' ', '-'
-          $manifest = [ordered]@{
-            version   = $ver
-            notes     = "See the release notes for $env:TAG."
-            pub_date  = (Get-Date).ToUniversalTime().ToString('o')
-            platforms = [ordered]@{
-              # The MSI is bundled too, but the NSIS installer is the one that
-              # carries the broker service hooks, so it is what an update runs.
-              'windows-x86_64' = [ordered]@{
-                signature = (Get-Content $sig -Raw).Trim()
-                url       = "https://github.com/$env:REPO/releases/download/$env:TAG/$asset"
-              }
-            }
-          }
-          $manifest | ConvertTo-Json -Depth 5 | Set-Content dist-assets\latest.json -Encoding utf8
-          Get-Content dist-assets\latest.json
-
       - uses: actions/upload-artifact@v4
         with:
           name: windows-binaries
           path: dist-assets/*
 
-      # Only attach to a Release when this run was triggered by a tag push.
-      - name: Publish Release assets
+  # ---- 3. build the macOS app on Apple Silicon -------------------------------
+  # arm64 only, deliberately — see the note at the top of
+  # scripts/build-strongswan-macos.sh. macos-14 is the Apple Silicon runner.
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync app version from tag
         if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          ver="${TAG#v}"
+          perl -pi -e 's/"version":\s*"[^"]+"/"version": "'"$ver"'"/' \
+            crates/vpn-desktop/tauri.conf.json
+          grep '"version"' crates/vpn-desktop/tauri.conf.json
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Both daemons are a pure function of their build scripts (which pin every
+      # version they download), and building OpenSSL + strongSwan + OpenVPN from
+      # source costs upwards of fifteen minutes. Cache on the script contents so
+      # a release that did not touch them skips the whole thing.
+      - name: Cache the native daemons
+        id: macos-daemons
+        uses: actions/cache@v4
+        with:
+          path: |
+            out/strongswan-macos
+            out/openvpn-macos
+          key: macos-daemons-${{ hashFiles('scripts/build-strongswan-macos.sh', 'scripts/build-openvpn-macos.sh', 'macos/strongswan.conf') }}
+
+      - name: Build strongSwan and OpenVPN
+        if: steps.macos-daemons.outputs.cache-hit != 'true'
+        run: |
+          ./scripts/build-strongswan-macos.sh
+          # Reuse the OpenSSL the strongSwan build just produced rather than
+          # building a second identical copy.
+          OPENSSL_PREFIX="$PWD/build/strongswan-macos/arm64/prefix" \
+            ./scripts/build-openvpn-macos.sh
+
+      # Both scripts verify their own output, but a cache hit restores a tree
+      # nothing has checked this run. These are the files whose absence fails
+      # at runtime rather than at build time.
+      - name: Sanity-check the daemon artifacts are present
+        run: |
+          required="
+            out/strongswan-macos/charon
+            out/strongswan-macos/libstrongswan.0.dylib
+            out/strongswan-macos/libcharon.0.dylib
+            out/strongswan-macos/libipsec.0.dylib
+            out/strongswan-macos/etc/strongswan.conf
+            out/openvpn-macos/openvpn
+          "
+          missing=""
+          for f in $required; do [ -f "$f" ] || missing="$missing $f"; done
+          if [ -n "$missing" ]; then echo "missing:$missing" >&2; exit 1; fi
+          ls -la out/strongswan-macos out/openvpn-macos
+
+      # vpn-desktop's build.rs runs tauri_build::build(), which validates that
+      # every resource glob in tauri.macos.conf.json resolves — so out/helper
+      # must exist before ANY build of that crate, tests included.
+      - name: Build + stage the privileged helper
+        run: |
+          cargo build --release -p vpn-broker
+          mkdir -p out/helper
+          cp target/release/vpn-broker out/helper/
+          ls -la out/helper
+
+      - name: Run tests
+        run: cargo test --workspace --release
+
+      - name: Build CLI binaries
+        run: cargo build --release -p vpn-agent -p vpn-cli
+
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Install Tauri CLI
+        run: |
+          cargo binstall --no-confirm --locked 'tauri-cli@^2.0' \
+            || cargo install tauri-cli --version "^2.0" --locked
+          cargo tauri --version
+
+      - name: Check the signing secrets are configured
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          API_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          [ -n "$KEY" ] || { echo "TAURI_SIGNING_PRIVATE_KEY is not set — the bundle cannot be signed for the updater. See README, 'Updating the app'." >&2; exit 1; }
+          # Gatekeeper blocks an unsigned app on any machine but the one that
+          # built it, so a release without a Developer ID is not shippable.
+          [ -n "$CERT" ] || { echo "APPLE_CERTIFICATE is not set — the app would not pass Gatekeeper on any other Mac." >&2; exit 1; }
+          # Signing is offline; notarising is an authenticated call to Apple, so
+          # it needs a credential of its own. Without these the app is signed but
+          # never submitted, and every user still gets the unidentified-developer
+          # dialog — a failure that only shows up on someone else's Mac.
+          # Named explicitly rather than derived from the variable, so the
+          # message points at the secret you actually have to go and set.
+          [ -n "$API_KEY" ]    || { echo "APPLE_API_KEY is not set — the app would be signed but not notarised." >&2; exit 1; }
+          [ -n "$API_ISSUER" ] || { echo "APPLE_API_ISSUER is not set — the app would be signed but not notarised." >&2; exit 1; }
+          [ -n "$API_P8" ]     || { echo "APPLE_API_KEY_P8 is not set — the app would be signed but not notarised." >&2; exit 1; }
+
+      # Notarisation staples the whole bundle, and every Mach-O inside it has to
+      # carry the same Developer ID signature with the hardened runtime. Tauri
+      # signs the .app it builds, but charon, openvpn, the helper and their
+      # dylibs are plain `resources` that it copies in as-is — they still carry
+      # the ad-hoc signature the build scripts gave them. Re-sign them here,
+      # before the bundle is assembled, or notarisation rejects the lot.
+      - name: Sign the bundled daemons with the Developer ID
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Import the cert into a throwaway keychain scoped to this runner.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          PASS="$(uuidgen)"
+          security create-keychain -p "$PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PASS" "$KEYCHAIN"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$PASS" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          for f in out/strongswan-macos/* out/openvpn-macos/* out/helper/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.conf) continue ;; esac
+            codesign --force --timestamp --options runtime \
+              --sign "$APPLE_SIGNING_IDENTITY" "$f"
+            codesign --verify --strict "$f"
+          done
+          echo "== signed =="
+          ls -la out/strongswan-macos out/openvpn-macos out/helper
+
+      # notarytool takes the key as a FILE, so the secret (which holds the .p8
+      # base64-encoded) has to be materialised. Into RUNNER_TEMP rather than the
+      # workspace, so it cannot be picked up by an artifact upload, and 0600
+      # because it is a private key. Removed again below, whatever happens.
+      - name: Stage the App Store Connect API key
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          umask 077
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$path"
+          # A truncated or mis-encoded secret fails deep inside notarytool with
+          # an unhelpful message; check the shape here instead.
+          head -1 "$path" | grep -q 'BEGIN PRIVATE KEY' \
+            || { echo "APPLE_API_KEY_P8 did not decode to a PEM private key — check it is the base64 of the .p8 file." >&2; exit 1; }
+          echo "APPLE_API_KEY_PATH=$path" >> "$GITHUB_ENV"
+
+      # An App Store Connect API key rather than an Apple ID: it is not tied to
+      # a person, is revocable on its own, and does not stop working when
+      # someone changes their password or leaves. These three together are what
+      # make Tauri notarise; without them it signs but never submits, and every
+      # user still gets the unidentified-developer dialog.
+      - name: Build the app bundle (signed + notarised)
+        working-directory: crates/vpn-desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+        run: cargo tauri build --target aarch64-apple-darwin
+
+      # The key outlives the build step otherwise, and a later failure would
+      # leave a private key on the runner image.
+      - name: Remove the API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8
+
+      # Notarisation alone is not enough for a clean install. It records the
+      # approval on Apple's servers; STAPLING attaches the ticket to the file
+      # itself. Without it Gatekeeper has to reach Apple on first launch, so a
+      # user who is offline — or behind a firewall, which VPN users often are —
+      # still gets the "cannot be opened" dialog for an app that was notarised
+      # perfectly well.
+      #
+      # This verifies rather than hopes: if the app is not accepted by
+      # Gatekeeper here, it will not be accepted on a user's Mac either, and the
+      # release fails now instead of on their machine.
+      - name: Staple the notarisation ticket and verify Gatekeeper accepts it
+        run: |
+          set -euo pipefail
+          bundle=target/aarch64-apple-darwin/release/bundle
+          app=$(find "$bundle/macos" -maxdepth 1 -name '*.app' | head -1)
+          dmg=$(find "$bundle/dmg" -maxdepth 1 -name '*.dmg' | head -1)
+          [ -n "$app" ] || { echo "no .app was built" >&2; exit 1; }
+
+          # The .app may already be stapled by the bundler; stapling twice is a
+          # no-op, so this is safe either way.
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+
+          # Every nested Mach-O must carry the same signature, or the whole
+          # bundle is rejected. --deep --strict is what catches a resource that
+          # kept its ad-hoc signature.
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          # The verdict a user's Mac will reach on first launch.
+          spctl --assess --type execute --verbose=4 "$app"
+
+          if [ -n "$dmg" ]; then
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+          fi
+          echo "== stapled and accepted =="
+
+      - name: Collect release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist-assets
+          for b in vpn-agent vpn-cli vpn-broker; do
+            src="target/aarch64-apple-darwin/release/$b"
+            [ -f "$src" ] && cp "$src" "dist-assets/$b-macos-arm64"
+          done
+          # GitHub rewrites the space in "VPN Client_x.y.z_..." when it stores an
+          # asset, so the download URL would not be the one we asked for — while
+          # latest.json has to name it byte for byte. Publish them space-free.
+          find target/aarch64-apple-darwin/release/bundle \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \) \
+            -exec sh -c 'cp "$1" "dist-assets/$(basename "$1" | tr " " "-")"' _ {} \;
+          echo "== assets =="
+          ls -la dist-assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-binaries
+          path: dist-assets/*
+          if-no-files-found: error
+
+  # ---- 4. compose the updater manifest and publish ---------------------------
+  # Neither build job can own latest.json: it names an artifact from each, and
+  # whichever wrote it would clobber the other's entry. So it is assembled here,
+  # once, from what both uploaded.
+  release:
+    needs: [windows, macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-binaries
+          path: dist-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-binaries
+          path: dist-assets
+
+      # What the running app polls: the version on offer, and the signature it
+      # must verify before executing what the URL points at. Published as a
+      # release asset so "releases/latest/download/latest.json" — the endpoint
+      # pinned in tauri.conf.json — always resolves to the newest one.
+      - name: Build the updater manifest (latest.json)
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          cd dist-assets
+
+          pick() { # glob -> exactly one matching filename, or fail loudly
+            local matches; matches=$(ls -1 $1 2>/dev/null || true)
+            local n; n=$(printf '%s' "$matches" | grep -c . || true)
+            if [ "$n" != "1" ]; then
+              echo "expected exactly one $1, found $n" >&2; exit 1
+            fi
+            printf '%s' "$matches"
+          }
+
+          # The MSI is bundled too, but the NSIS installer is the one carrying
+          # the broker service hooks, so it is what an update runs. macOS
+          # updates consume the .app.tar.gz — never the .dmg.
+          win=$(pick "*_${ver}_*-setup.exe")
+          mac=$(pick "*_${ver}_*.app.tar.gz")
+          [ -f "$win.sig" ] || { echo "no signature beside $win" >&2; exit 1; }
+          [ -f "$mac.sig" ] || { echo "no signature beside $mac" >&2; exit 1; }
+
+          base="https://github.com/$REPO/releases/download/$TAG"
+          cat > latest.json <<EOF
+          {
+            "version": "$ver",
+            "notes": "See the release notes for $TAG.",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "$(cat "$win.sig")",
+                "url": "$base/$win"
+              },
+              "darwin-aarch64": {
+                "signature": "$(cat "$mac.sig")",
+                "url": "$base/$mac"
+              }
+            }
+          }
+          EOF
+          # A malformed manifest is silently ignored by the updater, which
+          # presents as "updates stopped working" months later.
+          python3 -m json.tool latest.json
+          ls -la
+
+      - name: Publish Release assets
         uses: softprops/action-gh-release@v2
         with:
           files: dist-assets/*

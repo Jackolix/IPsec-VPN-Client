@@ -28,7 +28,14 @@
   .app { height: 100vh; display: flex; flex-direction: column; }
 
   /* Custom titlebar: the native decoration is off (tauri.conf.json), so this
-     row is the drag region and carries its own window controls. */
+     row is the drag region and carries its own window controls.
+
+     macOS is the exception. There the window keeps its decoration and uses
+     titleBarStyle "Overlay" (tauri.macos.conf.json), so the real traffic
+     lights float over this same bar: the design is unchanged, but the window
+     controls are the system's, which is what a Mac user reaches for. The bar
+     just gets left padding so the brand does not sit underneath them, and the
+     Windows-style buttons are dropped. */
   .titlebar {
     display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 0 0 16px;
     background: linear-gradient(180deg,#16212f,#121b27); border-bottom: 1px solid var(--line-soft); flex: 0 0 auto;
@@ -47,6 +54,8 @@
   .win-btn:hover { background: rgba(255,255,255,.07); color: var(--text); }
   .win-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .win-btn.close:hover { background: #c42b1c; color: #fff; }
+  body.macos .win-controls { display: none; }
+  body.macos .titlebar { padding-left: 82px; }
   .win-btn .ic-restore { display: none; }
   body.maximized .win-btn .ic-restore { display: block; }
   body.maximized .win-btn .ic-max { display: none; }
@@ -224,6 +233,14 @@
   .update-bar .ub-text { flex: 1; min-width: 0; }
   .update-bar .ub-sub { color: var(--muted); }
   .update-bar b { font-family: var(--mono); }
+  /* Helper strip: same shape and placement as the update strip, because it is
+     the same kind of message — a one-time action worth interrupting for. Shown
+     only on macOS, and only until the helper is installed. */
+  .helper-bar { display: none; align-items: center; gap: 12px; flex: 0 0 auto; padding: 9px 16px;
+    font-size: var(--fs-sm); color: #bcd9ff; background: var(--accent-soft); border-bottom: 1px solid var(--accent-line); }
+  .helper-bar.show { display: flex; }
+  .helper-bar.bad { color: #f0a996; background: var(--crit-soft); border-bottom-color: rgba(240,96,58,.4); }
+  .helper-bar .hb-text { flex: 1; min-width: 0; }
   .ub-progress { flex: 0 0 150px; height: 5px; border-radius: 3px; background: rgba(0,0,0,.35); overflow: hidden; }
   .ub-fill { height: 100%; width: 0; background: var(--accent); transition: width .18s linear; }
   .side-version { padding: 0 16px 11px; font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint);
@@ -361,6 +378,13 @@
     <button id="ub-later" class="btn btn-ghost btn-sm">Later</button>
   </div>
 
+  <div class="helper-bar" id="helper-bar" role="status">
+    <span class="led warn" style="box-shadow:none" aria-hidden="true"></span>
+    <div class="hb-text" id="hb-text"></div>
+    <button id="hb-install" class="btn btn-primary btn-sm">Install helper</button>
+    <button id="hb-later" class="btn btn-ghost btn-sm">Not now</button>
+  </div>
+
   <div class="body">
     <aside class="sidebar">
       <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import profile</button></div>
@@ -370,6 +394,7 @@
       </div>
       <ul class="profiles" id="profile-list"></ul>
       <div class="side-foot"><span id="foot-led" class="led"></span><span id="foot-text">connecting to vici…</span><button id="daemon-btn" class="btn-sm" style="display:none">Start</button></div>
+      <div class="side-version" id="side-helper" style="display:none"><span id="sh-text">helper</span><span class="spacer"></span><button type="button" id="sh-action">Install</button></div>
       <div class="side-version"><span>v<span id="app-version">—</span></span><span class="spacer"></span><button type="button" id="check-update">Check for updates</button></div>
     </aside>
 
@@ -626,10 +651,15 @@
 
   function sanitize(n) { var o = (n || "").replace(/[^A-Za-z0-9_-]/g, "_"); return o.length ? o : "conn"; }
 
-  // Name the OS credential store per platform, for user-facing copy.
+  // Platform flags. IS_MAC also drives the native window chrome further down.
   var IS_WIN = /Windows/.test(navigator.userAgent);
+  var IS_MAC = /Mac|iPhone|iPad/.test(navigator.userAgent);
+  // Platforms where the app owns a native daemon it can start and stop itself.
+  // Everything else (the Linux dev container) manages its own charon, and the
+  // app must not try to launch one.
+  var NATIVE_BACKEND = IS_WIN || IS_MAC;
   var KEYSTORE = IS_WIN ? "Windows Credential Manager"
-    : /Mac/.test(navigator.userAgent) ? "the macOS Keychain"
+    : IS_MAC ? "the macOS Keychain"
     : "the OS keychain";
 
   // Demo data used only when the page is opened outside the Tauri shell.
@@ -1790,24 +1820,36 @@
     log("NET", "virtual IP released, CHILD_SA removed");
   }
 
-  /* ---------- native backend (charon-svc) lifecycle ---------- */
-  // On Windows the app spawns strongSwan's native charon-svc itself (it needs
-  // Administrator for the Windows Filtering Platform, hence a UAC prompt); the
-  // Linux dev container manages its own charon, so the button is Windows-only.
+  /* ---------- native backend lifecycle ---------- */
+  // Windows and macOS both ship their own strongSwan daemon and the app owns
+  // its lifecycle: charon-svc.exe on Windows (elevated, since it drives the
+  // Windows Filtering Platform) and charon on macOS (root, for utun, routes
+  // and the virtual IP). Either way the button and the auto-start below apply.
+  //
+  // Whether that costs the user a prompt depends on the privileged helper: with
+  // it installed, starting and stopping are silent; without it the app falls
+  // back to a UAC / authorization prompt.
+  //
+  // The Linux dev container manages its own charon, so neither applies there.
   var daemonUp = false, daemonBusy = false;
-  var DAEMON_UI = TAURI && IS_WIN;
+  var DAEMON_UI = TAURI && NATIVE_BACKEND;
 
   function renderDaemon() {
     $("foot-led").className = "led" + (!TAURI ? "" : daemonUp ? " ok" : " warn");
     $("foot-text").textContent = !TAURI ? "preview (no backend)"
       : daemonUp ? "charon · vici" : "backend stopped";
+    // Only Start is offered. There is no Stop: the backend coming down is not
+    // something a user wants on its own — it tears down every live tunnel with
+    // it — and a connect starts it anyway, so the button exists purely to
+    // recover a backend that failed to come up. Stopping it is a maintenance
+    // action, and lives with the CLI (scripts/run-charon-macos.sh --stop, or
+    // stopping the service on Windows).
     var btn = $("daemon-btn");
-    if (!DAEMON_UI) { btn.style.display = "none"; return; }
+    if (!DAEMON_UI || daemonUp) { btn.style.display = "none"; return; }
     btn.style.display = "";
-    btn.textContent = daemonBusy ? "…" : daemonUp ? "Stop" : "Start";
+    btn.textContent = daemonBusy ? "…" : "Start";
     btn.className = "btn-sm" + (daemonBusy ? " busy" : "");
-    btn.title = daemonUp ? "Stop charon-svc (elevation prompt)"
-      : "Start charon-svc on this host (elevation prompt)";
+    btn.title = "Start the VPN backend on this host";
   }
 
   async function refreshDaemon() {
@@ -1820,13 +1862,16 @@
   async function ensureDaemon() {
     if (!TAURI) { return true; }
     await refreshDaemon();
-    if (daemonUp || !IS_WIN) { return daemonUp || !IS_WIN; }
-    log("KNL", "starting native backend charon-svc — approve the elevation prompt", "");
+    // Gated on NATIVE_BACKEND, not on Windows. macOS has its own native daemon
+    // now, and gating this on IS_WIN meant Connect silently skipped starting it
+    // and went straight to a vici socket nothing was listening on.
+    if (daemonUp || !NATIVE_BACKEND) { return daemonUp || !NATIVE_BACKEND; }
+    log("KNL", "starting the native VPN backend", "");
     daemonBusy = true; renderDaemon();
     try {
       await TAURI.invoke("start_daemon");
       daemonUp = true;
-      log("KNL", "charon-svc up; vici ready on the host", "good");
+      log("KNL", "backend up; vici ready on the host", "good");
     } catch (e) {
       log("KNL", "backend did not start: " + String(e), "bad");
       showNotice('<span class="led warn" style="box-shadow:none"></span><div>Native backend didn\'t start: ' + esc(String(e)) + "</div>", "bad");
@@ -1834,17 +1879,72 @@
     return daemonUp;
   }
 
+  /* ---------- privileged helper ---------- */
+  // Without it every connect and disconnect raises an authorization prompt:
+  // charon needs root for utun, the virtual IP and routes, and so does
+  // /etc/resolver. Installing it costs one prompt, once. macOS only — Windows
+  // registers its broker from the installer, and Linux has no helper.
+  var helperState = { supported: false, installed: false, reachable: false };
+  var helperBusy = false;
+
+  async function refreshHelper() {
+    if (!TAURI) { return; }
+    try { helperState = await TAURI.invoke("helper_status"); }
+    catch (e) { helperState = { supported: false, installed: false, reachable: false }; }
+    renderHelper();
+  }
+
+  function renderHelper() {
+    var row = $("side-helper");
+    var bar = $("helper-bar");
+    if (!helperState.supported) { row.style.display = "none"; bar.className = "helper-bar"; return; }
+
+    // Sidebar row: always present on macOS, so the state is visible and the
+    // install is reachable again after the strip has been dismissed.
+    row.style.display = "";
+    var ok = helperState.installed && helperState.reachable;
+    $("sh-text").textContent = helperBusy ? "helper · working…"
+      : ok ? "helper · active"
+      : helperState.installed ? "helper · not responding" : "helper · not installed";
+    var act = $("sh-action");
+    act.textContent = ok ? "Remove" : "Install";
+    act.disabled = helperBusy;
+
+    // The strip only nags while there is something to fix, and only until it
+    // is dismissed for this run.
+    if (ok || helperDismissed) { bar.className = "helper-bar"; return; }
+    $("hb-text").innerHTML = helperState.installed
+      ? "The VPN helper is installed but not responding. Reinstall it to stop connect and disconnect prompting."
+      : "Install the VPN helper so connecting and disconnecting stop asking for your password. It needs your password once.";
+    bar.className = "helper-bar show";
+  }
+  var helperDismissed = false;
+
+  async function doHelper(install) {
+    if (helperBusy) { return; }
+    helperBusy = true; renderHelper();
+    try {
+      var msg = await TAURI.invoke(install ? "install_helper" : "uninstall_helper");
+      log("KNL", String(msg), install ? "good" : "");
+      helperDismissed = false;
+    } catch (e) {
+      log("KNL", "helper: " + String(e), "bad");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+    } finally {
+      helperBusy = false;
+      await refreshHelper();
+      // Installing the helper changes who owns charon, so the footer's
+      // Start/Stop state can be stale afterwards.
+      await refreshDaemon();
+    }
+  }
+
   async function onDaemonBtn() {
     if (daemonBusy) { return; }
     daemonBusy = true; renderDaemon();
     try {
-      if (daemonUp) {
-        await TAURI.invoke("stop_daemon"); daemonUp = false;
-        log("KNL", "charon-svc stopped", "");
-      } else {
-        await TAURI.invoke("start_daemon"); daemonUp = true;
-        log("KNL", "charon-svc up; vici ready on the host", "good");
-      }
+      await TAURI.invoke("start_daemon"); daemonUp = true;
+      log("KNL", "backend up; vici ready on the host", "good");
     } catch (e) {
       log("KNL", String(e), "bad");
       showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
@@ -2043,10 +2143,18 @@
   });
   // Window controls for the undecorated window. Close goes through the normal
   // CloseRequested path, so it hides to the tray like the native X did.
+  //
+  // On macOS the window is decorated instead and the system traffic lights sit
+  // on top of this bar, so our own buttons are hidden and never wired up —
+  // minimise/zoom/close all come from the system. Detection is on the webview's
+  // user agent rather than a Tauri OS call, so it needs no extra plugin.
   (function () {
+    var isMac = IS_MAC;
+    if (isMac) { document.body.classList.add("macos"); }
     var wapi = window.__TAURI__ && window.__TAURI__.window;
     if (!wapi || !wapi.getCurrentWindow) { return; }
     var win = wapi.getCurrentWindow();
+    if (isMac) { return; }
     $("win-min").addEventListener("click", function () { win.minimize().catch(function () {}); });
     $("win-max").addEventListener("click", function () { win.toggleMaximize().catch(function () {}); });
     $("win-close").addEventListener("click", function () { win.close().catch(function () {}); });
@@ -2062,6 +2170,13 @@
     win.onResized(syncMax).catch(function () {});
     syncMax();
   })();
+  $("hb-install").addEventListener("click", function () { doHelper(true); });
+  $("hb-later").addEventListener("click", function () {
+    helperDismissed = true; renderHelper();
+  });
+  $("sh-action").addEventListener("click", function () {
+    doHelper(!(helperState.installed && helperState.reachable));
+  });
   $("cpick-btn").addEventListener("click", function () { cpickOpen ? closeCpick() : openCpick(); });
   $("cpick-search").addEventListener("input", function (e) {
     cpickQuery = e.target.value.trim(); cpickHi = 0; renderCompactSelect();
@@ -2288,6 +2403,24 @@
 
   renderDaemon();
   refreshDaemon();
+  // Checked once at startup rather than polled: installing or removing the
+  // helper goes through this window, and a launchd daemon does not come and go
+  // on its own the way the backend can.
+  //
+  // On the very first run the helper is set up without being asked — it is
+  // meant to be the default, the way the Windows installer registers the broker
+  // service, not something to discover. The backend answers at most once per
+  // user, so declining is remembered; the strip and the sidebar row remain for
+  // anyone who changes their mind.
+  refreshHelper().then(function () {
+    if (!TAURI) { return; }
+    return TAURI.invoke("helper_setup_pending").then(function (pending) {
+      if (pending) {
+        log("KNL", "setting up the VPN helper so connecting won't ask for your password", "");
+        return doHelper(true);
+      }
+    }).catch(function () {});
+  });
   // Keep the backend indicator live (it can be started/stopped out-of-band).
   if (TAURI) { setInterval(function () { if (!daemonBusy) { refreshDaemon(); } }, 4000); }
 

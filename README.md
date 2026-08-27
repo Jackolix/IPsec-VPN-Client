@@ -8,6 +8,13 @@ profiles natively and drives charon over the vici control protocol
 (connect / status / disconnect). Verified end-to-end against a LANCOM
 vRouter, including from a native Windows build over a TCP vici socket.
 
+**Windows and macOS** both terminate the tunnel on the host, with their own
+bundled strongSwan and a privileged helper that keeps the GUI unprivileged.
+They share the profile importers, the vici client and the connection logic;
+everything below that is each platform's own — see *Native Windows tunnel* and
+*Native macOS tunnel*. Linux is a development target only, driving charon in a
+container.
+
 ## Security rules (read first)
 
 - Profile exports contain a **live pre-shared key in plaintext** — NCP `.ini`
@@ -35,15 +42,20 @@ vRouter, including from a native Windows build over a TCP vici socket.
 | `crates/vici` | Hand-rolled client for strongSwan's vici control protocol: a cross-platform message codec plus packet framing and a blocking request/event client (Unix and TCP transports). |
 | `crates/vpn-control` | Shared connection logic used by both the CLI and the GUI: the config→vici bridge, `list-sa` status parsing, and the connect/status/disconnect flows over a `Transport` (Unix socket or TCP). `connect_logged` registers for charon's `log` event around `initiate` and returns the captured handshake transcript. |
 | `crates/vpn-desktop` | Tauri desktop app. Rust backend interprets profiles natively and calls `vpn-control`; the web UI (`ui/`) drives it via `invoke`. Native file-picker + drag-drop import, system tray, DNS-over-tunnel (NRPT), PSK in the OS keychain (`src/creds.rs`, `keyring`) taking precedence over the plaintext `.ini`. Run headlessly with `--selftest`; drive the backend flows with `--dev <cmd>`. |
-| `crates/vpn-broker` | Privileged LocalSystem Windows **service** that removes the per-connect UAC prompts: it supervises `charon-svc.exe` and applies/reverts the NRPT DNS rule for the unelevated GUI over an ACL'd named pipe (`src/ipc.rs`). The shared `protocol` + a pipe `client` are a thin lib the desktop links against. Registered by the installer; the GUI falls back to the elevated path when it isn't installed. |
+| `crates/vpn-broker` | The privileged helper, on both platforms. **Windows**: a LocalSystem **service** that supervises `charon-svc.exe` and applies/reverts NRPT DNS rules for the unelevated GUI over an ACL'd named pipe (`src/ipc.rs`), registered by the installer. **macOS**: a launchd **LaunchDaemon** (`src/launchd.rs`) serving the same requests over a Unix socket (`src/unix_ipc.rs`), doing charon's lifecycle and `/etc/resolver` DNS (`src/privileged.rs`). The `protocol` is shared because the shape is (one request, one response, newline JSON); `src/openvpn.rs`, the SSL VPN supervisor, is shared too — only its adapter handling is Windows-specific. On both, the GUI falls back to an elevation prompt when the helper isn't installed. |
 | `crates/vpn-agent` | CLI agent over `vpn-control`: imports a profile and drives charon (`connect` / `status` / `disconnect`). The PSK is pushed via `load-shared` in memory — no swanctl.conf with the secret is written to disk. |
 | `crates/vpn-cli` | Phase 0 CLI: `show` (redacted interpretation) and `generate` (writes swanctl.conf). Kept for inspection/debugging. |
 | `docker/vici-tcp` | Dev backend: charon with its vici socket published on `127.0.0.1:45022` so a host desktop build can drive it. |
 | `docker/strongswan-windows` | MinGW cross-build of strongSwan's **native** Windows daemon `charon-svc.exe` (kernel-wfp / kernel-iph / socket-win / vici, monolithic, OpenSSL). The tunnel terminates on the Windows host via the Windows Filtering Platform - no container. Built + exported by `scripts/build-strongswan-windows.ps1`, launched (elevated) by `scripts/run-charon-windows.ps1`; vici on `127.0.0.1:4502`. |
+| `macos/` | `strongswan.conf` for the native macOS daemon. Built by `scripts/build-strongswan-macos.sh` (kernel-libipsec / kernel-pfroute / tun-device over utun, monolithic, OpenSSL) into `out/strongswan-macos`; OpenVPN for the SSL datapath comes from `scripts/build-openvpn-macos.sh` into `out/openvpn-macos`. Launched by `scripts/run-charon-macos.sh` or by the helper; vici on a Unix socket. |
 | `docker/agent` | Multi-stage image running `vpn-agent` beside charon (Linux client during development). |
 | `docker/initiator` | Legacy Phase 0 container that shells out to `swanctl`. |
 
 ## Quickstart
+
+The snippets below are PowerShell — on a Mac, skip to *Native macOS tunnel*,
+which is self-contained. `cargo test --workspace` is the one command that is
+the same everywhere.
 
 ```powershell
 # Desktop GUI: starts the charon backend container and launches the app
@@ -139,10 +151,158 @@ adapter (`Get-NetRoute -InterfaceAlias 'strongSwan*'`).
 
 If the app icons are ever regenerated: `powershell.exe -File scripts\gen-icons.ps1`.
 
+### Native macOS tunnel (no container)
+
+Like Windows, the tunnel terminates on the Mac itself and the app bundles its
+own strongSwan. The datapath is the same shape — ESP in userland
+(`kernel-libipsec`) over a virtual adapter — but almost nothing else is, and
+none of the Windows workarounds carry over:
+
+* **utun is in the kernel.** strongSwan's `tun_device` drives it directly and
+  opens a fresh one per instance, so all three Wintun patches the Windows
+  cross-build carries (a TUN plugin, one adapter per tunnel, virtual IPs on
+  `kernel-iph`) have no counterpart here. `kernel-pfroute` installs addresses
+  and routes.
+* **The build is native.** No Docker, no MinGW — just Xcode Command Line Tools.
+* **`kernel-pfkey` is deliberately not built**, for the same reason
+  `kernel-wfp` isn't on Windows: its UDP-encapsulated ESP support in tunnel
+  mode is incomplete, and behind NAT that encapsulation is not optional.
+
+**arm64 only.** macOS builds are not universal and Intel Macs are not a target.
+Both build scripts take an `ARCH` override, and each verifies every staged
+Mach-O is the architecture it claims, so revisiting this is one variable and a
+`lipo -create` pass — not a rewrite.
+
+```bash
+# 1. Build the daemons into out/ (OpenSSL is pinned and built from source;
+#    pass OPENSSL_PREFIX to reuse one instead of building it twice).
+./scripts/build-strongswan-macos.sh
+OPENSSL_PREFIX="$PWD/build/strongswan-macos/arm64/prefix" \
+  ./scripts/build-openvpn-macos.sh          # SSL VPN datapath (optional)
+
+# 2. Install the privileged helper. One authorization prompt, once — after
+#    this, connect and disconnect never prompt again.
+cargo build --release -p vpn-broker
+sudo ./target/release/vpn-broker install    # reports the datapaths it installed
+./target/release/vpn-broker status          # installed: true / reachable: true
+
+# 3. Run the app. It starts charon through the helper on the first connect.
+#    (cargo tauri must run in the crate; the bundle lands in the workspace target/)
+(cd crates/vpn-desktop && cargo tauri build --bundles app)
+open "target/release/bundle/macos/VPN Client.app"
+```
+
+The app sets the helper up on **first launch** — one authorization prompt, once
+— so it is the default rather than something to discover, the way the Windows
+installer registers the broker service. Declining is remembered; the strip under
+the titlebar and the sidebar row offer it again whenever you want. Once
+installed, launchd loads it at boot and it starts charon with it, so the backend
+is simply always running in the background.
+
+Without the helper everything still works, but each connect and disconnect
+raises an authorization prompt — charon needs root for utun, the virtual IP and
+routes, and so does `/etc/resolver`. To drive it by hand instead:
+
+```bash
+sudo scripts/run-charon-macos.sh            # foreground; --stop to signal one
+
+# ...and from another shell (sudo too — the vici socket is root-owned):
+cargo build -p vpn-agent
+sudo ./target/debug/vpn-agent --socket /var/run/ipsec-vpn/charon.vici status
+```
+
+#### Where things live, and why they are not in the app bundle
+
+The helper installs to `/Library/PrivilegedHelperTools`, its launchd plist to
+`/Library/LaunchDaemons`, and **copies charon and openvpn** to
+`/Library/Application Support/dev.jackolix.ipsecvpn/`. That copy is the point:
+launchd runs the helper as root and the helper execs both binaries as root, so
+neither may live anywhere an unprivileged user can write — and an app bundle
+sitting in `~/Applications` or `~/Downloads` is exactly that.
+
+`sudo ./target/release/vpn-broker uninstall` removes all of it.
+
+#### Who may drive the daemon
+
+charon `chown`s its vici socket to its own configured gid immediately after
+binding, so the group of the containing directory does **not** decide this —
+`charon.group` in `macos/strongswan.conf` does. It is set to `staff`; narrowing
+it to `admin` makes the VPN administrators-only, at the cost of standard users
+not being able to use the app at all.
+
+The helper's own socket is `0660 root:staff` and refuses uids below 500 via
+`LOCAL_PEERCRED`. That identifies the *user*, not the program — proving which
+binary is calling needs the peer's code signature, which needs a Developer ID.
+Until then the real boundary is the shape of the request surface: `CharonStart`
+takes no arguments (so no request can name the binary root executes), DNS
+servers are re-parsed and the split-DNS domain re-validated helper-side, and
+nothing goes through a shell.
+
+#### DNS
+
+macOS has no single NRPT equivalent, so two mechanisms cover it, chosen from
+the tunnel's own remote subnets:
+
+| Tunnel | DNS |
+|---|---|
+| Names a DNS domain | `/etc/resolver/<domain>` — only that suffix resolves over the tunnel |
+| Split tunnel, no domain | **System DNS left alone** |
+| Real `0.0.0.0/0` tunnel | Catch-all on the primary service via `networksetup` |
+
+The middle row is a deliberate divergence from Windows. An NRPT rule for `.` is
+Windows' only way to say "no namespace", so it has to take the catch-all;
+macOS doesn't, and a tunnel carrying one `/24` should not quietly become the
+resolver for every name on the machine. Set a DNS domain on the profile (it is
+an editable field) to resolve internal names over the tunnel.
+
+#### Gotchas
+
+* **Rebuilding the bundle does not replace a running app.** Closing the window
+  hides it to the tray, so the old binary stays alive and reopening from the
+  tray gives you the *old* build. Quit it properly first
+  (`pkill -f "VPN Client.app"`).
+* **Changing helper code needs a reinstall** — `sudo ./target/release/vpn-broker
+  install`. The running daemon is the copy under `/Library`, not your build.
+* `scripts/diagnose-macos.sh` dumps the routing table, utun addresses, DNS and
+  the relevant charon log lines for a live tunnel. `knl = 2` in
+  `macos/strongswan.conf` is what makes route installation visible; at level 1
+  strongSwan logs it at DBG2 and you see nothing.
+* **Cross-check Windows from macOS** whenever shared code changes:
+  `cargo check --target x86_64-pc-windows-msvc -p vpn-broker --all-targets`.
+
 ### Releases / shipping
 
 Push a `v*` tag and `.github/workflows/release.yml` builds everything and
-attaches it to a GitHub Release: a Windows **installer** (NSIS `*-setup.exe`
+attaches it to a GitHub Release. Four jobs: the Windows daemon is cross-built
+on Linux and handed to a `windows` job; a `macos` job builds its own daemons
+natively on Apple Silicon; and a `release` job composes `latest.json` from both
+and publishes. The manifest cannot belong to either build job — it names an
+artifact from each, and whichever wrote it would clobber the other's entry.
+
+**macOS** ships a `.dmg` plus the `.app.tar.gz` the updater consumes (the `.dmg`
+is *not* an update channel). The job re-signs charon, openvpn and the helper
+with the Developer ID **before** the bundle is assembled: Tauri signs the `.app`
+it builds, but those are plain `resources` copied in carrying only the ad-hoc
+signature the build scripts gave them, and notarisation rejects a bundle whose
+nested Mach-O files are not all signed the same way. Secrets:
+`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+plus an App Store Connect API key for notarising: `APPLE_API_ISSUER`,
+`APPLE_API_KEY` (the Key ID) and `APPLE_API_KEY_P8` (the `.p8`, base64-encoded).
+
+Signing and notarising need different credentials because they are different
+operations: signing is offline cryptography, while notarising uploads the build
+to Apple and is an authenticated API call. An API key is used rather than an
+Apple ID and app-specific password because it belongs to the team rather than a
+person — revocable on its own, and it does not stop working when someone changes
+their password or leaves.
+
+Notarising is also not the last step. The ticket it issues has to be **stapled**
+to the app and the dmg, or Gatekeeper has to reach Apple on first launch and an
+offline user still sees "cannot be opened" for a perfectly notarised build. The
+job staples both and then runs `spctl --assess` — the same verdict a user's Mac
+reaches — so a release that would warn users fails in CI instead.
+
+**Windows** gets an **installer** (NSIS `*-setup.exe`
 and an MSI) that bundles the app, `charon-svc.exe` + its DLLs (installed to
 `<app>\charon\`) **and** the privileged broker (`vpn-broker.exe`), plus the
 standalone `vpn-agent.exe` / `vpn-cli.exe`. The NSIS installer registers the

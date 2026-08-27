@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 // Why a connect was abandoned at the gateway's push because it wanted the
 // default route and something else already has it. Defined in the protocol,
 // since the GUI matches on it to name the tunnel that is in the way.
-use vpn_broker::protocol::FULL_TUNNEL_REFUSED;
+use crate::protocol::FULL_TUNNEL_REFUSED;
 
 /// Overall budget for reaching CONNECTED: TLS, `auth-user-pass`, the server's
 /// config push and route installation all fit inside this.
@@ -52,9 +52,11 @@ const LOG_RING: usize = 40;
 /// the caller passes a slot and [`adapter_name`] turns it into a distinct
 /// device. Slot 0 keeps the original, unsuffixed name so an adapter created by
 /// an earlier version is reused rather than orphaned.
+#[cfg(windows)]
 const ADAPTER_BASE: &str = "OpenVPN Data Channel";
 
 /// The wintun adapter for tunnel slot `slot` (see [`ADAPTER_BASE`]).
+#[cfg(windows)]
 pub fn adapter_name(slot: usize) -> String {
     if slot == 0 {
         ADAPTER_BASE.to_string()
@@ -224,13 +226,23 @@ pub fn connect(
     sanitize(config)?;
 
     let exe = openvpn_exe()?;
-    let adapter = adapter_name(slot);
-    ensure_adapter(&exe, &adapter)?;
+    // Windows has no TUN device of its own, so openvpn is pointed at a wintun
+    // adapter that has to exist first and be distinct per tunnel. macOS opens a
+    // fresh utun per process with no help at all, which is why `slot` is only
+    // meaningful on Windows.
+    #[cfg(windows)]
+    let adapter = {
+        let a = adapter_name(slot);
+        ensure_adapter(&exe, &a)?;
+        a
+    };
+    #[cfg(not(windows))]
+    let _ = slot;
     let dir = work_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     let port = free_port()?;
     let config_path = dir.join(format!("sslvpn-{}.ovpn", port));
-    std::fs::write(&config_path, config)
+    write_private(&config_path, config)
         .map_err(|e| format!("could not stage the SSL VPN config: {e}"))?;
 
     // Feed the credentials through an `--auth-user-pass` file rather than over
@@ -240,7 +252,7 @@ pub fn connect(
     // sensitive as the private key already beside it, and shares its lifecycle —
     // deleted on teardown, on drop, and swept at startup.
     let auth_path = dir.join(format!("sslvpn-{}.auth", port));
-    std::fs::write(&auth_path, format!("{}\n{}\n", username, password))
+    write_private(&auth_path, &format!("{}\n{}\n", username, password))
         .map_err(|e| format!("could not stage the SSL VPN credentials: {e}"))?;
 
     // Guard against leaking either secret-bearing file if we bail before building
@@ -265,18 +277,6 @@ pub fn connect(
     cmd.arg("--config")
         .arg(&config_path)
         .args(["--script-security", "1"])
-        // Use the wintun adapter we ship (the DLL sits beside openvpn.exe),
-        // rather than requiring a TAP driver install. Layer-3, self-contained,
-        // same driver charon uses. `--windows-driver` after `--config` overrides
-        // anything the profile set.
-        .args(["--windows-driver", "wintun"])
-        // A distinctly named adapter so openvpn creates its own rather than
-        // grabbing charon's wintun device (both use wintun; without this openvpn
-        // finds charon's "strongSwan Tunnel" adapter and reports it "in use").
-        // One per slot, so a second concurrent tunnel doesn't collide with the
-        // first's adapter the same way.
-        .arg("--dev-node")
-        .arg(&adapter)
         .arg("--auth-user-pass")
         .arg(&auth_path)
         .args(["--management", "127.0.0.1", &port.to_string()])
@@ -295,6 +295,16 @@ pub fn connect(
             cmd.env("OPENSSL_MODULES", &modules);
         }
     }
+    // Use the wintun adapter we ship (the DLL sits beside openvpn.exe), rather
+    // than requiring a TAP driver install. Layer-3, self-contained, same driver
+    // charon uses. Placed after `--config` so it overrides anything the profile
+    // set, and pointed at a distinctly named adapter so openvpn creates its own
+    // rather than grabbing charon's wintun device -- both use wintun, and
+    // without this openvpn finds charon's "strongSwan Tunnel" and reports it in
+    // use. One per slot, so concurrent tunnels do not collide either.
+    #[cfg(windows)]
+    cmd.args(["--windows-driver", "wintun"]).arg("--dev-node").arg(&adapter);
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to launch openvpn: {e}"))?;
@@ -623,7 +633,17 @@ pub fn sanitize(config: &str) -> Result<(), String> {
 /// bundle exists) the OpenVPN that ships with Sophos Connect is accepted as a
 /// last resort.
 fn openvpn_exe() -> Result<PathBuf, String> {
+    #[cfg(windows)]
     const EXE: &str = "openvpn.exe";
+    #[cfg(not(windows))]
+    const EXE: &str = "openvpn";
+    // Where the dev build stages it, per platform: the Windows tree is vendored
+    // from the official MSI, the macOS one is built from source.
+    #[cfg(windows)]
+    const DEV_DIR: &str = "../../out/openvpn";
+    #[cfg(not(windows))]
+    const DEV_DIR: &str = "../../out/openvpn-macos";
+
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Some(p) = std::env::var_os("VPN_OPENVPN_EXE") {
@@ -634,16 +654,26 @@ fn openvpn_exe() -> Result<PathBuf, String> {
             // Bundled beside the broker (production layout).
             candidates.push(dir.join("openvpn").join(EXE));
             candidates.push(dir.join(EXE));
-            // Dev: target/debug/vpn-broker.exe -> repo/out/openvpn (mirrors the
-            // charon dev fallback), populated by scripts/fetch-openvpn-windows.ps1.
-            candidates.push(dir.join("../../out/openvpn").join(EXE));
+            // Dev: target/<profile>/vpn-broker -> repo/out/<staged tree>,
+            // mirroring the charon dev fallback.
+            candidates.push(dir.join(DEV_DIR).join(EXE));
         }
     }
+    // macOS installs the helper outside the app bundle, so the copy it uses
+    // lives beside it under the same root-owned support directory as charon —
+    // never in the bundle, which is user-writable.
+    #[cfg(target_os = "macos")]
+    candidates.push(
+        Path::new(crate::protocol::MACOS_SUPPORT_DIR)
+            .join("openvpn")
+            .join(EXE),
+    );
     // Last-resort dev fallback; a shipped build always bundles its own openvpn.
+    #[cfg(windows)]
     candidates.push(PathBuf::from(r"C:\Program Files (x86)\Sophos\Connect\openvpn.exe"));
 
     candidates.into_iter().find(|p| p.is_file()).ok_or_else(|| {
-        "openvpn.exe not found (bundle it beside the broker or set VPN_OPENVPN_EXE)".to_string()
+        format!("{EXE} not found (bundle it beside the helper or set VPN_OPENVPN_EXE)")
     })
 }
 
@@ -656,6 +686,7 @@ fn openvpn_exe() -> Result<PathBuf, String> {
 /// `tapctl` ships beside openvpn in the bundle. If it is absent (the dev
 /// fallback to Sophos Connect's openvpn has none), this is skipped and openvpn
 /// falls back to whatever adapter is available.
+#[cfg(windows)]
 fn ensure_adapter(openvpn_exe: &Path, adapter: &str) -> Result<(), String> {
     let Some(tapctl) = openvpn_exe.parent().map(|d| d.join("tapctl.exe")).filter(|p| p.is_file())
     else {
@@ -703,10 +734,36 @@ fn free_port() -> Result<u16, String> {
 /// Where the transient config and openvpn's log live — beside charon's, under
 /// ProgramData, since the service has no console.
 fn work_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("ipsec-vpn")
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        base.join("ipsec-vpn")
+    }
+    // The same root-owned directory the helper keeps its socket in. Cleared on
+    // boot, which suits files that exist only for the life of a tunnel and
+    // carry a private key and a password.
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/var/run/ipsec-vpn")
+    }
+}
+
+/// Write a file only its owner can read.
+///
+/// Both files this is used for are secrets: the staged `.ovpn` carries the
+/// user's private key, and the auth file carries their password. The helper
+/// runs as root, so without this they would land world-readable under the
+/// default umask and any local user could read the key straight off disk.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// openvpn's captured output for the log panel — trimmed, and capped to the last
@@ -815,6 +872,8 @@ mod tests {
         assert!(parse_push_reply(">STATE:1,CONNECTED,SUCCESS,10.8.0.6,1.2.3.4").is_none());
     }
 
+    /// Adapters are a Windows concern only — macOS opens a utun per process.
+    #[cfg(windows)]
     #[test]
     fn adapter_names_are_distinct_and_keep_the_original() {
         // Slot 0 must stay unsuffixed: an adapter created by a version that only

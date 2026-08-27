@@ -11,6 +11,7 @@ mod creds;
 mod daemon;
 mod deeplink;
 mod dns;
+mod helper;
 mod overrides;
 mod portal;
 mod ssl;
@@ -245,6 +246,44 @@ fn set_tray_status(
         detail.as_deref().unwrap_or_default(),
         &profiles.unwrap_or_default(),
     );
+}
+
+/// Whether the privileged helper is installed and answering.
+///
+/// `supported` is what the UI gates on: only macOS has a helper the app can
+/// offer to install. On Windows the broker is registered by the installer, and
+/// on Linux there is none.
+#[tauri::command]
+async fn helper_status() -> Result<serde_json::Value, String> {
+    let (installed, reachable) = helper::status();
+    Ok(serde_json::json!({
+        "supported": cfg!(target_os = "macos"),
+        "installed": installed,
+        "reachable": reachable,
+    }))
+}
+
+/// Whether the app should set the helper up now without being asked. True at
+/// most once per user — see [`helper::setup_pending`].
+#[tauri::command]
+async fn helper_setup_pending() -> Result<bool, String> {
+    Ok(helper::setup_pending())
+}
+
+/// Install the helper. Raises one authorization prompt; after it, connect and
+/// disconnect never prompt again.
+#[tauri::command]
+async fn install_helper() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(helper::install)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn uninstall_helper() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(helper::uninstall)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -488,6 +527,12 @@ fn dev(args: &[String]) {
         }
         Some("reset-edit") => backend::reset_profile_edit(&state, args.get(1).cloned().unwrap_or_default())
             .map(|_| "reset".to_string()),
+        Some("helper-install") => helper::install(),
+        Some("helper-uninstall") => helper::uninstall(),
+        Some("helper-status") => {
+            let (installed, reachable) = helper::status();
+            Ok(format!("installed: {installed}, reachable: {reachable}"))
+        }
         Some("daemon-start") => backend::daemon_start(&state).map(|_| "started".to_string()),
         Some("daemon-stop") => backend::daemon_stop(&state).map(|_| "stopped".to_string()),
         Some("save-creds") => {
@@ -550,6 +595,10 @@ fn main() {
             daemon_running,
             start_daemon,
             stop_daemon,
+            helper_status,
+            helper_setup_pending,
+            install_helper,
+            uninstall_helper,
             save_credentials,
             set_credentials,
             forget_credentials,

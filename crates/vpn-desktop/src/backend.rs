@@ -46,6 +46,12 @@ impl AppState {
 /// data dir, so an installed app (whose working directory is unpredictable)
 /// always finds the same stable folder.
 fn default_profile_dir() -> PathBuf {
+    app_data_dir().join("profiles")
+}
+
+/// The app's own per-user directory: profiles live under it, and so does the
+/// small amount of state that has to outlive a run.
+pub fn app_data_dir() -> PathBuf {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(not(windows))]
@@ -55,11 +61,18 @@ fn default_profile_dir() -> PathBuf {
 
     base.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join("ipsec-vpn")
-        .join("profiles")
 }
 
 fn default_transport() -> Transport {
-    #[cfg(unix)]
+    // macOS, like Windows, can spawn its own native daemon — so the default
+    // target is the socket *our* charon binds, not strongSwan's shared default
+    // path. See `daemon::NATIVE_VICI_SOCKET` for why that distinction matters.
+    #[cfg(target_os = "macos")]
+    {
+        Transport::Unix(crate::daemon::NATIVE_VICI_SOCKET.to_string())
+    }
+    // Linux drives a distro/container charon on the standard socket path.
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         Transport::Unix("/var/run/charon.vici".to_string())
     }
@@ -75,10 +88,16 @@ fn default_transport() -> Transport {
 
 /// The vici endpoint the app talks to — used both to drive charon and to know
 /// where the native daemon should come up.
+///
+/// Both variants are matched explicitly rather than falling back to the TCP
+/// address: on macOS the transport *is* a Unix socket, and mapping it to the
+/// Windows loopback port made `daemon_running` probe a port nothing would ever
+/// bind — reporting the backend permanently down while `vpn-control` connected
+/// to the real socket perfectly well.
 fn vici_addr(state: &AppState) -> String {
     match &state.transport {
         Transport::Tcp(a) => a.clone(),
-        _ => crate::daemon::NATIVE_VICI_ADDR.to_string(),
+        Transport::Unix(p) => p.clone(),
     }
 }
 

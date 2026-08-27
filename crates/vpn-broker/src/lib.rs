@@ -1,10 +1,20 @@
-//! Shared surface of the privileged broker: the IPC protocol (portable) and a
-//! Windows named-pipe client the unelevated GUI links against.
+//! Shared surface of the privileged helper: the IPC protocol (portable) plus
+//! the per-platform transport the unprivileged GUI links against.
 //!
-//! The broker binary (a LocalSystem Windows service) does the two things the
-//! GUI would otherwise need a UAC prompt for — supervising `charon-svc.exe`
-//! (WFP needs Administrator) and installing Windows NRPT DNS rules. The GUI
-//! sends it small, validated requests over an ACL'd named pipe instead.
+//! Both platforms solve the same problem — the GUI runs unprivileged, but
+//! bringing a tunnel up needs root — and both do it by moving those operations
+//! behind a small, validated request surface. What differs is everything else:
+//!
+//! | | Windows | macOS |
+//! |---|---|---|
+//! | form | LocalSystem SCM service | launchd `LaunchDaemon` |
+//! | transport | named pipe | Unix socket |
+//! | access control | pipe DACL | file mode + `LOCAL_PEERCRED` |
+//! | charon | supervised by the service | started on request |
+//! | DNS | NRPT rules | `/etc/resolver` files |
+//!
+//! The protocol is shared because the *shape* is shared: one request, one
+//! response, newline-delimited JSON, with a deliberately tiny command surface.
 
 pub mod protocol;
 
@@ -15,3 +25,21 @@ pub mod client;
 /// broker mistakes another vendor's strongSwan for ours.
 #[cfg(windows)]
 pub mod listener;
+
+/// The OpenVPN supervisor for the Sophos SSL VPN datapath, shared by both
+/// privileged helpers. The management-interface dialogue is OpenVPN's own
+/// protocol and identical everywhere; only the adapter handling differs, and
+/// that is Windows-only — macOS opens a utun with no help at all.
+#[cfg(any(windows, target_os = "macos"))]
+pub mod openvpn;
+
+/// macOS: the LaunchDaemon helper's socket server, its privileged operations,
+/// its installer, and the client the GUI uses to reach it.
+#[cfg(target_os = "macos")]
+pub mod launchd;
+#[cfg(target_os = "macos")]
+pub mod privileged;
+#[cfg(target_os = "macos")]
+pub mod unix_client;
+#[cfg(target_os = "macos")]
+pub mod unix_ipc;
