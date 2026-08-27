@@ -26,6 +26,13 @@ pub mod client;
 #[cfg(windows)]
 pub mod listener;
 
+/// The OpenVPN supervisor for the Sophos SSL VPN datapath, shared by both
+/// privileged helpers. The management-interface dialogue is OpenVPN's own
+/// protocol and identical everywhere; only the adapter handling differs, and
+/// that is Windows-only — macOS opens a utun with no help at all.
+#[cfg(any(windows, target_os = "macos"))]
+pub mod openvpn;
+
 /// macOS: the LaunchDaemon helper's socket server, its privileged operations,
 /// its installer, and the client the GUI uses to reach it.
 #[cfg(target_os = "macos")]

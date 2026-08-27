@@ -23,8 +23,6 @@ mod ipc;
 #[cfg(windows)]
 mod nrpt;
 #[cfg(windows)]
-mod openvpn;
-#[cfg(windows)]
 mod service;
 #[cfg(windows)]
 mod supervisor;
@@ -66,12 +64,15 @@ fn run_macos(cmd: Option<&str>) -> i32 {
                     privileged::apply_dns(&conn, &servers, domain.as_deref())
                 }
                 Request::RevertDns { conn } => privileged::revert_dns(&conn),
-                // SSL VPN is not carried by this helper yet. Answered rather
-                // than ignored so the GUI gets a reason it can show.
-                Request::SslConnect { .. } | Request::SslDisconnect { .. } | Request::SslStatus => {
-                    Response::err("SSL VPN is not supported by the macOS helper yet")
+                Request::SslConnect { name, config, username, password, allow_full } => {
+                    privileged::ssl_connect(&name, &config, &username, &password, allow_full)
                 }
+                Request::SslDisconnect { name } => privileged::ssl_disconnect(&name),
+                Request::SslStatus => privileged::ssl_status(),
             });
+            // A staged .ovpn holds a private key and its auth file holds a
+            // password; a crash is exactly when those get orphaned.
+            privileged::ssl_sweep();
             if let Err(e) = unix_ipc::serve(handler) {
                 eprintln!("helper: {e}");
                 return 1;
@@ -90,7 +91,10 @@ fn run_macos(cmd: Option<&str>) -> i32 {
                 eprintln!("no charon directory found beside this binary");
                 return 1;
             };
-            match launchd::install(&exe, &charon) {
+            // Optional: a build without the SSL datapath staged still gets a
+            // working IPsec helper.
+            let openvpn = launchd::bundled_openvpn_dir(&exe);
+            match launchd::install(&exe, &charon, openvpn.as_deref()) {
                 Ok(msg) => {
                     println!("{msg}");
                     0
@@ -178,7 +182,7 @@ fn run_windows(cmd: Option<&str>, args: &[String]) -> i32 {
     }
 }
 
-/// Drive [`openvpn::connect`] from the command line for testing. Reads the
+/// Drive [`vpn_broker::openvpn::connect`] from the command line for testing. Reads the
 /// config from a file (so the private key never rides argv), connects, prints
 /// the assigned IP, holds the tunnel up for a few seconds, then disconnects.
 #[cfg(windows)]
@@ -200,7 +204,7 @@ fn ovpn_connect(args: &[String]) -> i32 {
     };
 
     // Slot 0 — this foreground test drives one tunnel and owns the machine.
-    match openvpn::connect(&config, user, pass, 0, true) {
+    match vpn_broker::openvpn::connect(&config, user, pass, 0, true) {
         Ok(tunnel) => {
             println!(
                 "connected; assigned IP: {}",

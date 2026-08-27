@@ -82,9 +82,13 @@ pub fn parse_meta(text: &str) -> SslMeta {
     SslMeta { gateway, port, proto, needs_user }
 }
 
-/// Ask the broker to bring up the SSL tunnel `name` from `config`, answering its
-/// `auth-user-pass` round with `username`/`password`. Returns the assigned IP.
-#[cfg(windows)]
+/// Ask the privileged helper to bring up the SSL tunnel `name` from `config`,
+/// answering its `auth-user-pass` round with `username`/`password`. Returns the
+/// assigned IP.
+///
+/// Windows and macOS reach their helper through the same request, so the body
+/// is shared; only the transport under [`helper_request`] differs.
+#[cfg(any(windows, target_os = "macos"))]
 pub fn connect(
     name: &str,
     config: &str,
@@ -92,7 +96,7 @@ pub fn connect(
     password: &str,
     allow_full: bool,
 ) -> Result<String, SslError> {
-    let resp = vpn_broker::client::request(&vpn_broker::protocol::Request::SslConnect {
+    let resp = helper_request(&vpn_broker::protocol::Request::SslConnect {
         name: name.to_string(),
         config: config.to_string(),
         username: username.to_string(),
@@ -100,7 +104,7 @@ pub fn connect(
         allow_full,
     })
     .map_err(|e| SslError {
-        reason: format!("the VPN broker is not reachable: {e}"),
+        reason: format!("the VPN helper is not reachable: {e}"),
         log: String::new(),
     })?;
     if resp.ok {
@@ -113,7 +117,7 @@ pub fn connect(
 /// The broker encodes an SSL connect failure as JSON `{"reason","log"}` so the
 /// short reason and openvpn's output travel separately. A failure that isn't
 /// that shape (a transport-level error) is taken verbatim as the reason.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn parse_ssl_error(msg: &str) -> SslError {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(msg) {
         if let Some(reason) = v.get("reason").and_then(|s| s.as_str()) {
@@ -128,12 +132,12 @@ fn parse_ssl_error(msg: &str) -> SslError {
 
 /// Ask the broker to tear down the SSL tunnel called `name`, if it is up. Other
 /// SSL tunnels are left alone.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn disconnect(name: &str) -> Result<(), String> {
-    let resp = vpn_broker::client::request(&vpn_broker::protocol::Request::SslDisconnect {
+    let resp = helper_request(&vpn_broker::protocol::Request::SslDisconnect {
         name: name.to_string(),
     })
-    .map_err(|e| format!("the VPN broker is not reachable: {e}"))?;
+    .map_err(|e| format!("the VPN helper is not reachable: {e}"))?;
     if resp.ok {
         Ok(())
     } else {
@@ -141,11 +145,11 @@ pub fn disconnect(name: &str) -> Result<(), String> {
     }
 }
 
-/// Ask the broker which SSL tunnels are up. Empty when none is.
-#[cfg(windows)]
+/// Ask the privileged helper which SSL tunnels are up. Empty when none is.
+#[cfg(any(windows, target_os = "macos"))]
 pub fn status() -> Result<Vec<SslStatus>, String> {
-    let resp = vpn_broker::client::request(&vpn_broker::protocol::Request::SslStatus)
-        .map_err(|e| format!("the VPN broker is not reachable: {e}"))?;
+    let resp = helper_request(&vpn_broker::protocol::Request::SslStatus)
+        .map_err(|e| format!("the VPN helper is not reachable: {e}"))?;
     if !resp.ok {
         return Err(resp.msg);
     }
@@ -153,7 +157,7 @@ pub fn status() -> Result<Vec<SslStatus>, String> {
         return Ok(Vec::new());
     }
     let v: serde_json::Value = serde_json::from_str(&resp.msg)
-        .map_err(|e| format!("could not read the broker's SSL status: {e}"))?;
+        .map_err(|e| format!("could not read the helper's SSL status: {e}"))?;
     Ok(parse_status(&v))
 }
 
@@ -161,7 +165,7 @@ pub fn status() -> Result<Vec<SslStatus>, String> {
 /// tunnels became possible; a bare object is what a broker older than the app
 /// (an upgrade that left the service binary behind) still sends, and is read as
 /// the single tunnel it means.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn parse_status(v: &serde_json::Value) -> Vec<SslStatus> {
     let one = |o: &serde_json::Value| SslStatus {
         name: o.get("name").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
@@ -176,9 +180,28 @@ fn parse_status(v: &serde_json::Value) -> Vec<SslStatus> {
     }
 }
 
-// On non-Windows the broker (and thus SSL VPN) is unavailable; keep the surface
-// present so the rest of the app builds on CI.
-#[cfg(not(windows))]
+/// One request to whichever privileged helper this platform has.
+///
+/// The protocol is the same on both; the transport is not — an ACL'd named pipe
+/// on Windows, a Unix socket on macOS — so this is the single place the two
+/// diverge, and every caller above is written once.
+#[cfg(any(windows, target_os = "macos"))]
+fn helper_request(
+    req: &vpn_broker::protocol::Request,
+) -> Result<vpn_broker::protocol::Response, String> {
+    #[cfg(windows)]
+    {
+        vpn_broker::client::request(req)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        vpn_broker::unix_client::request(req)
+    }
+}
+
+// On Linux there is no privileged helper, so SSL VPN is unavailable; keep the
+// surface present so the rest of the app builds on CI.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn connect(
     _name: &str,
     _config: &str,
@@ -187,15 +210,16 @@ pub fn connect(
     _allow_full: bool,
 ) -> Result<String, SslError> {
     Err(SslError {
-        reason: "SSL VPN is only supported on Windows".to_string(),
+        reason: "SSL VPN needs a privileged helper, which this platform has none of"
+            .to_string(),
         log: String::new(),
     })
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn disconnect(_name: &str) -> Result<(), String> {
-    Err("SSL VPN is only supported on Windows".to_string())
+    Err("SSL VPN needs a privileged helper, which this platform has none of".to_string())
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn status() -> Result<Vec<SslStatus>, String> {
     Ok(Vec::new())
 }
@@ -238,8 +262,8 @@ mod tests {
         assert_eq!(e.reason, "the gateway rejected the username or password");
         assert_eq!(e.log, "line1\nline2");
         // A non-JSON failure is taken verbatim as the reason, with no log.
-        let e = parse_ssl_error("the VPN broker is not reachable: pipe closed");
-        assert_eq!(e.reason, "the VPN broker is not reachable: pipe closed");
+        let e = parse_ssl_error("the VPN helper is not reachable: pipe closed");
+        assert_eq!(e.reason, "the VPN helper is not reachable: pipe closed");
         assert!(e.log.is_empty());
     }
 
