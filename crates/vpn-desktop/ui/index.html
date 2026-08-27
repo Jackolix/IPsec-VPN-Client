@@ -58,6 +58,7 @@
   .led { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
   .led.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
   .led.warn { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+  .led.crit { background: var(--crit); box-shadow: 0 0 0 3px var(--crit-soft); }
   .led.pulse { animation: pulse 1.3s ease-in-out infinite; }
   @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.35;} }
 
@@ -122,6 +123,7 @@
   .status-pill { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 6px 13px; background: rgba(0,0,0,.2); white-space: nowrap; }
   .status-pill.established { color: var(--ok); border-color: rgba(70,194,102,.42); background: var(--ok-soft); }
   .status-pill.connecting { color: var(--warn); border-color: rgba(217,165,49,.42); background: var(--warn-soft); }
+  .status-pill.stalled { color: var(--crit); border-color: rgba(240,96,58,.42); background: var(--crit-soft); }
   .btn { font-family: var(--mono); font-size: var(--fs-base); font-weight: 600; letter-spacing: .02em; cursor: pointer; border-radius: 9px; padding: 10px 20px; border: 1px solid transparent; white-space: nowrap; transition: background .13s, border-color .13s, opacity .13s; }
   .btn-primary { background: var(--accent); color: #06121f; }
   .btn-primary:hover { background: #62adff; }
@@ -648,6 +650,10 @@
 
   var profiles = [];
   var state = {};          // id -> 'disconnected' | 'connecting' | 'established'
+  // id -> true when the SA is up but the data path is one-way dead. Kept apart
+  // from `state` on purpose: a stalled tunnel is still established as far as
+  // every connect/disconnect decision goes, and only the indicators differ.
+  var stalled = {};
   var current = null;
   var filter = "";         // sidebar filter text (never touches the backend)
   var pendingDelete = null;
@@ -724,8 +730,8 @@
       var b = document.createElement("button");
       b.className = "profile" + (current && p.id === current.id ? " active" : "");
       b.setAttribute("aria-pressed", current && p.id === current.id ? "true" : "false");
-      var st = state[p.id];
-      var led = st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
+      var st = uiState(p.id);
+      var led = st === "stalled" ? "led crit" : st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
       b.innerHTML = '<div class="profile-top"><span class="' + led + '"></span>' +
         '<span class="profile-name"></span>' +
         (p.kind === "ssl" ? '<span class="profile-kind ssl">SSL</span>'
@@ -804,15 +810,103 @@
   }
 
   function setPill() {
-    var st = state[current.id];
+    var st = uiState(current.id);
     $("pill").className = "status-pill" + (st === "disconnected" ? "" : " " + st);
-    $("pill-led").className = "led" + (st === "established" ? " ok" : st === "connecting" ? " warn pulse" : "");
-    $("pill-text").textContent = st === "established" ? "established" : st;
-    var anyUp = Object.keys(state).some(function (k) { return state[k] === "established"; });
-    var anyConn = Object.keys(state).some(function (k) { return state[k] === "connecting"; });
-    $("glob-led").className = "led" + (anyUp ? " ok" : anyConn ? " warn pulse" : "");
-    $("glob-text").textContent = anyUp ? "tunnel up" : anyConn ? "negotiating" : "disconnected";
+    $("pill-led").className = "led" +
+      (st === "stalled" ? " crit" : st === "established" ? " ok" : st === "connecting" ? " warn pulse" : "");
+    $("pill-text").textContent = st === "stalled" ? "no traffic" : st;
+    var all = profiles.map(function (p) { return uiState(p.id); });
+    var anyDead = all.indexOf("stalled") >= 0;
+    var anyUp = all.indexOf("established") >= 0;
+    var anyConn = all.indexOf("connecting") >= 0;
+    $("glob-led").className = "led" +
+      (anyDead ? " crit" : anyUp ? " ok" : anyConn ? " warn pulse" : "");
+    $("glob-text").textContent = anyDead ? "no traffic" : anyUp ? "tunnel up" : anyConn ? "negotiating" : "disconnected";
     renderCompactStatus();
+    updateTray();
+  }
+
+  // The one state name that covers both maps, in the vocabulary the tray
+  // speaks: a stalled tunnel is established plus a dead data path.
+  function uiState(id) {
+    var st = state[id] || "disconnected";
+    return (st === "established" && stalled[id]) ? "stalled" : st;
+  }
+
+  /* ---------- most-recently-used profiles ---------- */
+  // Recency lives in localStorage because the UI is the only side that knows a
+  // connect happened. Losing it (cleared site data, a fresh machine) degrades
+  // to plain alphabetical rather than to an empty menu, so nothing depends on
+  // it surviving. More ids are kept than are ever shown, so that deleting a
+  // profile doesn't evict the genuinely recent ones behind it.
+  var RECENT_KEY = "vpn.recent", RECENT_KEEP = 24, TRAY_MAX = 6;
+
+  function recentIds() {
+    try {
+      var v = JSON.parse(window.localStorage.getItem(RECENT_KEY) || "[]");
+      return Array.isArray(v) ? v.filter(function (x) { return typeof x === "string"; }) : [];
+    } catch (e) { return []; }
+  }
+  function noteUsed(id) {
+    try {
+      var list = recentIds().filter(function (x) { return x !== id; });
+      list.unshift(id);
+      window.localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, RECENT_KEEP)));
+    } catch (e) { /* private mode, blocked storage — the menu just stays alphabetical */ }
+    updateTray();
+  }
+
+  // What goes in the tray's quick-connect list: anything not fully down first
+  // (so a live tunnel can always be torn down from there), then by recency,
+  // then by name.
+  function trayProfiles() {
+    var rank = {};
+    recentIds().forEach(function (id, i) { rank[id] = i; });
+    return profiles
+      .map(function (p) {
+        return {
+          p: p,
+          active: (state[p.id] || "disconnected") !== "disconnected",
+          rank: (p.id in rank) ? rank[p.id] : Infinity
+        };
+      })
+      .sort(function (a, b) {
+        if (a.active !== b.active) { return a.active ? -1 : 1; }
+        if (a.rank !== b.rank) { return a.rank - b.rank; }
+        return a.p.name.toLowerCase() < b.p.name.toLowerCase() ? -1 : 1;
+      })
+      .slice(0, TRAY_MAX)
+      .map(function (s) { return { id: s.p.id, name: s.p.name, state: uiState(s.p.id) }; });
+  }
+
+  // Badge the taskbar/tray icon and refill its menu. Aggregated over every
+  // profile, because the tray has no notion of which one is selected: a stalled
+  // tunnel outranks a healthy one (it is the one worth acting on), which
+  // outranks a handshake in flight, which outranks nothing at all. The tooltip
+  // names the tunnels, so hovering answers "which one?" without opening the
+  // window.
+  var trayLast = "";
+  function updateTray() {
+    if (!TAURI) { return; }
+    var up = [], negotiating = [], dead = [];
+    profiles.forEach(function (p) {
+      var st = uiState(p.id);
+      if (st === "stalled") { dead.push(p.name); }
+      else if (st === "established") { up.push(p.name); }
+      else if (st === "connecting") { negotiating.push(p.name); }
+    });
+    var status = dead.length ? "stalled" : up.length ? "established" : negotiating.length ? "connecting" : "disconnected";
+    var detail = (dead.length ? dead : up.length ? up : negotiating).join(", ");
+    var items = trayProfiles();
+    // The status poll runs every 1.6s whether or not anything moved; only an
+    // actual change is worth an IPC round trip, an icon repaint and a menu
+    // rebuild.
+    var key = status + "|" + detail + "|" +
+      items.map(function (i) { return i.id + ":" + i.state; }).join(",");
+    if (key === trayLast) { return; }
+    trayLast = key;
+    TAURI.invoke("set_tray_status", { status: status, detail: detail, profiles: items })
+      .catch(function () {});
   }
 
   function setAction() {
@@ -876,8 +970,8 @@
       b.className = "cpick-opt" + (i === cpickHi ? " hi" : "") + (current && p.id === current.id ? " sel" : "");
       b.setAttribute("role", "option");
       b.setAttribute("aria-selected", current && p.id === current.id ? "true" : "false");
-      var st = state[p.id];
-      var led = st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
+      var st = uiState(p.id);
+      var led = st === "stalled" ? "led crit" : st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
       b.innerHTML = '<span class="' + led + '"></span><span class="copt-name"></span><span class="copt-gw"></span>';
       b.querySelector(".copt-name").textContent = p.name;
       b.querySelector(".copt-gw").textContent = p.gateway;
@@ -932,11 +1026,14 @@
       $("c-status").textContent = "no profile"; $("c-led").className = "led";
       $("c-meta").style.display = "none"; b.disabled = true; return;
     }
-    var st = state[current.id];
+    // `st` drives the button, which treats a stalled tunnel as the established
+    // one it still is; `vs` is what the indicator says about it.
+    var st = state[current.id], vs = uiState(current.id);
     $("c-name").textContent = current.name;
     $("c-gw").textContent = current.gateway;
-    $("c-led").className = "led" + (st === "established" ? " ok" : st === "connecting" ? " warn pulse" : "");
-    $("c-status").textContent = st === "established" ? "established" : st;
+    $("c-led").className = "led" +
+      (vs === "stalled" ? " crit" : vs === "established" ? " ok" : vs === "connecting" ? " warn pulse" : "");
+    $("c-status").textContent = vs === "stalled" ? "no traffic" : vs;
     b.disabled = false;
     if (st === "disconnected") { b.className = "btn btn-primary cbig"; b.textContent = "Connect"; }
     else if (st === "connecting") { b.className = "btn btn-ghost cbig"; b.textContent = "Cancel"; }
@@ -1592,6 +1689,68 @@
     });
     if (changed && current) { setPill(); setAction(); renderList(); renderTiles(); }
     else if (changed) { renderList(); }
+    // Unconditional, and not only via setPill: a tunnel that dropped while no
+    // profile was selected still has to reach the tray, and setPill needs a
+    // `current` to run at all.
+    updateTray();
+  }
+
+  /* ---------- data-path stall detection ---------- */
+  // charon can call an SA ESTABLISHED long after its data path has died: DPD
+  // rides the IKE SA, so a gateway that keeps answering liveness probes proves
+  // nothing about ESP, and `dpd_action = restart` never fires. The only signal
+  // left is one-way silence — we are still sending and *nothing* is coming
+  // back.
+  //
+  // Idle is not silence: a tunnel nobody is using moves neither counter and is
+  // never flagged (which is also why SSL tunnels, whose counters are always
+  // zero, cannot trip this). It takes sustained unanswered outbound traffic,
+  // because a few seconds of it is just a slow gateway.
+  var STALL_POLLS = 12;   // ~20s at the 1.6s poll interval
+  var traffic = {};       // SA name -> { in, out, silent }
+
+  function detectStalls(sas) {
+    var byName = {};
+    profiles.forEach(function (p) { byName[sanitize(p.name)] = p; });
+    var seen = {}, changed = false;
+
+    sas.forEach(function (sa) {
+      seen[sa.name] = true;
+      var bin = 0, bout = 0;
+      (sa.children || []).forEach(function (c) { bin += c.bytes_in; bout += c.bytes_out; });
+      var prev = traffic[sa.name];
+      var silent = prev ? prev.silent : 0;
+      if (prev) {
+        if (bin > prev.in) { silent = 0; }              // something answered
+        else if (bout > prev.out) { silent += 1; }      // we spoke into the void
+        // Neither moved: idle, which tells us nothing either way — hold.
+      }
+      traffic[sa.name] = { in: bin, out: bout, silent: silent };
+
+      var p = byName[sa.name];
+      if (!p) { return; }
+      var now = silent >= STALL_POLLS;
+      if (now === !!stalled[p.id]) { return; }
+      stalled[p.id] = now;
+      changed = true;
+      if (now) {
+        log("NET", p.name + ": sending with nothing coming back — the SA is up but the data path is dead", "bad");
+      } else {
+        log("NET", p.name + ": traffic is flowing again");
+      }
+    });
+
+    // Forget SAs that are gone, so a reconnect starts from a clean slate
+    // rather than inheriting the dead tunnel's silence.
+    Object.keys(traffic).forEach(function (n) { if (!seen[n]) { delete traffic[n]; } });
+    Object.keys(stalled).forEach(function (id) {
+      if (stalled[id] && state[id] !== "established") { delete stalled[id]; changed = true; }
+    });
+
+    if (!changed) { return; }
+    if (current) { setPill(); renderTiles(); }
+    renderList();
+    updateTray();
   }
 
   async function pollOnce() {
@@ -1599,6 +1758,7 @@
     var sas;
     try { sas = await TAURI.invoke("status"); } catch (e) { return; }
     reconcile(sas);
+    detectStalls(sas);
     if (!current) { return; }
     var nm = sanitize(current.name);
     var sa = null;
@@ -1625,6 +1785,7 @@
     catch (e) { log("IKE", String(e), "bad"); }
     stopPolling();
     state[p.id] = "disconnected";
+    delete stalled[p.id];
     setPill(); setAction(); renderList(); renderTiles();
     log("NET", "virtual IP released, CHILD_SA removed");
   }
@@ -1731,6 +1892,9 @@
   function onAction() {
     var st = state[current.id];
     if (st === "disconnected") {
+      // Recorded on the attempt, not on success: a profile you just tried and
+      // that failed is exactly the one you want back at the top of the tray.
+      noteUsed(current.id);
       state[current.id] = "connecting"; setPill(); setAction(); renderList();
       if (TAURI) { realConnect(current); } else { demoConnect(current); }
     } else if (st === "connecting") {
@@ -1749,6 +1913,8 @@
     if (!current || !byId[current.id]) { current = profiles[0] || null; }
     else { current = byId[current.id]; }
     if (current) { renderAll(); } else { renderList(); }
+    // An import or a delete changes the tray menu even when no tunnel moved.
+    updateTray();
   }
 
   // Import a profile via the native file picker (falls back to the info modal
@@ -2079,6 +2245,23 @@
     // A profile carried in by an itmvpn:// link, while the window was already
     // open. One that launched the app is collected below instead.
     EVT.listen("link-import", function (e) { if (e && e.payload) { handleLinkImport(e.payload); } });
+    // Quick-connect from the tray menu. It runs the ordinary action for that
+    // profile — connect when down, tear down when up — so the credential
+    // prompts, the IKE-version retry and the error notices all behave exactly
+    // as they do from the button.
+    EVT.listen("tray-profile", function (e) {
+      var id = e && e.payload;
+      if (!id) { return; }
+      var p = null;
+      profiles.forEach(function (x) { if (x.id === id) { p = x; } });
+      if (!p) { return; }
+      current = p; renderAll();
+      // Only steal focus when we are about to need it. A profile that can
+      // connect on saved credentials should stay out of the way — that is the
+      // whole point of starting it from the tray.
+      if (state[p.id] === "disconnected" && p.userAuth && !p.userStored) { showWindow(); }
+      onAction();
+    });
     // A dropped .pro can't open a modal from the Rust side, so it arrives here.
     EVT.listen("provisioning-dropped", function (e) {
       $("dropzone").classList.remove("show");

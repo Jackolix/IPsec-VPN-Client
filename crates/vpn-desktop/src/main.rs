@@ -224,6 +224,29 @@ async fn status(state: tauri::State<'_, AppState>) -> Result<Vec<IkeSa>, String>
     }
 }
 
+/// Drive the tray icon's status badge, tooltip and quick-connect menu.
+///
+/// All of it comes from the UI rather than being recomputed here: it is the UI
+/// that reconciles every profile against what charon and the broker report
+/// (`reconcile()` in `ui/index.html`), watches the byte counters for a stall,
+/// and knows which profiles were used most recently. Deriving any of it a
+/// second time in Rust would give the tray an opinion that could disagree with
+/// the window. `detail` is the tooltip's second line.
+#[tauri::command]
+fn set_tray_status(
+    app: tauri::AppHandle,
+    status: String,
+    detail: Option<String>,
+    profiles: Option<Vec<tray::MenuProfile>>,
+) {
+    tray::set_status(
+        &app,
+        tray::Status::parse(&status),
+        detail.as_deref().unwrap_or_default(),
+        &profiles.unwrap_or_default(),
+    );
+}
+
 #[tauri::command]
 async fn daemon_running(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let s = state.inner().clone();
@@ -523,6 +546,7 @@ fn main() {
             connect,
             disconnect,
             status,
+            set_tray_status,
             daemon_running,
             start_daemon,
             stop_daemon,
@@ -610,10 +634,225 @@ fn main() {
 /// when the window is closed.
 mod tray {
     use tauri::{
-        menu::{Menu, MenuItem},
+        image::Image,
+        menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem},
         tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-        AppHandle, Manager,
+        AppHandle, Emitter, Manager, Wry,
     };
+
+    pub(crate) const TRAY_ID: &str = "main-tray";
+
+    /// Menu-item id prefix for the quick-connect entries. Profile ids are
+    /// restricted to `[A-Za-z0-9._-]` by `backend::check_id`, so nothing in one
+    /// can be mistaken for this separator.
+    const PROFILE_PREFIX: &str = "profile:";
+
+    /// Event carrying a clicked profile's id to the UI, which owns the connect
+    /// flow (credential prompts, IKE version retry, the notices).
+    pub(crate) const PROFILE_EVENT: &str = "tray-profile";
+
+    /// What the tray icon reports at a glance. Mirrors the states the UI keeps
+    /// per profile (`state` in `ui/index.html`), aggregated over all of them:
+    /// a stalled tunnel wins over a healthy one (it is the actionable
+    /// condition), which wins over a handshake in flight, which wins over
+    /// nothing at all.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Status {
+        Disconnected,
+        Connecting,
+        Connected,
+        /// The SA is up and charon still calls it established, but the data
+        /// path is one-way dead — see the stall detector in `ui/index.html`.
+        Stalled,
+    }
+
+    impl Status {
+        /// Parse the value the UI sends. An unrecognised one reads as
+        /// disconnected rather than failing: a quiet grey dot beats an error
+        /// the user never sees, on an indicator that is not load-bearing.
+        pub fn parse(s: &str) -> Status {
+            match s {
+                "established" | "connected" => Status::Connected,
+                "connecting" => Status::Connecting,
+                "stalled" => Status::Stalled,
+                _ => Status::Disconnected,
+            }
+        }
+
+        /// Badge fill, matching the LED colours the window already uses
+        /// (`--ok` / `--warn` / `--crit` / `--muted` in `ui/index.html`) so the
+        /// tray and the dashboard never disagree about what green means.
+        fn colour(self) -> [u8; 3] {
+            match self {
+                Status::Connected => [0x46, 0xc2, 0x66],
+                Status::Connecting => [0xd9, 0xa5, 0x31],
+                Status::Stalled => [0xf0, 0x60, 0x3a],
+                Status::Disconnected => [0x86, 0x95, 0xab],
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Status::Connected => "connected",
+                Status::Connecting => "connecting",
+                Status::Stalled => "connected, no traffic",
+                Status::Disconnected => "disconnected",
+            }
+        }
+
+        /// Does this state mean there is a tunnel to tear down? Drives the
+        /// checkmark beside a menu entry, and with it what clicking does.
+        fn is_up(self) -> bool {
+            matches!(self, Status::Connected | Status::Stalled)
+        }
+    }
+
+    /// One quick-connect entry, as the UI hands it over: already ordered
+    /// most-recently-used first and capped, because recency is the UI's to
+    /// know (see `recents()` in `ui/index.html`).
+    #[derive(Debug, Clone, serde::Deserialize)]
+    pub struct MenuProfile {
+        pub id: String,
+        pub name: String,
+        /// The same vocabulary [`Status::parse`] accepts.
+        pub state: String,
+    }
+
+    /// Alpha-blend a straight-RGBA source pixel over a straight-RGBA destination.
+    fn blend(dst: &mut [u8], src: [u8; 4]) {
+        let a = src[3] as u32;
+        if a == 0 {
+            return;
+        }
+        for c in 0..3 {
+            dst[c] = ((src[c] as u32 * a + dst[c] as u32 * (255 - a)) / 255) as u8;
+        }
+        dst[3] = (a + (dst[3] as u32 * (255 - a)) / 255).min(255) as u8;
+    }
+
+    /// Antialiasing ramp over one pixel, from a signed distance to an edge
+    /// (positive inside).
+    fn coverage(signed_distance: f32) -> f32 {
+        (signed_distance + 0.5).clamp(0.0, 1.0)
+    }
+
+    /// Paint a status dot into the bottom-right corner of the app icon.
+    ///
+    /// Composited at runtime rather than shipped as three more `.png`s: the
+    /// icon is the one asset that has to track the branding, and hand-staged
+    /// variants of it would go stale the next time the logo changes (nothing
+    /// regenerates icons — see the note in `build.rs`).
+    ///
+    /// The dot is deliberately large — 40% of the icon across — because the
+    /// Windows tray draws at 16px, where a tastefully small badge disappears
+    /// altogether. A ring in the window background colour separates it from
+    /// whatever it lands on in the logo.
+    fn badged(base: &Image<'_>, status: Status) -> Image<'static> {
+        let (w, h) = (base.width(), base.height());
+        let mut rgba = base.rgba().to_vec();
+        // An icon whose buffer does not match its dimensions gets no badge
+        // rather than an out-of-bounds panic inside the tray.
+        if w == 0 || h == 0 || rgba.len() < w as usize * h as usize * 4 {
+            return Image::new_owned(rgba, w, h);
+        }
+
+        let side = w.min(h) as f32;
+        let radius = side * 0.20;
+        let ring = (side * 0.055).max(1.0);
+        let cx = w as f32 - radius - ring;
+        let cy = h as f32 - radius - ring;
+        let [r, g, b] = status.colour();
+
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 + 0.5 - cx;
+                let dy = y as f32 + 0.5 - cy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let outer = coverage(radius + ring - dist);
+                if outer == 0.0 {
+                    continue;
+                }
+                let inner = coverage(radius - dist);
+                let px = (y as usize * w as usize + x as usize) * 4;
+                let dst = &mut rgba[px..px + 4];
+                // Ring first, then the fill on top of it.
+                blend(dst, [0x0b, 0x12, 0x1b, (outer * 255.0) as u8]);
+                if inner > 0.0 {
+                    blend(dst, [r, g, b, (inner * 255.0) as u8]);
+                }
+            }
+        }
+        Image::new_owned(rgba, w, h)
+    }
+
+    /// The label for a quick-connect entry. The checkmark already says "up",
+    /// so only the states it cannot express get spelled out.
+    fn entry_label(profile: &MenuProfile) -> String {
+        match Status::parse(&profile.state) {
+            Status::Connecting => format!("{} — connecting…", profile.name),
+            Status::Stalled => format!("{} — no traffic", profile.name),
+            _ => profile.name.clone(),
+        }
+    }
+
+    /// Build the tray menu: window, the quick-connect entries, quit.
+    ///
+    /// Rebuilt whole on every change rather than mutated in place — a handful
+    /// of items costs nothing to recreate, and it keeps the menu a pure
+    /// function of the state the UI last sent.
+    fn menu(app: &AppHandle, profiles: &[MenuProfile]) -> tauri::Result<Menu<Wry>> {
+        let show = MenuItem::with_id(app, "show", "Show window", true, None::<&str>)?;
+        let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+
+        let mut items: Vec<Box<dyn IsMenuItem<Wry>>> = vec![Box::new(show)];
+        if !profiles.is_empty() {
+            items.push(Box::new(PredefinedMenuItem::separator(app)?));
+            for p in profiles {
+                let status = Status::parse(&p.state);
+                // A check item, so a live tunnel is marked the way the platform
+                // marks anything else that is on — and clicking it reads as
+                // turning it off, which is what it does.
+                items.push(Box::new(CheckMenuItem::with_id(
+                    app,
+                    format!("{PROFILE_PREFIX}{}", p.id),
+                    entry_label(p),
+                    true,
+                    status.is_up(),
+                    None::<&str>,
+                )?));
+            }
+        }
+        items.push(Box::new(PredefinedMenuItem::separator(app)?));
+        items.push(Box::new(quit));
+
+        let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|i| i.as_ref()).collect();
+        Menu::with_items(app, &refs)
+    }
+
+    /// Repaint the tray icon, its tooltip and its menu for the current state.
+    ///
+    /// Failures are swallowed: the tray is an indicator, and a machine that
+    /// refuses to update it must not break the connection it reports on.
+    pub fn set_status(app: &AppHandle, status: Status, detail: &str, profiles: &[MenuProfile]) {
+        let Some(tray) = app.tray_by_id(TRAY_ID) else {
+            return;
+        };
+        if let Some(base) = app.default_window_icon() {
+            let _ = tray.set_icon(Some(badged(base, status)));
+        }
+        // Hovering is how you find out *which* tunnel is up without opening
+        // the window, so the detail line goes in the tooltip.
+        let label = status.label();
+        let tooltip = if detail.is_empty() {
+            format!("VPN Client — {label}")
+        } else {
+            format!("VPN Client — {label}\n{detail}")
+        };
+        let _ = tray.set_tooltip(Some(tooltip));
+        if let Ok(m) = menu(app, profiles) {
+            let _ = tray.set_menu(Some(m));
+        }
+    }
 
     pub(crate) fn reveal(app: &AppHandle) {
         if let Some(w) = app.get_webview_window("main") {
@@ -624,19 +863,33 @@ mod tray {
     }
 
     pub fn build(app: &AppHandle) -> tauri::Result<()> {
-        let show = MenuItem::with_id(app, "show", "Show window", true, None::<&str>)?;
-        let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-        let menu = Menu::with_items(app, &[&show, &quit])?;
+        // No quick-connect entries yet: the UI fills them in as soon as it has
+        // read the profile directory, a beat after the window boots.
+        let menu = menu(app, &[])?;
 
-        TrayIconBuilder::with_id("main-tray")
-            .icon(app.default_window_icon().expect("bundled window icon").clone())
-            .tooltip("VPN Client")
+        // Start on the grey dot: until the UI has polled charon and the broker,
+        // "disconnected" is the honest answer, and it puts the badge on screen
+        // from the first frame so its later absence never reads as a bug.
+        let base = app.default_window_icon().expect("bundled window icon");
+
+        TrayIconBuilder::with_id(TRAY_ID)
+            .icon(badged(base, Status::Disconnected))
+            .tooltip("VPN Client — disconnected")
             .menu(&menu)
             .show_menu_on_left_click(false)
+            // Registered globally rather than against this menu instance, so it
+            // keeps working across the `set_menu` that every state change does.
             .on_menu_event(|app, event| match event.id.as_ref() {
                 "show" => reveal(app),
                 "quit" => app.exit(0),
-                _ => {}
+                // Connecting needs the credential prompts, the IKE-version
+                // retry and the error notices that all live in the UI, so the
+                // click is handed there rather than reimplemented here.
+                other => {
+                    if let Some(id) = other.strip_prefix(PROFILE_PREFIX) {
+                        let _ = app.emit(PROFILE_EVENT, id.to_string());
+                    }
+                }
             })
             .on_tray_icon_event(|tray, event| {
                 if let TrayIconEvent::Click {
@@ -650,5 +903,122 @@ mod tray {
             })
             .build(app)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A fully transparent square, so anything the badge paints is visible
+        /// as a change rather than hidden by the logo underneath.
+        fn blank(side: u32) -> Image<'static> {
+            Image::new_owned(vec![0u8; (side * side * 4) as usize], side, side)
+        }
+
+        /// The pixel at the badge's centre, as RGBA.
+        fn centre(img: &Image<'_>) -> [u8; 4] {
+            let side = img.width().min(img.height()) as f32;
+            let radius = side * 0.20;
+            let ring = (side * 0.055).max(1.0);
+            let x = (img.width() as f32 - radius - ring) as u32;
+            let y = (img.height() as f32 - radius - ring) as u32;
+            let px = (y as usize * img.width() as usize + x as usize) * 4;
+            let b = img.rgba();
+            [b[px], b[px + 1], b[px + 2], b[px + 3]]
+        }
+
+        #[test]
+        fn each_status_paints_its_own_colour() {
+            let base = blank(32);
+            assert_eq!(centre(&badged(&base, Status::Connected)), [0x46, 0xc2, 0x66, 255]);
+            assert_eq!(centre(&badged(&base, Status::Connecting)), [0xd9, 0xa5, 0x31, 255]);
+            assert_eq!(centre(&badged(&base, Status::Disconnected)), [0x86, 0x95, 0xab, 255]);
+        }
+
+        #[test]
+        fn badge_stays_in_its_corner() {
+            let out = badged(&blank(32), Status::Connected);
+            assert_eq!((out.width(), out.height()), (32, 32));
+            // The top-left quadrant is where the wordmark lives; the badge must
+            // not reach into it at any icon size we ship.
+            let b = out.rgba();
+            for y in 0..16u32 {
+                for x in 0..16u32 {
+                    let px = (y as usize * 32 + x as usize) * 4;
+                    assert_eq!(b[px + 3], 0, "badge bled into ({x},{y})");
+                }
+            }
+        }
+
+        /// Windows renders the tray at 16px. The dot has to survive that, so it
+        /// must be several pixels across even on the smallest icon we could be
+        /// handed — this is the whole reason it is 40% of the icon.
+        #[test]
+        fn dot_is_legible_at_tray_size() {
+            let out = badged(&blank(16), Status::Connected);
+            let b = out.rgba();
+            let opaque = (0..16 * 16).filter(|i| b[i * 4 + 3] > 128).count();
+            assert!(opaque >= 20, "badge covers only {opaque} of 256 px");
+        }
+
+        /// An icon whose buffer is shorter than its declared dimensions must
+        /// come back unbadged, not panic inside the tray.
+        #[test]
+        fn truncated_icon_is_passed_through() {
+            let broken = Image::new_owned(vec![0u8; 16], 32, 32);
+            let out = badged(&broken, Status::Connected);
+            assert_eq!(out.rgba().len(), 16);
+        }
+
+        #[test]
+        fn ui_state_names_map_to_statuses() {
+            // "established" is the name the UI's state map uses; the others are
+            // spelled the same on both sides.
+            assert_eq!(Status::parse("established"), Status::Connected);
+            assert_eq!(Status::parse("connecting"), Status::Connecting);
+            assert_eq!(Status::parse("stalled"), Status::Stalled);
+            assert_eq!(Status::parse("disconnected"), Status::Disconnected);
+            assert_eq!(Status::parse("nonsense"), Status::Disconnected);
+        }
+
+        /// A stalled tunnel is still a tunnel: the entry stays checked, so
+        /// clicking it tears down rather than trying to connect what is
+        /// already connected.
+        #[test]
+        fn a_stalled_tunnel_still_counts_as_up() {
+            assert!(Status::Stalled.is_up());
+            assert!(Status::Connected.is_up());
+            assert!(!Status::Connecting.is_up());
+            assert!(!Status::Disconnected.is_up());
+        }
+
+        fn entry(state: &str) -> String {
+            entry_label(&MenuProfile {
+                id: "x".into(),
+                name: "ITM-Office".into(),
+                state: state.into(),
+            })
+        }
+
+        #[test]
+        fn only_states_the_checkmark_cannot_show_are_spelled_out() {
+            assert_eq!(entry("established"), "ITM-Office");
+            assert_eq!(entry("disconnected"), "ITM-Office");
+            assert_eq!(entry("connecting"), "ITM-Office — connecting…");
+            assert_eq!(entry("stalled"), "ITM-Office — no traffic");
+        }
+
+        /// The menu id has to survive the round trip back to a profile id, for
+        /// every id `backend::check_id` lets through.
+        #[test]
+        fn profile_ids_round_trip_through_menu_ids() {
+            for id in ["ITM-Office", "a.b.c", "x_1-2", "IPSEC_ITM_2"] {
+                let menu_id = format!("{PROFILE_PREFIX}{id}");
+                assert_eq!(menu_id.strip_prefix(PROFILE_PREFIX), Some(id));
+            }
+            // A built-in item must never be mistaken for a profile.
+            assert_eq!("quit".strip_prefix(PROFILE_PREFIX), None);
+            assert_eq!("show".strip_prefix(PROFILE_PREFIX), None);
+        }
     }
 }
