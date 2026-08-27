@@ -266,7 +266,23 @@ an editable field) to resolve internal names over the tunnel.
 ### Releases / shipping
 
 Push a `v*` tag and `.github/workflows/release.yml` builds everything and
-attaches it to a GitHub Release: a Windows **installer** (NSIS `*-setup.exe`
+attaches it to a GitHub Release. Four jobs: the Windows daemon is cross-built
+on Linux and handed to a `windows` job; a `macos` job builds its own daemons
+natively on Apple Silicon; and a `release` job composes `latest.json` from both
+and publishes. The manifest cannot belong to either build job — it names an
+artifact from each, and whichever wrote it would clobber the other's entry.
+
+**macOS** ships a `.dmg` plus the `.app.tar.gz` the updater consumes (the `.dmg`
+is *not* an update channel). The job re-signs charon, openvpn and the helper
+with the Developer ID **before** the bundle is assembled: Tauri signs the `.app`
+it builds, but those are plain `resources` copied in carrying only the ad-hoc
+signature the build scripts gave them, and notarisation rejects a bundle whose
+nested Mach-O files are not all signed the same way. Secrets:
+`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+`APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` — the last three together are what
+make Tauri actually notarise rather than only sign.
+
+**Windows** gets an **installer** (NSIS `*-setup.exe`
 and an MSI) that bundles the app, `charon-svc.exe` + its DLLs (installed to
 `<app>\charon\`) **and** the privileged broker (`vpn-broker.exe`), plus the
 standalone `vpn-agent.exe` / `vpn-cli.exe`. The NSIS installer registers the
