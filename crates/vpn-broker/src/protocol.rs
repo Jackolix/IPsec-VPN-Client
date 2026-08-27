@@ -12,6 +12,24 @@ use serde::{Deserialize, Serialize};
 /// pipe namespace; access is restricted by the pipe's DACL (see the server).
 pub const PIPE_NAME: &str = r"\\.\pipe\ipsec-vpn-broker";
 
+/// The Unix socket the macOS helper listens on, and the launchd label /
+/// install paths that go with it.
+///
+/// The helper binary and charon are installed OUTSIDE the app bundle, under
+/// root-owned directories. That is not tidiness: launchd runs the helper as
+/// root, and the helper execs charon as root, so both must live somewhere an
+/// unprivileged user cannot write. An app bundle in ~/Applications or
+/// ~/Downloads is user-writable — pointing root at a binary in there would let
+/// any local user swap it and be root.
+pub const MACOS_SOCKET: &str = "/var/run/ipsec-vpn/helper.sock";
+pub const MACOS_LABEL: &str = "dev.jackolix.ipsecvpn.helper";
+pub const MACOS_PLIST: &str = "/Library/LaunchDaemons/dev.jackolix.ipsecvpn.helper.plist";
+pub const MACOS_HELPER_BIN: &str = "/Library/PrivilegedHelperTools/dev.jackolix.ipsecvpn.helper";
+pub const MACOS_SUPPORT_DIR: &str = "/Library/Application Support/dev.jackolix.ipsecvpn";
+/// Where the helper looks for charon. Derived from [`MACOS_SUPPORT_DIR`] and
+/// never taken from a request — see the module note above.
+pub const MACOS_CHARON_DIR: &str = "/Library/Application Support/dev.jackolix.ipsecvpn/charon";
+
 /// SCM service name (used by install/uninstall and status checks).
 pub const SERVICE_NAME: &str = "ipsec-vpn-broker";
 
@@ -75,6 +93,17 @@ pub enum Request {
     /// Report the SSL VPN tunnels that are up. Response `msg` is a JSON array of
     /// `{"name","ip","full","domain"}` objects, or empty when none is up.
     SslStatus,
+    /// Start the native strongSwan daemon, and report when its vici socket is
+    /// up. macOS only — the Windows broker supervises `charon-svc.exe` as part
+    /// of its own service lifecycle, so it has no equivalent request.
+    ///
+    /// Deliberately carries NO arguments. The helper resolves charon from its
+    /// own fixed, root-owned install directory; accepting a path here would let
+    /// any client that reaches the socket have root execute a binary of its
+    /// choosing.
+    CharonStart,
+    /// Stop the native strongSwan daemon. macOS only.
+    CharonStop,
 }
 
 /// `serde` default for [`Request::SslConnect::allow_full`].

@@ -19,6 +19,11 @@ path = "src/main.rs"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# The macOS helper needs LOCAL_PEERCRED to identify who is on the other end of
+# its Unix socket; there is no std API for that.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 # The service, named-pipe IPC and SCM install/uninstall are Windows-only.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"

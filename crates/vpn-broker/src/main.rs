@@ -9,6 +9,9 @@
 //! Everything real is Windows-only; on other platforms this is a stub so the
 //! workspace still builds (the CI Linux job compiles it).
 
+// Only the Windows service body uses it; on other platforms `main` just
+// reports that there is nothing to run.
+#[cfg(windows)]
 use vpn_broker::protocol;
 
 #[cfg(windows)]
@@ -33,12 +36,91 @@ fn main() {
     #[cfg(windows)]
     std::process::exit(run_windows(cmd, &args));
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    std::process::exit(run_macos(cmd));
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = cmd;
         let _ = args;
-        eprintln!("vpn-broker is a Windows-only service; nothing to do on this platform.");
+        eprintln!("vpn-broker is a Windows/macOS helper; nothing to do on this platform.");
         std::process::exit(1);
+    }
+}
+
+/// The macOS helper: `run` is what launchd invokes, `install`/`uninstall` are
+/// what the app invokes once behind an authorization prompt.
+#[cfg(target_os = "macos")]
+fn run_macos(cmd: Option<&str>) -> i32 {
+    use std::sync::Arc;
+    use vpn_broker::protocol::{Request, Response};
+    use vpn_broker::{launchd, privileged, unix_ipc};
+
+    match cmd {
+        Some("run") => {
+            let handler: unix_ipc::Handler = Arc::new(|req: Request| match req {
+                Request::Ping => Response::ok("helper is running"),
+                Request::CharonStart => privileged::charon_start(),
+                Request::CharonStop => privileged::charon_stop(),
+                Request::ApplyDns { conn, servers, domain, .. } => {
+                    privileged::apply_dns(&conn, &servers, domain.as_deref())
+                }
+                Request::RevertDns { conn } => privileged::revert_dns(&conn),
+                // SSL VPN is not carried by this helper yet. Answered rather
+                // than ignored so the GUI gets a reason it can show.
+                Request::SslConnect { .. } | Request::SslDisconnect { .. } | Request::SslStatus => {
+                    Response::err("SSL VPN is not supported by the macOS helper yet")
+                }
+            });
+            if let Err(e) = unix_ipc::serve(handler) {
+                eprintln!("helper: {e}");
+                return 1;
+            }
+            0
+        }
+        Some("install") => {
+            let exe = match std::env::current_exe() {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("cannot locate this binary: {e}");
+                    return 1;
+                }
+            };
+            let Some(charon) = launchd::bundled_charon_dir(&exe) else {
+                eprintln!("no charon directory found beside this binary");
+                return 1;
+            };
+            match launchd::install(&exe, &charon) {
+                Ok(msg) => {
+                    println!("{msg}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            }
+        }
+        Some("uninstall") => match launchd::uninstall() {
+            Ok(msg) => {
+                println!("{msg}");
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        Some("status") => {
+            let installed = launchd::installed();
+            let reachable = vpn_broker::unix_client::available();
+            println!("installed: {installed}\nreachable: {reachable}");
+            i32::from(!(installed && reachable))
+        }
+        _ => {
+            eprintln!("usage: vpn-broker <run|install|uninstall|status>");
+            2
+        }
     }
 }
 
