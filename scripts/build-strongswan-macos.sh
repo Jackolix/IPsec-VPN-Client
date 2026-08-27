@@ -25,14 +25,16 @@
 # way as out/strongswan-windows so the Tauri bundler and the app's dev fallback
 # can treat the two identically.
 #
-# Usage:
-#   scripts/build-strongswan-macos.sh              # build for the host arch
-#   ARCH=x86_64 scripts/build-strongswan-macos.sh  # cross-build (needs Rosetta)
-#   CLEAN=1 scripts/build-strongswan-macos.sh      # discard the build tree first
+# ARM64 ONLY, deliberately. macOS builds are not universal and Intel Macs are
+# not a target: shipping a second slice would mean running this whole build
+# again into a separate prefix and `lipo -create`ing every Mach-O in the dist
+# tree, to serve hardware Apple stopped selling. The ARCH override below is kept
+# so that decision is one variable away from being revisited, not a rewrite.
 #
-# A universal (arm64 + x86_64) bundle is NOT produced here: it needs this whole
-# build run once per arch into separate prefixes and then `lipo -create` over
-# every Mach-O in the dist tree. Single-arch first — it is what proves the port.
+# Usage:
+#   scripts/build-strongswan-macos.sh              # arm64 (the shipped build)
+#   ARCH=x86_64 scripts/build-strongswan-macos.sh  # not shipped; needs Rosetta
+#   CLEAN=1 scripts/build-strongswan-macos.sh      # discard the build tree first
 
 set -euo pipefail
 
@@ -279,8 +281,14 @@ fi
 for f in "$DIST"/*.dylib "$DIST/charon"; do
     [ -f "$f" ] || continue
     codesign --verify "$f" 2>/dev/null || { echo "  MISSING signature on $(basename "$f")"; fail=1; }
+    # A slice for the wrong architecture loads on nothing, and fails at runtime
+    # far from here; catch it while the build still has the context.
+    if ! lipo -archs "$f" 2>/dev/null | grep -qw "$ARCH"; then
+        echo "  MISSING $(basename "$f") is not $ARCH (got: $(lipo -archs "$f" 2>/dev/null))"
+        fail=1
+    fi
 done
-[ "$fail" = 0 ] && printf '  ok      all Mach-O files signed\n'
+[ "$fail" = 0 ] && printf '  ok      every Mach-O is signed and %s\n' "$ARCH"
 
 echo
 ls -la "$DIST"

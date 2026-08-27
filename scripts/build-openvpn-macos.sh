@@ -21,8 +21,11 @@
 # Output: a relocatable dist tree in out/openvpn-macos, staged like
 # out/strongswan-macos so the Tauri bundler treats them the same way.
 #
+# ARM64 ONLY, matching scripts/build-strongswan-macos.sh -- see the note there.
+# Intel Macs are not a target, so nothing here is lipo'd into a fat binary.
+#
 # Usage:
-#   scripts/build-openvpn-macos.sh
+#   scripts/build-openvpn-macos.sh                                  # arm64
 #   OPENSSL_PREFIX=/path/to/prefix scripts/build-openvpn-macos.sh   # reuse a build
 #   CLEAN=1 scripts/build-openvpn-macos.sh
 
@@ -207,6 +210,15 @@ if otool -L "$DIST"/* 2>/dev/null | grep -qE "$PREFIX|$OPENSSL_PREFIX"; then
 else
     printf '  ok      no absolute build paths remain\n'
 fi
+
+for f in "$DIST"/*.dylib "$DIST/openvpn"; do
+    [ -f "$f" ] || continue
+    if ! lipo -archs "$f" 2>/dev/null | grep -qw "$ARCH"; then
+        echo "  MISSING $(basename "$f") is not $ARCH (got: $(lipo -archs "$f" 2>/dev/null))"
+        fail=1
+    fi
+done
+[ "$fail" = 0 ] && printf '  ok      every Mach-O is %s\n' "$ARCH"
 
 # --version proves the whole tree loads: rpath resolution, signature validity
 # and the linked crypto library all have to be right for this to print.
