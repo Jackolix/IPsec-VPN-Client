@@ -29,6 +29,26 @@ pub const MACOS_SUPPORT_DIR: &str = "/Library/Application Support/dev.jackolix.i
 /// Where the helper looks for charon. Derived from [`MACOS_SUPPORT_DIR`] and
 /// never taken from a request — see the module note above.
 pub const MACOS_CHARON_DIR: &str = "/Library/Application Support/dev.jackolix.ipsecvpn/charon";
+/// The app version that installed the privileged half, written by
+/// [`crate::launchd::install`].
+///
+/// macOS updates replace the `.app` and nothing else — unlike the Windows
+/// installer, which carries the GUI, the broker, charon and openvpn in one
+/// package and swaps the whole set. So an updated app can find an older helper,
+/// charon and openvpn still installed under /Library, with no way to notice.
+/// This file is that way: the GUI compares it against its own version and asks
+/// for a reinstall when they diverge.
+pub const MACOS_VERSION_FILE: &str =
+    "/Library/Application Support/dev.jackolix.ipsecvpn/installed-version";
+/// What [`MACOS_VERSION_FILE`] holds when the helper was installed by hand from
+/// a checkout rather than out of an app bundle, so there was no version to
+/// record.
+///
+/// Written explicitly rather than leaving the file absent, because those two
+/// cases mean opposite things: a *missing* file is a helper installed before
+/// this stamping existed at all — genuinely behind — while this sentinel is a
+/// developer's own build, which must not be nagged about.
+pub const MACOS_VERSION_UNSTAMPED: &str = "unversioned";
 /// Runtime state: the two sockets, charon's log, the captured resolv.conf and
 /// the DNS records. Cleared on boot by the OS, and by `vpn-broker uninstall`.
 pub const MACOS_RUN_DIR: &str = "/var/run/ipsec-vpn";

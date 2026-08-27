@@ -254,20 +254,29 @@ fn set_tray_status(
 /// offer to install. On Windows the broker is registered by the installer, and
 /// on Linux there is none.
 #[tauri::command]
-async fn helper_status() -> Result<serde_json::Value, String> {
-    let (installed, reachable) = helper::status();
+async fn helper_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let st = helper::status(&app.package_info().version.to_string());
     Ok(serde_json::json!({
         "supported": cfg!(target_os = "macos"),
-        "installed": installed,
-        "reachable": reachable,
+        "installed": st.installed,
+        "reachable": st.reachable,
+        "stale": st.stale,
+        "installedVersion": st.installed_version,
     }))
+}
+
+/// Whether the app is running from somewhere it cannot update itself from —
+/// see [`helper::bad_install_location`]. `null` when the location is fine.
+#[tauri::command]
+fn install_location_problem() -> Option<String> {
+    helper::bad_install_location()
 }
 
 /// Whether the app should set the helper up now without being asked. True at
 /// most once per user — see [`helper::setup_pending`].
 #[tauri::command]
-async fn helper_setup_pending() -> Result<bool, String> {
-    Ok(helper::setup_pending())
+async fn helper_setup_pending(app: tauri::AppHandle) -> Result<bool, String> {
+    Ok(helper::setup_pending(&app.package_info().version.to_string()))
 }
 
 /// Install the helper. Raises one authorization prompt; after it, connect and
@@ -550,8 +559,15 @@ fn dev(args: &[String]) {
         Some("helper-install") => helper::install(),
         Some("helper-uninstall") => helper::uninstall(),
         Some("helper-status") => {
-            let (installed, reachable) = helper::status();
-            Ok(format!("installed: {installed}, reachable: {reachable}"))
+            // No AppHandle out here, so no version to compare against: report
+            // what is installed and let the caller judge. The GUI does the
+            // staleness check, where the running version is actually known.
+            let st = helper::status("");
+            let v = st.installed_version.unwrap_or_else(|| "unknown".to_string());
+            Ok(format!(
+                "installed: {}, reachable: {}, installed by: {v}",
+                st.installed, st.reachable
+            ))
         }
         Some("daemon-start") => backend::daemon_start(&state).map(|_| "started".to_string()),
         Some("daemon-stop") => backend::daemon_stop(&state).map(|_| "stopped".to_string()),
@@ -621,6 +637,7 @@ fn main() {
             uninstall_helper,
             uninstall_app,
             quit_app,
+            install_location_problem,
             save_credentials,
             set_credentials,
             forget_credentials,

@@ -386,6 +386,15 @@
     <button id="hb-later" class="btn btn-ghost btn-sm">Not now</button>
   </div>
 
+  <!-- Launched straight from the mounted dmg, the app is read-only (or
+       translocated to a random read-only path) and can never update itself —
+       with nothing about it looking wrong. macOS only. -->
+  <div class="helper-bar bad" id="location-bar" role="status">
+    <span class="led crit" style="box-shadow:none" aria-hidden="true"></span>
+    <div class="hb-text" id="lb-text"></div>
+    <button id="lb-later" class="btn btn-ghost btn-sm">Dismiss</button>
+  </div>
+
   <div class="body">
     <aside class="sidebar">
       <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import profile</button></div>
@@ -1763,7 +1772,8 @@
   // never flagged (which is also why SSL tunnels, whose counters are always
   // zero, cannot trip this). It takes sustained unanswered outbound traffic,
   // because a few seconds of it is just a slow gateway.
-  var STALL_POLLS = 12;   // ~20s at the 1.6s poll interval
+  var STALL_POLLS = 12;   // ~20s at the busy poll interval (a stall needs an SA,
+                          // and an SA means the poll is running at POLL_BUSY)
   var traffic = {};       // SA name -> { in, out, silent }
 
   function detectStalls(sas) {
@@ -1835,6 +1845,35 @@
     drawSpark();
     renderCompactStatus();
   }
+
+  // How often the backend is asked what is up. Each pass is two IPC round
+  // trips — vici to charon, and the helper's socket for SSL — so this rate is
+  // most of what the app costs while it sits in the tray, which is where it
+  // spends weeks. With a tunnel up the tiles, the transfer graph and the stall
+  // detector all need it quick; with nothing up there is nothing to watch
+  // change, and a connect brings the next poll forward anyway.
+  var POLL_BUSY = 1600, POLL_IDLE = 6000;
+  var pollHandle = null;
+
+  function anyActive() {
+    for (var k in state) {
+      if (state[k] === "established" || state[k] === "connecting") { return true; }
+    }
+    return false;
+  }
+
+  // Chained rather than setInterval: a slow or hung IPC round trip must not
+  // queue up behind itself.
+  function runPoll(delay) {
+    if (pollHandle) { clearTimeout(pollHandle); }
+    pollHandle = setTimeout(function () {
+      pollOnce().catch(function () {}).then(schedulePoll);
+    }, delay);
+  }
+  function schedulePoll() { runPoll(anyActive() ? POLL_BUSY : POLL_IDLE); }
+  // Something just changed that only the poll can confirm — don't sit out the
+  // rest of an idle interval waiting to notice.
+  function pollSoon() { runPoll(120); }
 
   async function realDisconnect(p) {
     log("IKE", "terminating IKE_SA " + p.name);
@@ -1911,7 +1950,14 @@
   // charon needs root for utun, the virtual IP and routes, and so does
   // /etc/resolver. Installing it costs one prompt, once. macOS only — Windows
   // registers its broker from the installer, and Linux has no helper.
-  var helperState = { supported: false, installed: false, reachable: false };
+  var helperState = { supported: false, installed: false, reachable: false, stale: false };
+
+  // Installed, answering, AND from this build. The third condition is macOS
+  // only and exists because an update swaps the .app alone — see the `stale`
+  // field on the Rust side.
+  function helperOk() {
+    return helperState.installed && helperState.reachable && !helperState.stale;
+  }
   var helperBusy = false;
 
   async function refreshHelper() {
@@ -1932,23 +1978,53 @@
     // Sidebar row: always present on macOS, so the state is visible and the
     // install is reachable again after the strip has been dismissed.
     row.style.display = "";
-    var ok = helperState.installed && helperState.reachable;
+    var stale = !!helperState.stale;
+    var ok = helperOk();
     $("sh-text").textContent = helperBusy ? "helper · working…"
       : ok ? "helper · active"
+      : stale ? "helper · outdated"
       : helperState.installed ? "helper · not responding" : "helper · not installed";
     var act = $("sh-action");
-    act.textContent = ok ? "Remove" : "Install";
+    // "Update" and "Install" are the same call — installing replaces whatever
+    // is there. Only a healthy, current helper offers removal instead.
+    act.textContent = ok ? "Remove" : stale ? "Update" : "Install";
     act.disabled = helperBusy;
 
     // The strip only nags while there is something to fix, and only until it
     // is dismissed for this run.
     if (ok || helperDismissed) { bar.className = "helper-bar"; return; }
-    $("hb-text").innerHTML = helperState.installed
+    $("hb-text").innerHTML = stale
+      ? "VPN Client was updated, but the background helper is still the one from <b>" +
+        esc(helperState.installedVersion || "an earlier version") +
+        "</b>. An update replaces the app alone, so the helper, charon and openvpn stay as they were — update them so both halves match."
+      : helperState.installed
       ? "The VPN helper is installed but not responding. Reinstall it to stop connect and disconnect prompting."
       : "Install the VPN helper so connecting and disconnecting stop asking for your password. It needs your password once.";
+    $("hb-install").textContent = stale ? "Update helper" : "Install helper";
     bar.className = "helper-bar show";
   }
   var helperDismissed = false;
+
+  /* ---------- running from the disk image (macOS) ---------- */
+  //
+  // Worth its own strip rather than a log line: nothing about a translocated
+  // app looks wrong, it connects perfectly, and the only symptom is that
+  // updates never arrive — which nobody notices for months.
+  async function checkInstallLocation() {
+    if (!TAURI) { return; }
+    var why = null;
+    try { why = await TAURI.invoke("install_location_problem"); }
+    catch (e) { return; }
+    if (!why) { return; }
+    $("lb-text").innerHTML = why === "disk-image"
+      ? "VPN Client is running from the disk image. Drag it into your <b>Applications</b> folder and open it from there — it cannot update itself from here."
+      : "VPN Client is running from a temporary read-only copy, which is what macOS does when an app is opened straight from a disk image. Drag it into your <b>Applications</b> folder and open it from there — it cannot update itself from here.";
+    $("location-bar").className = "helper-bar bad show";
+    log("CFG", "running from a read-only location (" + why + ") — updates cannot apply", "bad");
+  }
+  $("lb-later").addEventListener("click", function () {
+    $("location-bar").className = "helper-bar bad";
+  });
 
   async function doHelper(install) {
     if (helperBusy) { return; }
@@ -2026,6 +2102,7 @@
       // that failed is exactly the one you want back at the top of the tray.
       noteUsed(current.id);
       state[current.id] = "connecting"; setPill(); setAction(); renderList();
+      pollSoon();   // leave the idle cadence immediately
       if (TAURI) { realConnect(current); } else { demoConnect(current); }
     } else if (st === "connecting") {
       seqTimers.forEach(clearTimeout); seqTimers = [];
@@ -2258,7 +2335,7 @@
     helperDismissed = true; renderHelper();
   });
   $("sh-action").addEventListener("click", function () {
-    doHelper(!(helperState.installed && helperState.reachable));
+    doHelper(!helperOk());
   });
   $("cpick-btn").addEventListener("click", function () { cpickOpen ? closeCpick() : openCpick(); });
   $("cpick-search").addEventListener("input", function (e) {
@@ -2495,6 +2572,7 @@
   // service, not something to discover. The backend answers at most once per
   // user, so declining is remembered; the strip and the sidebar row remain for
   // anyone who changes their mind.
+  checkInstallLocation();
   refreshHelper().then(function () {
     if (!TAURI) { return; }
     return TAURI.invoke("helper_setup_pending").then(function (pending) {
@@ -2505,7 +2583,17 @@
     }).catch(function () {});
   });
   // Keep the backend indicator live (it can be started/stopped out-of-band).
-  if (TAURI) { setInterval(function () { if (!daemonBusy) { refreshDaemon(); } }, 4000); }
+  // Same reasoning as the status poll. Kept quick while something depends on
+  // the daemon, and while it is *down* — that is when a start needs to be
+  // noticed promptly — and slow when it is simply up with nothing running.
+  if (TAURI) {
+    (function daemonLoop() {
+      setTimeout(function () {
+        var p = daemonBusy ? Promise.resolve() : refreshDaemon();
+        Promise.resolve(p).catch(function () {}).then(daemonLoop);
+      }, anyActive() || !daemonUp ? 4000 : 15000);
+    })();
+  }
 
   // Restore the last-used view up front — before profiles are loaded — so the
   // window is sized and laid out for it by the time it becomes visible. The
@@ -2522,7 +2610,7 @@
     // that outlived a previous run of the app — and feeds the selected
     // profile's tiles. First pass right after profiles land, so a tunnel
     // already up is shown as such instead of appearing disconnected.
-    if (TAURI) { pollOnce(); setInterval(pollOnce, 1600); }
+    if (TAURI) { pollOnce().catch(function () {}).then(schedulePoll); }
   });
 })();
 </script>

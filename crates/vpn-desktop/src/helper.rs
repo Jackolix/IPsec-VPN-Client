@@ -45,9 +45,13 @@ fn helper_bin() -> Result<std::path::PathBuf, String> {
 /// asked once is setup, being asked at every launch is nagging. The strip and
 /// the sidebar row stay, so a user who said no can still say yes later.
 #[cfg(target_os = "macos")]
-pub fn setup_pending() -> bool {
-    let (installed, reachable) = status();
-    if installed && reachable {
+pub fn setup_pending(app_version: &str) -> bool {
+    let st = status(app_version);
+    // A *stale* helper deliberately does not qualify: it is already working,
+    // and a password prompt fired automatically right after an update — which
+    // is exactly when this would happen — reads as the update asking for
+    // permission to do something. The strip asks instead.
+    if st.installed && st.reachable {
         return false;
     }
     let marker = crate::backend::app_data_dir().join("helper-setup-attempted");
@@ -63,17 +67,108 @@ pub fn setup_pending() -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn setup_pending() -> bool {
+pub fn setup_pending(_app_version: &str) -> bool {
     false
 }
 
-/// Is the helper installed and answering?
+/// What the GUI needs to know about the privileged half.
+pub struct HelperStatus {
+    pub installed: bool,
+    pub reachable: bool,
+    /// The app version that installed it, when it recorded one. `None` for a
+    /// helper installed by hand from a checkout.
+    pub installed_version: Option<String>,
+    /// The installed helper, charon and openvpn came from a different version
+    /// of the app than the one running.
+    ///
+    /// This is the macOS-only consequence of how updates work: the updater
+    /// swaps the `.app` and nothing else, so everything under /Library stays at
+    /// whatever version put it there. An unknown version is deliberately *not*
+    /// stale — that is a developer's own build, and nagging them would be noise.
+    pub stale: bool,
+}
+
+/// Is the helper installed, answering, and from this version of the app?
 #[cfg(target_os = "macos")]
-pub fn status() -> (bool, bool) {
-    (
-        vpn_broker::launchd::installed(),
-        vpn_broker::unix_client::available(),
-    )
+pub fn status(app_version: &str) -> HelperStatus {
+    let installed = vpn_broker::launchd::installed();
+    let installed_version = if installed {
+        vpn_broker::launchd::installed_version()
+    } else {
+        None
+    };
+    HelperStatus {
+        stale: is_stale(installed, installed_version.as_deref(), app_version),
+        installed,
+        reachable: vpn_broker::unix_client::available(),
+        installed_version,
+    }
+}
+
+/// Is what is installed under /Library from a different app version than the
+/// one running?
+///
+/// Split out from [`status`] so the rule can be pinned by a test without a
+/// /Library to read. Three cases, and only the middle one is a judgement call:
+///
+///   * a recorded version that differs — stale, the ordinary post-update case;
+///   * **no record at all** — stale too. Stamping arrived in 0.2.9, so an
+///     unstamped install is from a build older than that, which is exactly what
+///     this is for. Reading absence as "fine" would make the first update that
+///     needs this the one it silently misses.
+///   * the [`MACOS_VERSION_UNSTAMPED`] sentinel — not stale. That is a helper
+///     installed by hand from a checkout, and nagging a developer to reinstall
+///     after every build trains them to ignore the strip that matters.
+fn is_stale(installed: bool, installed_version: Option<&str>, app_version: &str) -> bool {
+    use vpn_broker::protocol::MACOS_VERSION_UNSTAMPED;
+    if !installed {
+        return false;
+    }
+    match installed_version {
+        Some(MACOS_VERSION_UNSTAMPED) => false,
+        Some(v) => v != app_version,
+        None => true,
+    }
+}
+
+/// Why the app cannot update itself from where it is running, if it cannot.
+///
+/// Two cases, both of them "you launched it straight from the disk image":
+///
+///   * **App Translocation.** macOS runs a quarantined app from a read-only
+///     randomised mount under `/private/var/folders/.../AppTranslocation/`, so
+///     the updater's in-place bundle swap has nowhere to write. Nothing about
+///     the running app looks wrong; it just silently never updates.
+///   * **Still on the mounted dmg**, at `/Volumes/…`, which is read-only.
+///
+/// Everything else — `/Applications`, `~/Applications`, `~/Downloads`, a cargo
+/// build — is writable and fine. This is only about the updater: the helper
+/// installs correctly from a translocated bundle, because installing copies
+/// the binaries out to /Library rather than running them where they sit.
+#[cfg(target_os = "macos")]
+pub fn bad_install_location() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    location_problem(&exe.to_string_lossy()).map(str::to_string)
+}
+
+/// The rule behind [`bad_install_location`], separated from `current_exe` so
+/// it can be tested against paths this machine will never have.
+#[cfg(target_os = "macos")]
+fn location_problem(path: &str) -> Option<&'static str> {
+    if path.contains("/AppTranslocation/") {
+        Some("translocated")
+    } else if path.starts_with("/Volumes/") {
+        Some("disk-image")
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn bad_install_location() -> Option<String> {
+    // Windows installs to Program Files and Linux through a package manager;
+    // neither has an equivalent of being run out of its own installer.
+    None
 }
 
 /// Install the helper. Raises one authorization prompt.
@@ -250,8 +345,13 @@ fn trash_own_bundle() -> Result<bool, String> {
 // The helper is macOS-only; Windows has the broker service and Linux uses the
 // dev container.
 #[cfg(not(target_os = "macos"))]
-pub fn status() -> (bool, bool) {
-    (false, false)
+pub fn status(_app_version: &str) -> HelperStatus {
+    HelperStatus {
+        installed: false,
+        reachable: false,
+        installed_version: None,
+        stale: false,
+    }
 }
 #[cfg(not(target_os = "macos"))]
 pub fn install() -> Result<String, String> {
@@ -266,4 +366,48 @@ pub fn uninstall_app(_state: &crate::backend::AppState) -> Result<String, String
     // Windows uninstalls through Add/Remove Programs, which the NSIS and MSI
     // packages register; Linux through the package manager.
     Err("in-app uninstall is macOS-only".to_string())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{is_stale, location_problem};
+
+    #[test]
+    fn only_read_only_launch_locations_are_flagged() {
+        assert_eq!(
+            location_problem(
+                "/private/var/folders/xy/T/AppTranslocation/1A2B/d/VPN Client.app/Contents/MacOS/vpn-desktop"
+            ),
+            Some("translocated")
+        );
+        assert_eq!(
+            location_problem("/Volumes/VPN Client/VPN Client.app/Contents/MacOS/vpn-desktop"),
+            Some("disk-image")
+        );
+        // The three ordinary places, all writable, none of them a problem.
+        for ok in [
+            "/Applications/VPN Client.app/Contents/MacOS/vpn-desktop",
+            "/Users/x/Applications/VPN Client.app/Contents/MacOS/vpn-desktop",
+            "/Users/x/dev/repo/target/release/vpn-desktop",
+        ] {
+            assert_eq!(location_problem(ok), None, "{ok}");
+        }
+    }
+
+    #[test]
+    fn a_different_or_missing_recorded_version_is_stale() {
+        assert!(is_stale(true, Some("0.2.8"), "0.2.9"));
+        assert!(!is_stale(true, Some("0.2.9"), "0.2.9"));
+        // Installed before stamping existed — the case this whole check was
+        // added for, so absence must not read as "fine".
+        assert!(is_stale(true, None, "0.2.9"));
+        // Installed by hand from a checkout.
+        assert!(!is_stale(
+            true,
+            Some(vpn_broker::protocol::MACOS_VERSION_UNSTAMPED),
+            "0.2.9"
+        ));
+        // Nothing installed is a different problem, with its own message.
+        assert!(!is_stale(false, Some("0.2.8"), "0.2.9"));
+    }
 }

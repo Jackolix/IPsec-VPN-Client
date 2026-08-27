@@ -280,6 +280,37 @@ macOS doesn't, and a tunnel carrying one `/24` should not quietly become the
 resolver for every name on the machine. Set a DNS domain on the profile (it is
 an editable field) to resolve internal names over the tunnel.
 
+#### What runs when nothing is connected
+
+Measured on an idle machine, 2h26m after boot, with no tunnel up and the GUI
+not running:
+
+| | CPU used | share of a core | RSS | threads |
+|---|---|---|---|---|
+| helper (`vpn-broker run`) | 0.24 s | 0.003 % | 1.8 MB | 1 |
+| charon | 1.00 s | 0.011 % | 11.8 MB | 17 |
+| openvpn | not running | — | — | — |
+
+The **helper is fully passive**: one thread blocked in `accept()`, no timers and
+no periodic work. It wakes only when the GUI sends it a request. **openvpn**
+exists only while an SSL tunnel is up and is SIGTERM'd on disconnect.
+
+**charon is started on the first connect and never stopped.** It outlives both
+the tunnel and the GUI, until a reboot or `scripts/run-charon-macos.sh --stop`.
+That is deliberate — a connect starts it anyway, so stopping it is a maintenance
+action rather than a button — and at 12 MB and a hundredth of a percent of a
+core it is not worth an automatic teardown that could fail and would add
+latency to every reconnect.
+
+The recurring cost is not the daemons but the **GUI's status poll**, which is
+two IPC round trips (vici for IPsec, the helper socket for SSL). It runs at
+1.6 s while anything is connected or connecting and backs off to 6 s when
+nothing is — a connect calls `pollSoon()` so it leaves the idle cadence
+immediately rather than waiting out an interval. The daemon-liveness probe does
+the same, 4 s to 15 s, staying quick while the daemon is *down* so a start is
+noticed promptly. Both are chained `setTimeout`s rather than `setInterval`, so a
+slow round trip cannot queue up behind itself.
+
 #### Gotchas
 
 * **Rebuilding the bundle does not replace a running app.** Closing the window
@@ -372,6 +403,29 @@ end up on different versions. Two consequences the UI states up front: the
 installer's PREINSTALL hook stops the broker, so **a live tunnel drops**, and
 the bundle is per-machine, so **Windows raises a UAC prompt**. The app closes
 and the installer reopens it.
+
+On **macOS** the mechanism is the same but the payload is not: the manifest's
+`darwin-aarch64` entry points at the `.app.tar.gz` (never the dmg), and the
+updater swaps the bundle in place and relaunches. Three differences follow, and
+all three are macOS-only:
+
+* **The privileged half is not updated.** Replacing anything under `/Library`
+  needs root, and an update must not raise an authorization prompt of its own —
+  so the helper, charon and openvpn stay at whatever version installed them.
+  That is the version skew Windows does not have. `launchd::install` records the
+  installing app's version (from the bundle's own `Info.plist`) at
+  `/Library/Application Support/dev.jackolix.ipsecvpn/installed-version`, the
+  GUI compares it against the running one, and the helper strip offers to
+  update it. A *missing* record counts as stale — it means an install from
+  before this existed — while the `unversioned` sentinel, written when the
+  helper is installed by hand from a checkout, does not.
+* **The bundle has to be writable.** An app opened straight from the mounted
+  dmg is either on a read-only `/Volumes/…` or, once quarantined, translocated
+  by macOS to a read-only randomised path — and can never update itself, with
+  nothing about it looking wrong. The window says so on launch; the dmg
+  background says to drag it to Applications for the same reason.
+* **Apple Silicon only.** There is no `darwin-x86_64` entry, matching the
+  arm64-only build.
 
 Trust rests on the signature, not on the transport. `latest.json` carries a
 minisign signature for the installer, and the updater verifies it against the

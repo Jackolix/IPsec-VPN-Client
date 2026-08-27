@@ -22,7 +22,7 @@ use std::process::Command;
 
 use crate::protocol::{
     MACOS_CHARON_DIR, MACOS_HELPER_BIN, MACOS_HELPER_LOG, MACOS_LABEL, MACOS_PLIST,
-    MACOS_RUN_DIR, MACOS_SUPPORT_DIR,
+    MACOS_RUN_DIR, MACOS_SUPPORT_DIR, MACOS_VERSION_FILE, MACOS_VERSION_UNSTAMPED,
 };
 
 fn plist_contents() -> String {
@@ -168,6 +168,18 @@ pub fn install(
         datapaths.push_str(" + SSL");
     }
 
+    // Stamped before the daemon comes up, so the GUI never sees a running
+    // helper with no version beside it and concludes it is a hand-installed
+    // one. Missing rather than wrong when the version cannot be determined.
+    let _ = std::fs::remove_file(MACOS_VERSION_FILE);
+    let stamp = installing_app_version(helper_src)
+        .unwrap_or_else(|| MACOS_VERSION_UNSTAMPED.to_string());
+    if std::fs::write(MACOS_VERSION_FILE, &stamp).is_ok() {
+        let _ =
+            std::fs::set_permissions(MACOS_VERSION_FILE, std::fs::Permissions::from_mode(0o644));
+        let _ = chown_root(Path::new(MACOS_VERSION_FILE));
+    }
+
     std::fs::write(MACOS_PLIST, plist_contents())
         .map_err(|e| format!("cannot write {MACOS_PLIST}: {e}"))?;
     std::fs::set_permissions(MACOS_PLIST, std::fs::Permissions::from_mode(0o644))
@@ -184,6 +196,50 @@ pub fn install(
         return Err(format!("launchctl bootstrap failed: {}", err.trim()));
     }
     Ok(format!("helper installed and started ({MACOS_LABEL}); datapaths: {datapaths}"))
+}
+
+/// The version of the app bundle `helper_src` was copied out of.
+///
+/// Read from the bundle's own `Info.plist` rather than passed in as an
+/// argument, so `sudo vpn-broker install` from a checkout behaves the same as
+/// the GUI doing it — and so there is no way for the two to disagree. `None`
+/// when the helper is not inside a bundle at all, which is every dev build;
+/// the GUI treats an unknown version as "not stale" rather than nagging.
+fn installing_app_version(helper_src: &Path) -> Option<String> {
+    // <App>.app/Contents/Resources/helper/vpn-broker -> <App>.app/Contents
+    let contents = helper_src.parent()?.parent()?.parent()?;
+    let plist = contents.join("Info.plist");
+    if !plist.is_file() {
+        return None;
+    }
+    // plutil, not a text search: Tauri writes XML today but a binary plist is
+    // just as valid and would silently stop matching.
+    let out = Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
+        .arg(&plist)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// The app version that installed what is currently under /Library, if it
+/// recorded one. See [`MACOS_VERSION_FILE`].
+pub fn installed_version() -> Option<String> {
+    let v = std::fs::read_to_string(MACOS_VERSION_FILE).ok()?;
+    let v = v.trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 /// Stop and remove the helper, and everything it put outside the app bundle.

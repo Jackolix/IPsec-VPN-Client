@@ -1,17 +1,31 @@
 //! In-app updates.
 //!
 //! The app looks for a `latest.json` published beside the installers on the
-//! GitHub Release, and when it names a version newer than this build, downloads
-//! that release's NSIS installer and hands it to Windows to run. Everything the
-//! product ships lives inside that one installer — the GUI, the broker service,
-//! charon and OpenVPN — so an update replaces the whole set at once and there is
-//! no version skew to reason about between the unelevated app and the privileged
-//! service it talks to.
+//! GitHub Release, and when it names a version newer than this build, fetches
+//! what that manifest points at for this platform. The two platforms then
+//! diverge completely, and the difference is not cosmetic:
 //!
-//! Two consequences the UI has to be honest about, both of them the installer's
-//! doing rather than ours: its PREINSTALL hook stops the broker service (which
-//! reverts DNS and stops charon), so installing tears down a live tunnel; and
-//! because the bundle is perMachine, running it raises a UAC prompt.
+//! **Windows** downloads the NSIS installer and hands it to the OS to run.
+//! Everything the product ships lives inside that one installer — the GUI, the
+//! broker service, charon and OpenVPN — so an update replaces the whole set at
+//! once and there is no version skew to reason about between the unelevated app
+//! and the privileged service it talks to. Two consequences the UI has to be
+//! honest about, both the installer's doing rather than ours: its PREINSTALL
+//! hook stops the broker service (which reverts DNS and stops charon), so
+//! installing tears down a live tunnel; and because the bundle is perMachine,
+//! running it raises a UAC prompt.
+//!
+//! **macOS** swaps the `.app` bundle in place and relaunches — and *only* the
+//! bundle. The privileged half installed under `/Library` (the helper daemon,
+//! charon, openvpn) is untouched, because replacing it needs root and an
+//! update must not raise an authorization prompt of its own. So macOS does have
+//! the version skew Windows does not, and it is silent unless something looks
+//! for it: [`crate::helper::status`] compares the app version recorded at
+//! install time against the running one and the window offers to update the
+//! helper. Two further macOS-only limits: the swap needs the bundle to be
+//! writable, so an app run straight from the disk image can never update itself
+//! (see [`crate::helper::bad_install_location`]), and the manifest carries only
+//! `darwin-aarch64` — Apple Silicon is the only macOS build there is.
 //!
 //! Trust comes from the signature, not the transport. `latest.json` names a
 //! minisign signature for the installer, and the plugin verifies it against the
@@ -90,7 +104,9 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
     // Windows never gets here: the plugin launches the installer and exits the
     // process, because the installer cannot overwrite a running .exe. The
     // installer restarts the app itself. This is the path the other platforms
-    // take, where the swap happens in-place and we relaunch.
+    // take, where the swap happens in-place and we relaunch — on macOS with an
+    // installed helper that is now a version behind, which the window points
+    // out on the next render.
     app.restart()
 }
 
