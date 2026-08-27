@@ -372,6 +372,29 @@ jobs:
           APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
         run: cargo tauri build --target aarch64-apple-darwin
 
+      # Tauri notarises the .app and staples it, then builds the dmg FROM the
+      # stapled app and only signs that. So the dmg has no ticket of its own,
+      # and stapling it fails with "Record not found" — the ticket is looked up
+      # by the dmg's own hash, which Apple has never seen.
+      #
+      # It needs one. A quarantined disk image is assessed by Gatekeeper when it
+      # is mounted, and a signed-but-unnotarised one is refused there — before
+      # the user ever reaches the stapled app inside it.
+      - name: Notarise and staple the dmg
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          dmg=$(find target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -1)
+          [ -n "$dmg" ] || { echo "no .dmg was built" >&2; exit 1; }
+          xcrun notarytool submit "$dmg" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$dmg"
+
       # The key outlives the build step otherwise, and a later failure would
       # leave a private key on the runner image.
       - name: Remove the API key
@@ -385,10 +408,11 @@ jobs:
       # still gets the "cannot be opened" dialog for an app that was notarised
       # perfectly well.
       #
-      # Tauri staples the .app itself, before it builds the dmg from it, so this
-      # VERIFIES that rather than redoing it — if a future version stops, the
-      # validate fails here rather than silently shipping an unstapled app. The
-      # dmg it only signs, so that one is stapled here.
+      # Tauri staples the .app itself, before it builds the dmg from it, and the
+      # dmg is notarised and stapled by the step above. This VERIFIES both
+      # rather than redoing either — if a future version stops stapling, the
+      # validate fails here rather than silently shipping something that
+      # prompts users.
       #
       # All of it is a gate, not a formality: if Gatekeeper does not accept the
       # app on this runner it will not accept it on a user's Mac either, and the
@@ -415,7 +439,9 @@ jobs:
           spctl --assess --type execute --verbose=4 "$app"
 
           [ -n "$dmg" ] || { echo "no .dmg was built" >&2; exit 1; }
-          xcrun stapler staple "$dmg"
+          # Both were stapled earlier — by Tauri for the app, by the step above
+          # for the dmg. Validating rather than re-stapling means a regression
+          # in either fails here instead of shipping.
           xcrun stapler validate "$dmg"
 
           # The updater consumes these two, and the release job cannot build a
