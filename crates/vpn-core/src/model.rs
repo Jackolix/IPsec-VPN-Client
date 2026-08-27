@@ -332,6 +332,22 @@ impl Ipv4Net {
             prefix_len: m.leading_ones() as u8,
         })
     }
+
+    /// Does this network contain `ip`?
+    ///
+    /// Used to tell a user *why* a host behind the tunnel does not answer: an
+    /// address outside every remote traffic selector is not routed over the
+    /// tunnel at all, which is a configuration answer rather than a dead
+    /// device.
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        // A /0 matches everything, and shifting a u32 by 32 is UB-adjacent
+        // (it panics in debug), so it is handled before the shift.
+        if self.prefix_len == 0 {
+            return true;
+        }
+        let shift = 32 - u32::from(self.prefix_len);
+        (u32::from(ip) >> shift) == (u32::from(self.addr) >> shift)
+    }
 }
 
 impl fmt::Display for Ipv4Net {
@@ -717,5 +733,29 @@ mod proposal_tests {
         for offered in c.ike_proposals() {
             assert!(offered.starts_with("aes256-"), "{offered}");
         }
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+
+    #[test]
+    fn contains_matches_the_prefix() {
+        let n: Ipv4Net = "10.0.15.0/24".parse().unwrap();
+        assert!(n.contains("10.0.15.1".parse().unwrap()));
+        assert!(n.contains("10.0.15.255".parse().unwrap()));
+        assert!(!n.contains("10.0.16.1".parse().unwrap()));
+    }
+
+    /// The two boundaries the shift arithmetic could get wrong.
+    #[test]
+    fn the_prefix_length_extremes_hold() {
+        let all: Ipv4Net = "0.0.0.0/0".parse().unwrap();
+        assert!(all.contains("203.0.113.9".parse().unwrap()));
+
+        let host: Ipv4Net = "10.0.15.7/32".parse().unwrap();
+        assert!(host.contains("10.0.15.7".parse().unwrap()));
+        assert!(!host.contains("10.0.15.8".parse().unwrap()));
     }
 }

@@ -12,8 +12,10 @@ mod daemon;
 mod deeplink;
 mod dns;
 mod helper;
+mod hosts;
 mod overrides;
 mod portal;
+mod reach;
 mod ssl;
 mod update;
 
@@ -160,6 +162,21 @@ async fn save_profile_edit(
 }
 
 /// Drop a profile's edits, falling back to the imported `.ini`.
+/// Check which of a profile's hosts answer. `manual` is the user asking, which
+/// also permits probing hosts outside the tunnel's traffic selectors.
+#[tauri::command]
+async fn probe_hosts(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    manual: bool,
+) -> Result<Vec<reach::HostStatus>, String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::probe_hosts(&s, id, manual)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[tauri::command]
 async fn reset_profile_edit(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let s = state.inner().clone();
@@ -467,6 +484,15 @@ fn dev(args: &[String]) {
         .map(|_| "set".to_string()),
         Some("disconnect") => backend::disconnect(&state, args.get(1).cloned().unwrap_or_default())
             .map(|_| "disconnected".to_string()),
+        // `hosts <id> [manual]` — the reachability check the Hosts card runs,
+        // headlessly. `manual` also probes hosts outside the tunnel's traffic
+        // selectors, which the automatic sweep deliberately skips.
+        Some("hosts") => backend::probe_hosts(
+            &state,
+            args.get(1).cloned().unwrap_or_default(),
+            args.get(2).map(|s| s == "manual").unwrap_or(false),
+        )
+        .map(|st| serde_json::to_string_pretty(&st).expect("serialize host status")),
         // Live connections across both datapaths (IPsec SAs + any SSL tunnel).
         Some("status") => backend::status(&state)
             .map(|sas| serde_json::to_string_pretty(&sas).expect("serialize status")),
@@ -706,6 +732,7 @@ fn main() {
             get_profile_edit,
             save_profile_edit,
             reset_profile_edit,
+            probe_hosts,
             take_link_request,
             confirm_link_import,
             cancel_link_import,

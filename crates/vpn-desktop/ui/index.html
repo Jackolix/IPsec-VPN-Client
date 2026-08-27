@@ -154,9 +154,42 @@
   #spark { width: 100%; height: 34px; display: block; margin-top: 4px; }
 
   .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .cards.one { grid-template-columns: 1fr; }
   .card { background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--r); display: flex; flex-direction: column; min-width: 0; }
   .card > h3 { margin: 0; padding: 12px 15px; border-bottom: 1px solid var(--line-soft); font-family: var(--mono); font-size: var(--fs-xs); font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 8px; }
   .card > h3 .count { margin-left: auto; color: var(--faint); font-weight: 400; }
+
+  /* Hosts & equipment. A row is a name, the thing you copy, and why it is or
+     is not answering — the reason matters more than the dot, because "no
+     answer" on its own is not something a user can act on. */
+  .host-row { display: flex; align-items: center; gap: 11px; padding: 9px 15px; border-top: 1px solid var(--line-soft); }
+  .host-row:first-child { border-top: 0; }
+  .hled { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
+  .hled.up { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+  .hled.down { background: var(--crit); box-shadow: 0 0 0 3px var(--crit-soft); }
+  .hled.skip { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+  .hmain { flex: 1; min-width: 0; }
+  .hname { font-size: var(--fs-base); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hdetail { font-size: var(--fs-xs); color: var(--muted); line-height: 1.45; }
+  .haddr { font-family: var(--mono); font-size: var(--fs-sm); color: var(--text); background: rgba(0,0,0,.22);
+    border: 1px solid var(--line); border-radius: 7px; padding: 4px 9px; cursor: pointer; flex: 0 0 auto; }
+  .haddr:hover { border-color: var(--accent-line); color: var(--accent); }
+  .haddr.copied { border-color: rgba(70,194,102,.42); color: var(--ok); }
+  .haddr:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .hrtt { font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); min-width: 54px; text-align: right; flex: 0 0 auto; }
+  .hosts-empty { padding: 14px 15px; color: var(--faint); font-size: var(--fs-sm); line-height: 1.5; }
+  .hosts-empty code { color: var(--muted); }
+
+  /* The row editor in the edit dialog. */
+  .hrows { display: flex; flex-direction: column; gap: 6px; }
+  .hrow { display: flex; gap: 6px; align-items: center; }
+  .hrow input.hr-name { flex: 1 1 32%; }
+  .hrow input.hr-addr { flex: 1 1 48%; }
+  .hrow input.hr-port { flex: 0 0 72px; }
+  .hr-del { flex: 0 0 auto; width: 28px; height: 30px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--surface-2); color: var(--muted); font-size: var(--fs-sm); }
+  .hr-del:hover { border-color: var(--crit); color: var(--crit); }
+  .hr-add { align-self: flex-start; margin-top: 2px; }
   .kv { padding: 6px 15px 13px; }
   .kv-row { display: flex; align-items: baseline; gap: 12px; padding: 6px 0; border-bottom: 1px dashed var(--line-soft); }
   .kv-row:last-child { border-bottom: 0; }
@@ -439,6 +472,16 @@
           <div class="card"><h3>Import trust <span id="warn-count" class="count"></span></h3><div class="warns" id="warns"></div></div>
         </div>
 
+        <div class="cards one" id="hosts-card">
+          <div class="card">
+            <h3>Hosts &amp; equipment
+              <span id="hosts-count" class="count"></span>
+              <button type="button" id="hosts-check" class="btn btn-ghost btn-sm" style="margin-left:10px">Check all</button>
+            </h3>
+            <div id="hosts-list"></div>
+          </div>
+        </div>
+
         <div class="console">
           <div class="console-head"><span id="log-title">charon log</span><span class="spacer"></span><button id="clear-log">Clear</button></div>
           <div class="log" id="log" role="log" aria-live="polite"><div class="log-empty">No events yet — connect to begin the IKE_SA handshake.</div></div>
@@ -660,6 +703,22 @@
       </fieldset>
 
       <fieldset class="fgroup">
+        <legend>Hosts &amp; equipment</legend>
+        <div class="fgrid">
+          <div class="field wide" id="f-hosts">
+            <label>Behind the tunnel</label>
+            <div class="hrows" id="e-hosts"></div>
+            <button type="button" class="btn btn-ghost btn-sm hr-add" id="hosts-add">+ Add host</button>
+            <span class="hint">The equipment you open this tunnel to reach. Each one can be copied and
+              reachability-checked from the connection view. Leave the port empty to check with a ping;
+              give it one to check the service with a TCP connect instead — which is what you want for a
+              device that serves a web UI but drops pings. An administrator can ship these instead, in a
+              <code>&lt;profile&gt;.hosts.json</code> beside the profile file.</span>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset class="fgroup">
         <legend>Pre-shared key</legend>
         <div class="fgrid">
           <div class="field wide"><label for="e-psk">Replace PSK</label><input id="e-psk" type="password" autocomplete="off" placeholder="leave empty to keep the current key" /><span class="hint" id="psk-hint"></span></div>
@@ -710,6 +769,11 @@
       ] },
     { id: "demo2", name: "ACME_SITE_01", gateway: "gateway.example.test",
       localId: "acme_site_01", remote: "10.0.15.0/24", vip: "—",
+      hosts: [
+        { name: "Core switch", addr: "10.0.15.2" },
+        { name: "Controller web UI", addr: "10.0.15.9", port: 443 },
+        { name: "Off-site NAS", addr: "192.168.40.10" }
+      ],
       ike: "aes256-sha256-prfsha256-modp3072", esp: "aes256-sha256", pfs: "modp3072",
       warns: [{ lvl: "medium", t: "IkeIdType=3 interpreted as USER_FQDN", n: "unconfirmed mapping — verify on first connect" }] }
   ];
@@ -747,6 +811,7 @@
       userStored: !!s.user_stored,
       userName: s.user_name || null,
       edits: s.edits || [],
+      hosts: s.hosts || [],
       warns: (s.warnings || []).map(function (w) { return { lvl: w.level, t: w.text, n: w.note }; })
     };
   }
@@ -873,6 +938,136 @@
       rows[i].querySelector(".wt").textContent = w.t;
       if (w.n) { rows[i].querySelector(".wn").textContent = w.n; }
     });
+  }
+
+  /* ---------- hosts & equipment ---------- */
+
+  // Probe results, per profile id. Deliberately not persisted: reachability is
+  // a fact about right now, and a stale green dot is worse than no dot.
+  var hostStatus = {};
+
+  function copyAddr(text, btn) {
+    var flash = function () {
+      btn.classList.add("copied");
+      setTimeout(function () { btn.classList.remove("copied"); }, 900);
+    };
+    // The webview is a secure context, so the async API is available; the
+    // textarea fallback covers a webview where it is not.
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(flash, function () { copyFallback(text, flash); });
+    } else {
+      copyFallback(text, flash);
+    }
+  }
+  function copyFallback(text, done) {
+    var ta = document.createElement("textarea");
+    ta.value = text; ta.setAttribute("readonly", "");
+    ta.style.position = "fixed"; ta.style.top = "-1000px"; ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); done(); } catch (e) { /* nothing else to try */ }
+    document.body.removeChild(ta);
+  }
+
+  function hostLed(s) {
+    if (!s) { return ""; }
+    if (s.state === "up") { return " up"; }
+    if (s.state === "down") { return " down"; }
+    if (s.state === "dns-failed") { return " down"; }
+    if (s.state === "skipped") { return " skip"; }
+    return "";
+  }
+
+  function renderHosts() {
+    var p = current, card = $("hosts-card");
+    // An SSL tunnel's routes arrive from the gateway at connect time, so there
+    // are no traffic selectors to say whether a host is even carried.
+    if (p.kind === "ssl") { card.style.display = "none"; return; }
+    card.style.display = "";
+
+    var list = p.hosts || [], el = $("hosts-list");
+    $("hosts-count").textContent = list.length ? list.length + (list.length === 1 ? " host" : " hosts") : "";
+    $("hosts-check").disabled = !list.length;
+    el.innerHTML = "";
+
+    if (!list.length) {
+      var empty = document.createElement("div");
+      empty.className = "hosts-empty";
+      empty.appendChild(document.createTextNode("No hosts yet \u2014 add the equipment you open this tunnel to reach under "));
+      var b = document.createElement("b"); b.textContent = "Edit"; empty.appendChild(b);
+      empty.appendChild(document.createTextNode(", or ship a "));
+      var code = document.createElement("code"); code.textContent = p.id + ".hosts.json";
+      empty.appendChild(code);
+      empty.appendChild(document.createTextNode(" beside the profile file."));
+      el.appendChild(empty);
+      return;
+    }
+
+    var st = hostStatus[p.id] || [];
+    list.forEach(function (h, i) {
+      var s = st[i] || null;
+      var row = document.createElement("div");
+      row.className = "host-row";
+
+      var led = document.createElement("span");
+      led.className = "hled" + hostLed(s);
+      row.appendChild(led);
+
+      var main = document.createElement("div");
+      main.className = "hmain";
+      var name = document.createElement("div");
+      name.className = "hname";
+      // Straight from a profile file, so never interpolated as markup.
+      name.textContent = h.name;
+      main.appendChild(name);
+      var detail = document.createElement("div");
+      detail.className = "hdetail";
+      detail.textContent = s ? s.detail : "not checked yet";
+      main.appendChild(detail);
+      row.appendChild(main);
+
+      var rtt = document.createElement("span");
+      rtt.className = "hrtt";
+      rtt.textContent = s && s.rtt_ms != null ? s.rtt_ms.toFixed(1) + " ms" : (s ? s.probe : "");
+      row.appendChild(rtt);
+
+      var shown = h.port ? h.addr + ":" + h.port : h.addr;
+      var addr = document.createElement("button");
+      addr.type = "button";
+      addr.className = "haddr";
+      addr.textContent = shown;
+      addr.title = "Copy " + shown;
+      addr.addEventListener("click", function () { copyAddr(shown, addr); });
+      row.appendChild(addr);
+
+      el.appendChild(row);
+    });
+  }
+
+  // `manual` is the user pressing Check all, which also permits probing hosts
+  // the tunnel does not route. The automatic sweep after a connect leaves those
+  // alone — see the `reach` module for why.
+  async function checkHosts(manual) {
+    if (!current || !TAURI) { return; }
+    var p = current;
+    if (!(p.hosts || []).length) { return; }
+    var btn = $("hosts-check");
+    btn.disabled = true;
+    var label = btn.textContent;
+    btn.textContent = "Checking\u2026";
+    try {
+      var res = await TAURI.invoke("probe_hosts", { id: p.id, manual: !!manual });
+      hostStatus[p.id] = res;
+      if (current && current.id === p.id) { renderHosts(); }
+      var up = res.filter(function (r) { return r.state === "up"; }).length;
+      log("NET", up + " of " + res.length + (res.length === 1 ? " host" : " hosts") + " reachable",
+        up === res.length ? "good" : up ? "" : "bad");
+    } catch (e) {
+      log("NET", "host check failed: " + String(e), "bad");
+    } finally {
+      btn.textContent = label;
+      btn.disabled = !(current && (current.hosts || []).length);
+    }
   }
 
   function setPill() {
@@ -1182,7 +1377,7 @@
     }
     $("d-gw").textContent = current.gateway;
     hideNotice();
-    renderList(); renderSecurity(); renderWarns(); setPill(); setAction(); renderTiles(); renderCreds();
+    renderList(); renderSecurity(); renderWarns(); renderHosts(); setPill(); setAction(); renderTiles(); renderCreds();
   }
 
   /* ---------- credentials (OS keychain) ---------- */
@@ -1505,12 +1700,78 @@
       remote: p.remote === "—" ? [] : p.remote.split(",").map(function (s) { return s.trim(); }),
       request_virtual_ip: true, compression: false,
       dns: p.dns ? p.dns.split(",").map(function (s) { return s.trim(); }) : [],
-      dns_domain: p.dnsDomain || "", dpd_delay: 30, auto_reconnect: true
+      dns_domain: p.dnsDomain || "", dpd_delay: 30, auto_reconnect: true,
+      hosts: (p.hosts || []).slice()
     };
   }
 
   function showEditErr(msg) { var e = $("edit-err"); e.className = "notice bad show"; e.textContent = msg; }
   function clearEditErr() { $("edit-err").className = "notice bad"; $("edit-err").textContent = ""; }
+
+  /* ---------- the host row editor ---------- */
+
+  function hostRow(h) {
+    var row = document.createElement("div");
+    row.className = "hrow";
+
+    var name = document.createElement("input");
+    name.type = "text"; name.className = "hr-name"; name.spellcheck = false;
+    name.placeholder = "Core switch";
+    name.setAttribute("aria-label", "Host name");
+    name.value = h && h.name ? h.name : "";
+
+    var addr = document.createElement("input");
+    addr.type = "text"; addr.className = "hr-addr"; addr.spellcheck = false;
+    addr.placeholder = "10.0.15.2 or nas.corp.example";
+    addr.setAttribute("aria-label", "Host address");
+    addr.value = h && h.addr ? h.addr : "";
+
+    var port = document.createElement("input");
+    port.type = "text"; port.className = "hr-port"; port.spellcheck = false;
+    port.inputMode = "numeric";
+    port.placeholder = "port";
+    port.setAttribute("aria-label", "Port (optional)");
+    port.value = h && h.port ? String(h.port) : "";
+
+    var del = document.createElement("button");
+    del.type = "button"; del.className = "hr-del";
+    del.textContent = "\u2715";
+    del.title = "Remove this host";
+    del.setAttribute("aria-label", "Remove this host");
+    del.addEventListener("click", function () {
+      row.remove();
+      // Never leave the editor with nothing to type into.
+      if (!$("e-hosts").children.length) { $("e-hosts").appendChild(hostRow(null)); }
+    });
+
+    row.appendChild(name); row.appendChild(addr); row.appendChild(port); row.appendChild(del);
+    return row;
+  }
+
+  function fillHosts(list, edits) {
+    var box = $("e-hosts");
+    box.innerHTML = "";
+    (list || []).forEach(function (h) { box.appendChild(hostRow(h)); });
+    if (!box.children.length) { box.appendChild(hostRow(null)); }
+    $("f-hosts").classList.toggle("edited", (edits || []).indexOf("hosts") >= 0);
+  }
+
+  function readHosts() {
+    var out = [];
+    Array.prototype.forEach.call($("e-hosts").children, function (row) {
+      var name = row.querySelector(".hr-name").value.trim();
+      var addr = row.querySelector(".hr-addr").value.trim();
+      var raw = row.querySelector(".hr-port").value.trim();
+      // A row nobody touched is not an error; the backend drops it too.
+      if (!name && !addr && !raw) { return; }
+      var h = { name: name, addr: addr };
+      // A non-numeric port becomes 0, which the backend rejects by name rather
+      // than silently ignoring what the user typed.
+      if (raw) { h.port = /^[0-9]+$/.test(raw) ? parseInt(raw, 10) : 0; }
+      out.push(h);
+    });
+    return out;
+  }
 
   function fillForm(edit, edits) {
     FIELDS.forEach(function (f) {
@@ -1521,6 +1782,8 @@
       else { el.value = v == null ? "" : String(v); }
       $("f-" + f).classList.toggle("edited", (edits || []).indexOf(f) >= 0);
     });
+    // Not in FIELDS: a host list is rows, not one input.
+    fillHosts(edit.hosts, edits);
   }
 
   function readForm() {
@@ -1535,6 +1798,7 @@
       else if (f === "user_auth") { edit[f] = el.value === "true"; }
       else { edit[f] = el.value.trim(); }
     });
+    edit.hosts = readHosts();
     return edit;
   }
 
@@ -1569,6 +1833,9 @@
     var id = current.id, psk = $("e-psk").value;
     try {
       var names = await TAURI.invoke("save_profile_edit", { id: id, edit: readForm() });
+      // The list may have changed under the results, and a probe result is
+      // matched to a host by position.
+      delete hostStatus[id];
       if (psk) { await TAURI.invoke("set_credentials", { id: id, psk: psk }); }
       closeEdit();
       await refresh();
@@ -1587,6 +1854,7 @@
     try {
       await TAURI.invoke("reset_profile_edit", { id: current.id });
       var id = current.id;
+      delete hostStatus[id];
       closeEdit();
       await refresh();
       var p = profiles.filter(function (x) { return x.id === id; })[0];
@@ -1721,6 +1989,9 @@
     state[p.id] = "established"; connectAt = Date.now(); prevTotal = 0; samples = [];
     setPill(); setAction(); renderList();
     startPolling();
+    // One sweep now that there is a data path, then only when asked. Nothing
+    // polls this in the background.
+    checkHosts(false);
   }
 
   // In real mode the status poll runs continuously (see boot), not just while
@@ -2363,6 +2634,12 @@
   $("clear-log").addEventListener("click", clearLog);
   $("import-btn").addEventListener("click", onImport);
   $("edit-btn").addEventListener("click", openEdit);
+  $("hosts-check").addEventListener("click", function () { checkHosts(true); });
+  $("hosts-add").addEventListener("click", function () {
+    var box = $("e-hosts"), row = hostRow(null);
+    box.appendChild(row);
+    row.querySelector(".hr-name").focus();
+  });
   $("edit-cancel").addEventListener("click", closeEdit);
   $("edit-save").addEventListener("click", onEditSave);
   $("edit-reset").addEventListener("click", onEditReset);

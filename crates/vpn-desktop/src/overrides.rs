@@ -13,6 +13,7 @@
 //! The PSK is deliberately not an overridable field: it lives in the OS
 //! keychain (see [`creds`](crate::creds)), never in this file.
 
+use crate::hosts::Host;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use vpn_core::{
@@ -59,6 +60,14 @@ pub struct Edit {
     /// DPD probe interval in seconds; 0 disables probing.
     pub dpd_delay: u32,
     pub auto_reconnect: bool,
+    /// Hosts and equipment reachable over the tunnel.
+    ///
+    /// Unlike every other field here this one does not come from the profile
+    /// file: it is layered from the companion `<id>.hosts.json` (see
+    /// [`hosts`](crate::hosts)) and then overridden, which is why
+    /// [`Edit::from_config`] cannot fill it and the caller must.
+    #[serde(default)]
+    pub hosts: Vec<Host>,
 }
 
 impl Edit {
@@ -85,7 +94,17 @@ impl Edit {
             dns_domain: config.dns.domain.clone().unwrap_or_default(),
             dpd_delay: config.dpd.delay_secs,
             auto_reconnect: config.dpd.auto_reconnect,
+            // Not a property of the tunnel config; the caller layers in the
+            // companion file's hosts.
+            hosts: Vec::new(),
         }
+    }
+
+    /// The host list, trimmed and validated. Separate from [`Edit::apply_to`]
+    /// because hosts are not part of [`ConnectionConfig`] — that type describes
+    /// the tunnel, and a list of equipment is not part of one.
+    pub fn normalized_hosts(&self) -> Result<Vec<Host>, String> {
+        crate::hosts::normalize(&self.hosts)
     }
 
     /// Validate and apply onto `config`. Rejects anything charon would choke on
@@ -188,6 +207,10 @@ impl Edit {
         };
         config.dpd.delay_secs = self.dpd_delay;
         config.dpd.auto_reconnect = self.auto_reconnect;
+        // Validated here too, so a bad host list is rejected by the same call
+        // that rejects every other bad edit, rather than slipping through to
+        // the sidecar. The normalized value itself is applied by the caller.
+        self.normalized_hosts()?;
         Ok(())
     }
 }
@@ -248,6 +271,8 @@ pub struct Overrides {
     pub dpd_delay: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_reconnect: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<Host>>,
 }
 
 macro_rules! diff_fields {
@@ -271,7 +296,7 @@ impl Overrides {
             base, edited, out, names, name, gateway, ike_version, user_auth, local_id, local_id_type,
             ike_enc, ike_integ,
             ike_prf, ike_dh, esp_enc, esp_integ, pfs, remote, request_virtual_ip, compression, dns,
-            dns_domain, dpd_delay, auto_reconnect,
+            dns_domain, dpd_delay, auto_reconnect, hosts,
         );
         (out, names)
     }
@@ -296,7 +321,7 @@ impl Overrides {
             name, gateway, ike_version, user_auth, local_id, local_id_type, ike_enc, ike_integ,
             ike_prf, ike_dh, esp_enc,
             esp_integ, pfs, remote, request_virtual_ip, compression, dns, dns_domain, dpd_delay,
-            auto_reconnect,
+            auto_reconnect, hosts,
         );
         (e, names)
     }
@@ -367,6 +392,7 @@ mod tests {
             dns_domain: String::new(),
             dpd_delay: 30,
             auto_reconnect: true,
+            hosts: vec![],
         }
     }
 

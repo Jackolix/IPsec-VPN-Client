@@ -16,6 +16,12 @@
 !crates/*/tests/fixtures/*.redacted.mobileconfig
 !crates/*/tests/fixtures/*.redacted.pro
 
+# Host lists shipped beside a profile. No secret in them, but they name a
+# customer's internal equipment and addressing — which the security rules say
+# is not ours to publish either.
+*.hosts.json
+!crates/*/tests/fixtures/*.redacted.hosts.json
+
 # Generated connection configs contain the PSK.
 /out/
 *.swanctl.conf

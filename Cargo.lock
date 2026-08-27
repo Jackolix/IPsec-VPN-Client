@@ -4940,6 +4940,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "keyring",
+ "libc",
  "ncp-profile",
  "reqwest",
  "serde",
@@ -4955,6 +4956,7 @@ dependencies = [
  "vpn-broker",
  "vpn-control",
  "vpn-core",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

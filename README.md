@@ -50,7 +50,7 @@ container.
 | `crates/sophos-profile` | Sophos importers: `.scx` (Sophos Connect — JSON, close to a serialised swanctl connection), `.tgb` (legacy Cyberoam/TheGreenBow — ini-shaped, IKEv1, algorithms reached through a chain of section references) and `.pro` (a pointer to a user portal, not a connection). Same policy as the NCP importer: hard error on anything safety-critical it cannot map, warning on anything merely unconfirmed. |
 | `crates/vici` | Hand-rolled client for strongSwan's vici control protocol: a cross-platform message codec plus packet framing and a blocking request/event client (Unix and TCP transports). |
 | `crates/vpn-control` | Shared connection logic used by both the CLI and the GUI: the config→vici bridge, `list-sa` status parsing, and the connect/status/disconnect flows over a `Transport` (Unix socket or TCP). `connect_logged` registers for charon's `log` event around `initiate` and returns the captured handshake transcript. |
-| `crates/vpn-desktop` | Tauri desktop app. Rust backend interprets profiles natively and calls `vpn-control`; the web UI (`ui/`) drives it via `invoke`. Native file-picker + drag-drop import, system tray, DNS-over-tunnel (NRPT), PSK in the OS keychain (`src/creds.rs`, `keyring`) taking precedence over the plaintext `.ini`. Run headlessly with `--selftest`; drive the backend flows with `--dev <cmd>`. |
+| `crates/vpn-desktop` | Tauri desktop app. Rust backend interprets profiles natively and calls `vpn-control`; the web UI (`ui/`) drives it via `invoke`. Native file-picker + drag-drop import, system tray, DNS-over-tunnel (NRPT), PSK in the OS keychain (`src/creds.rs`, `keyring`) taking precedence over the plaintext `.ini`. Hosts behind the tunnel (`src/hosts.rs`) with an unprivileged reachability check on both platforms (`src/reach.rs`) — see *Hosts and equipment*. Run headlessly with `--selftest`; drive the backend flows with `--dev <cmd>`. |
 | `crates/vpn-broker` | The privileged helper, on both platforms. **Windows**: a LocalSystem **service** that supervises `charon-svc.exe` and applies/reverts NRPT DNS rules for the unelevated GUI over an ACL'd named pipe (`src/ipc.rs`), registered by the installer. **macOS**: a launchd **LaunchDaemon** (`src/launchd.rs`) serving the same requests over a Unix socket (`src/unix_ipc.rs`), doing charon's lifecycle and `/etc/resolver` DNS (`src/privileged.rs`). The `protocol` is shared because the shape is (one request, one response, newline JSON); `src/openvpn.rs`, the SSL VPN supervisor, is shared too — only its adapter handling is Windows-specific. On both, the GUI falls back to an elevation prompt when the helper isn't installed. |
 | `crates/vpn-agent` | CLI agent over `vpn-control`: imports a profile and drives charon (`connect` / `status` / `disconnect`). The PSK is pushed via `load-shared` in memory — no swanctl.conf with the secret is written to disk. |
 | `crates/vpn-cli` | Phase 0 CLI: `show` (redacted interpretation) and `generate` (writes swanctl.conf). Kept for inspection/debugging. |
@@ -602,6 +602,58 @@ And a `.tgb` is generated against whichever interface the admin exported it
 from, so its gateway may be a private address that will never answer from
 outside; the import warns rather than leaving the user with a connection that
 only times out.
+
+## Hosts and equipment
+
+A profile says how to build the tunnel and nothing about what is on the other
+end. The **Hosts & equipment** card carries the other half: the switch, the NAS,
+the machine's web UI — the things a person actually opens the VPN to reach. Each
+row copies its address to the clipboard on click and can be checked for
+reachability.
+
+The check is unprivileged on both platforms and never involves the broker.
+macOS uses an ICMP datagram socket (`SOCK_DGRAM`/`IPPROTO_ICMP`), which Darwin
+allows any user to open; Windows uses `IcmpSendEcho`, which does the echo in the
+kernel for the caller. Giving a host a **port** switches it to a TCP connect
+instead — the right probe for equipment that serves a web UI but drops pings.
+
+What makes it worth having is that it explains itself. The profile knows its
+remote traffic selectors, so an address outside all of them is reported as *not
+routed over this tunnel*, naming the subnets that are — a configuration answer
+rather than a dead switch. A name that will not resolve while the tunnel is up
+is blamed on the DNS configuration, and one outside the split-DNS suffix says
+so. That check is also a safety rail: a profile can be handed to a user by
+anyone, so hosts outside the tunnel are never probed automatically, only when
+the user asks for one by hand. Nothing polls in the background — the sweep runs
+once on connect, and otherwise when **Check all** is pressed.
+
+Hosts come from two places, layered the way every other profile field is:
+
+1. A companion **`<profile>.hosts.json`** beside the profile file — what an
+   administrator ships. Unlike the profile it carries no pre-shared key, so it
+   is the half that can be mailed or handed to a customer on its own.
+2. The user's own edits, in the `<id>.override.json` sidecar, replayed on top.
+   *Reset to file* falls back to the companion file, not to nothing.
+
+```json
+[
+  { "name": "Core switch",       "addr": "10.0.15.2" },
+  { "name": "Controller web UI", "addr": "10.0.15.9", "port": 443 },
+  { "name": "NAS",               "addr": "nas.corp.example" }
+]
+```
+
+The profile file itself is never written to — it is re-parsed on every load and
+holds a live PSK, so storing a switch's address must not put that key through
+our serializer. `.ini`, `.scx` and `.tgb` are therefore read-only here, and a
+single companion format covers all of them rather than four dialect extensions.
+
+Drive it headlessly with `vpn-desktop --dev hosts <id> [manual]`.
+
+Two limits worth knowing: the list is IPv4-only, matching the rest of the config
+model, and SSL VPN profiles have no host list — an OpenVPN tunnel's routes are
+pushed by the gateway at connect time, so there are no traffic selectors to say
+whether a host is carried.
 
 ## Importing from the web (`itmvpn://` links)
 

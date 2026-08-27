@@ -38,12 +38,22 @@ url = "2"
 # (Windows Credential Manager, macOS Keychain, Secret Service on Linux).
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+# IcmpSendEcho, for the host reachability check (`reach`). It does the echo in
+# the kernel on the caller's behalf, so the unelevated GUI can probe without a
+# raw socket and without going through the privileged helper.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+# The unprivileged ICMP datagram socket behind the host reachability check.
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
+libc = "0.2"
 
 [features]
 # Prevents a console window from also opening on Windows release builds.

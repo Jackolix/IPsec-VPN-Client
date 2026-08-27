@@ -162,6 +162,9 @@ pub struct ProfileSummary {
     /// Which datapath this profile uses: `ipsec` (charon) or `ssl` (OpenVPN via
     /// the broker). The UI adapts labels and skips IPsec-only editing for SSL.
     pub kind: String,
+    /// Hosts and equipment behind the tunnel, from the companion
+    /// `<id>.hosts.json` with the user's edits applied.
+    pub hosts: Vec<crate::hosts::Host>,
 }
 
 /// A profile opened for editing: its current effective values, plus which of
@@ -204,10 +207,12 @@ fn summarize(
     file: &str,
     config: &vpn_core::ConnectionConfig,
     warnings: &[vpn_core::ImportWarning],
+    hosts: Vec<crate::hosts::Host>,
     edits: Vec<String>,
 ) -> ProfileSummary {
     ProfileSummary {
         edits,
+        hosts,
         file: file.to_string(),
         format: format_label(file).to_string(),
         ike_version: config.ike_version.swanctl_value().to_string(),
@@ -287,6 +292,11 @@ fn summarize_ssl(id: &str, file: &str, text: &str) -> ProfileSummary {
             .then(|| crate::creds::load_user(id).ok().flatten().map(|c| c.username))
             .flatten(),
         kind: "ssl".to_string(),
+        // Hosts are an IPsec-profile feature for now: an SSL tunnel's routes
+        // are pushed by the gateway at connect time, so there are no traffic
+        // selectors to say whether a host is carried by the tunnel — which is
+        // the whole point of the check.
+        hosts: Vec::new(),
     }
 }
 
@@ -386,10 +396,15 @@ fn provisioning_message(text: &str) -> String {
 fn load(
     state: &AppState,
     id: &str,
-) -> std::result::Result<(vpn_core::ImportedProfile, Vec<String>), String> {
+) -> std::result::Result<(vpn_core::ImportedProfile, Vec<crate::hosts::Host>, Vec<String>), String>
+{
     let mut imported = parse(&profile_path(state, id))?;
-    let base = crate::overrides::Edit::from_config(&imported.config);
+    let mut base = crate::overrides::Edit::from_config(&imported.config);
+    // Hosts are not in the profile file — they are layered in from the
+    // companion `<id>.hosts.json` before the user's own overrides go on top.
+    base.hosts = crate::hosts::load_companion(&state.profile_dir, id);
     let (edited, mut names) = crate::overrides::load(&state.profile_dir, id).overlay(&base);
+    let mut hosts = edited.normalized_hosts().unwrap_or_else(|_| base.hosts.clone());
     if !names.is_empty() {
         if let Err(e) = edited.apply_to(&mut imported.config) {
             // Phrased for `to_warn_item`, which splits a trailing parenthetical
@@ -398,9 +413,10 @@ fn load(
                 "saved edits were not applied; using the profile file as imported ({e})"
             )));
             names.clear();
+            hosts = base.hosts.clone();
         }
     }
-    Ok((imported, names))
+    Ok((imported, hosts, names))
 }
 
 /// The file backing a profile id. The id is the file stem, so the extension is
@@ -468,12 +484,13 @@ pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 out.push(summarize_ssl(id, &file, &text));
             }
-        } else if let Ok((imported, edits)) = load(state, id) {
+        } else if let Ok((imported, hosts, edits)) = load(state, id) {
             out.push(summarize(
                 id,
                 &file,
                 &imported.config,
                 &imported.warnings,
+                hosts,
                 edits,
             ));
         }
@@ -488,9 +505,11 @@ pub fn get_profile_edit(state: &AppState, id: String) -> std::result::Result<Pro
         return Err("SSL VPN profiles have no editable parameters — the gateway pushes routes \
                     and DNS on connect".to_string());
     }
-    let (imported, edits) = load(state, &id)?;
+    let (imported, hosts, edits) = load(state, &id)?;
+    let mut edit = crate::overrides::Edit::from_config(&imported.config);
+    edit.hosts = hosts;
     Ok(ProfileEdit {
-        edit: crate::overrides::Edit::from_config(&imported.config),
+        edit,
         edits,
         stored: crate::creds::has(&id),
         id,
@@ -510,11 +529,15 @@ pub fn save_profile_edit(
     // Validate against the profile as imported: an edit that can't be applied
     // must not reach the sidecar, or the profile would carry a broken override.
     let mut imported = parse(&profile_path(state, &id))?;
-    let base = crate::overrides::Edit::from_config(&imported.config);
+    let mut base = crate::overrides::Edit::from_config(&imported.config);
+    base.hosts = crate::hosts::load_companion(&state.profile_dir, &id);
     edit.apply_to(&mut imported.config)?;
     // Diff the *normalized* edit (trimmed, empty-vs-absent resolved) so that
     // e.g. a re-typed identical value doesn't register as an override.
-    let normalized = crate::overrides::Edit::from_config(&imported.config);
+    let mut normalized = crate::overrides::Edit::from_config(&imported.config);
+    // Hosts do not round-trip through `ConnectionConfig`, so they are
+    // normalized directly. `apply_to` above has already validated them.
+    normalized.hosts = edit.normalized_hosts()?;
     let (overrides, names) = crate::overrides::Overrides::diff(&base, &normalized);
     crate::overrides::save(&state.profile_dir, &id, &overrides)?;
     Ok(names)
@@ -950,7 +973,7 @@ pub fn delete_profile(state: &AppState, id: String) -> std::result::Result<(), S
     // Best-effort: a profile that no longer parses can't tell us its connection
     // name, and a charon that isn't running can't be asked to disconnect. Losing
     // the tunnel teardown is not a reason to refuse the delete.
-    if let Ok((imported, _)) = load(state, &id) {
+    if let Ok((imported, _, _)) = load(state, &id) {
         let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
         let up = status(state)
             .map(|sas| sas.iter().any(|sa| sa.name == name))
@@ -997,7 +1020,7 @@ pub fn connect(
     if is_ssl_profile(state, &id) {
         return ssl_connect(state, &id, login);
     }
-    let (mut imported, _) = load(state, &id)?;
+    let (mut imported, _, _) = load(state, &id)?;
     // Prefer a PSK saved in the OS keychain over the one parsed from the
     // (plaintext-on-disk) profile file, so saved credentials are what actually
     // authenticate the tunnel.
@@ -1308,7 +1331,7 @@ pub fn needs_user_login(state: &AppState, id: &str) -> bool {
         return needs && !crate::creds::has_user(id);
     }
     load(state, id)
-        .map(|(imported, _)| {
+        .map(|(imported, _, _)| {
             imported.config.user_auth.is_some() && !crate::creds::has_user(id)
         })
         .unwrap_or(false)
@@ -1465,7 +1488,7 @@ fn apply_dns(
 
 /// Copy a profile's PSK from its `.ini` into the OS keychain.
 pub fn save_credentials(state: &AppState, id: String) -> std::result::Result<(), String> {
-    let (imported, _) = load(state, &id)?;
+    let (imported, _, _) = load(state, &id)?;
     let vpn_core::AuthMethod::PresharedKey(psk) = &imported.config.auth;
     crate::creds::store(&id, psk)
 }
@@ -1510,6 +1533,41 @@ pub fn disconnect(state: &AppState, name: String) -> std::result::Result<(), Str
 /// broker's SSL VPN tunnels rendered as a synthetic SA, so the UI shows them and
 /// can tear them down the same way. Both datapaths carry several tunnels at
 /// once, so this is a list on either side.
+/// Check which of a profile's hosts are reachable.
+///
+/// `manual` is the user pressing a Check button. On an automatic sweep (after
+/// connecting) it is `false`, and hosts outside the tunnel's traffic selectors
+/// are left alone — a profile can come from anyone, and its host list is a set
+/// of addresses this app would otherwise send packets to unprompted. See
+/// [`reach`](crate::reach).
+pub fn probe_hosts(
+    state: &AppState,
+    id: String,
+    manual: bool,
+) -> std::result::Result<Vec<crate::reach::HostStatus>, String> {
+    if is_ssl_profile(state, &id) {
+        return Err("SSL VPN profiles have no host list — the gateway pushes routes on \
+                    connect, so there are no traffic selectors to check against"
+            .to_string());
+    }
+    let (imported, hosts, _) = load(state, &id)?;
+    if hosts.is_empty() {
+        return Ok(Vec::new());
+    }
+    // "Connected" only changes how a failure is explained, so a status call we
+    // cannot make is not a reason to refuse the probe.
+    let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
+    let connected = status(state)
+        .map(|sas| sas.iter().any(|sa| sa.name == name))
+        .unwrap_or(false);
+    let ctx = crate::reach::Context {
+        remote: imported.config.remote_subnets.clone(),
+        connected,
+        dns_domain: imported.config.dns.domain.clone(),
+    };
+    Ok(crate::reach::probe_all(&hosts, &ctx, manual))
+}
+
 pub fn status(state: &AppState) -> std::result::Result<Vec<IkeSa>, String> {
     let ssl = crate::ssl::status().unwrap_or_default();
     let mut sas = match vpn_control::status(&state.transport) {
@@ -1574,6 +1632,81 @@ mod tests {
         assert_eq!(strip_ovpn_timestamp("done"), "done");
         // Looks date-ish but isn't the full stamp — left as-is, no panic.
         assert_eq!(strip_ovpn_timestamp("2026-08-10 partial"), "2026-08-10 partial");
+    }
+
+    /// The layering the host list depends on: the companion file an
+    /// administrator ships is the base, the user's sidecar overrides it, and
+    /// "Reset to file" falls back to the companion file rather than to nothing.
+    #[test]
+    fn hosts_layer_companion_file_then_user_edits() {
+        let s = scratch_state("hosts");
+        std::fs::write(s.profile_dir.join("p.ini"), SAMPLE).unwrap();
+        std::fs::write(
+            s.profile_dir.join("p.hosts.json"),
+            r#"[{"name":"Switch","addr":"10.0.0.2"}]"#,
+        )
+        .unwrap();
+
+        // Base: what the administrator shipped.
+        let (_, hosts, _) = load(&s, "p").unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "Switch");
+
+        // The user adds one of their own.
+        let mut edit = get_profile_edit(&s, "p".to_string()).unwrap().edit;
+        edit.hosts.push(crate::hosts::Host {
+            name: "  NAS  ".to_string(),
+            addr: " 10.0.0.7 ".to_string(),
+            port: Some(5001),
+        });
+        let names = save_profile_edit(&s, "p".to_string(), edit).unwrap();
+        assert!(names.contains(&"hosts".to_string()), "{names:?}");
+
+        let (_, hosts, edits) = load(&s, "p").unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[1].name, "NAS", "the edit is stored trimmed");
+        assert_eq!(hosts[1].addr, "10.0.0.7");
+        assert_eq!(hosts[1].port, Some(5001));
+        assert!(edits.contains(&"hosts".to_string()));
+
+        // Reset drops back to the companion file, not to an empty list.
+        reset_profile_edit(&s, "p".to_string()).unwrap();
+        let (_, hosts, _) = load(&s, "p").unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "Switch");
+    }
+
+    /// A host list matching the shipped file exactly must not create a sidecar,
+    /// or every profile would look edited the moment its dialog was opened.
+    #[test]
+    fn reopening_the_dialog_and_saving_records_no_host_override() {
+        let s = scratch_state("hosts_noop");
+        std::fs::write(s.profile_dir.join("p.ini"), SAMPLE).unwrap();
+        std::fs::write(
+            s.profile_dir.join("p.hosts.json"),
+            r#"[{"name":"Switch","addr":"10.0.0.2","port":443}]"#,
+        )
+        .unwrap();
+
+        let edit = get_profile_edit(&s, "p".to_string()).unwrap().edit;
+        let names = save_profile_edit(&s, "p".to_string(), edit).unwrap();
+        assert!(!names.contains(&"hosts".to_string()), "{names:?}");
+    }
+
+    /// A bad host list is refused before it can reach the sidecar.
+    #[test]
+    fn an_invalid_host_never_reaches_the_sidecar() {
+        let s = scratch_state("hosts_bad");
+        std::fs::write(s.profile_dir.join("p.ini"), SAMPLE).unwrap();
+
+        let mut edit = get_profile_edit(&s, "p".to_string()).unwrap().edit;
+        edit.hosts.push(crate::hosts::Host {
+            name: "Bad".to_string(),
+            addr: "10.0.0.1; rm -rf /".to_string(),
+            port: None,
+        });
+        assert!(save_profile_edit(&s, "p".to_string(), edit).is_err());
+        assert!(crate::overrides::load(&s.profile_dir, "p").hosts.is_none());
     }
 
     /// A throwaway state whose profile directory is empty and per-test.
