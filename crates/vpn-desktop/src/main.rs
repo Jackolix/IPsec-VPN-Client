@@ -286,6 +286,26 @@ async fn uninstall_helper() -> Result<String, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Remove the app and everything it installed. See [`helper::uninstall_app`].
+///
+/// The window stays open afterwards so the result can be read — the bundle is
+/// already in the Trash by then, and quitting is a separate, deliberate step.
+#[tauri::command]
+async fn uninstall_app(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let s = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || helper::uninstall_app(&s))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Quit for real, rather than hiding to the tray the way closing the window
+/// does. Only the uninstall flow uses this: after the bundle is in the Trash,
+/// a tray icon outliving its own app is the one thing worse than no feedback.
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[tauri::command]
 async fn daemon_running(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let s = state.inner().clone();
@@ -599,6 +619,8 @@ fn main() {
             helper_setup_pending,
             install_helper,
             uninstall_helper,
+            uninstall_app,
+            quit_app,
             save_credentials,
             set_credentials,
             forget_credentials,

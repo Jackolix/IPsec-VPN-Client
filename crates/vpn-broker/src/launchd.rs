@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::protocol::{
-    MACOS_CHARON_DIR, MACOS_HELPER_BIN, MACOS_LABEL, MACOS_PLIST, MACOS_SUPPORT_DIR,
+    MACOS_CHARON_DIR, MACOS_HELPER_BIN, MACOS_HELPER_LOG, MACOS_LABEL, MACOS_PLIST,
+    MACOS_RUN_DIR, MACOS_SUPPORT_DIR,
 };
 
 fn plist_contents() -> String {
@@ -45,7 +46,7 @@ fn plist_contents() -> String {
     <key>KeepAlive</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>/var/log/ipsec-vpn-helper.log</string>
+    <string>{MACOS_HELPER_LOG}</string>
 </dict>
 </plist>
 "#
@@ -185,16 +186,49 @@ pub fn install(
     Ok(format!("helper installed and started ({MACOS_LABEL}); datapaths: {datapaths}"))
 }
 
-/// Stop and remove the helper. Must run as root.
+/// Stop and remove the helper, and everything it put outside the app bundle.
+/// Must run as root.
+///
+/// The order matters. charon and openvpn are the only things that can undo
+/// their own routes, `/etc/resolver` files and utun devices, so they are asked
+/// to shut down *before* the bootout — once the helper is gone there is
+/// nothing left to ask, and a half-removed install leaves the machine routing
+/// traffic into a tunnel nobody owns.
 pub fn uninstall() -> Result<String, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("removing the helper needs root".to_string());
     }
+
+    crate::privileged::kill_our_openvpn();
+    let _ = crate::privileged::charon_stop();
+    // After the daemons, while the records under RUN_DIR still exist.
+    crate::privileged::purge_dns();
+
     let _ = bootout();
     let _ = std::fs::remove_file(MACOS_PLIST);
     let _ = std::fs::remove_file(MACOS_HELPER_BIN);
     let _ = std::fs::remove_dir_all(MACOS_SUPPORT_DIR);
-    Ok("helper removed".to_string())
+    // The sockets, charon's log and the DNS records; then the helper's own
+    // stderr. Both directories are ours alone, created by us.
+    let _ = std::fs::remove_dir_all(MACOS_RUN_DIR);
+    let _ = std::fs::remove_file(MACOS_HELPER_LOG);
+
+    // Report what is actually gone rather than that the calls were made: this
+    // is the one moment a user is told the machine is clean.
+    let left: Vec<&str> = [
+        MACOS_PLIST,
+        MACOS_HELPER_BIN,
+        MACOS_SUPPORT_DIR,
+        MACOS_RUN_DIR,
+    ]
+    .into_iter()
+    .filter(|p| Path::new(p).exists())
+    .collect();
+    if left.is_empty() {
+        Ok("helper removed".to_string())
+    } else {
+        Err(format!("could not remove: {}", left.join(", ")))
+    }
 }
 
 fn bootout() -> Result<(), String> {

@@ -29,6 +29,13 @@ pub const MACOS_SUPPORT_DIR: &str = "/Library/Application Support/dev.jackolix.i
 /// Where the helper looks for charon. Derived from [`MACOS_SUPPORT_DIR`] and
 /// never taken from a request — see the module note above.
 pub const MACOS_CHARON_DIR: &str = "/Library/Application Support/dev.jackolix.ipsecvpn/charon";
+/// Runtime state: the two sockets, charon's log, the captured resolv.conf and
+/// the DNS records. Cleared on boot by the OS, and by `vpn-broker uninstall`.
+pub const MACOS_RUN_DIR: &str = "/var/run/ipsec-vpn";
+/// The helper's own stderr. In /var/log rather than [`MACOS_RUN_DIR`] because
+/// launchd will not create a missing directory for a `StandardErrorPath`, and
+/// /var/run does not survive a reboot.
+pub const MACOS_HELPER_LOG: &str = "/var/log/ipsec-vpn-helper.log";
 
 /// SCM service name (used by install/uninstall and status checks).
 pub const SERVICE_NAME: &str = "ipsec-vpn-broker";

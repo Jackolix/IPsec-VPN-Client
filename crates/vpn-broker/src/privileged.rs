@@ -22,12 +22,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{MACOS_CHARON_DIR, Response};
+use crate::protocol::{MACOS_CHARON_DIR, MACOS_RUN_DIR, MACOS_SUPPORT_DIR, Response};
 
 /// The vici socket our charon binds. Must match `NATIVE_VICI_SOCKET` in the
 /// desktop app and `plugins.vici.socket` in the installed strongswan.conf.
 const VICI_SOCKET: &str = "/var/run/ipsec-vpn/charon.vici";
-const RUN_DIR: &str = "/var/run/ipsec-vpn";
+use MACOS_RUN_DIR as RUN_DIR;
 
 fn charon_bin() -> PathBuf {
     Path::new(MACOS_CHARON_DIR).join("charon")
@@ -212,6 +212,77 @@ pub fn revert_dns(conn: &str) -> Response {
     let _ = std::fs::remove_file(&record);
     flush_dns();
     Response::ok("")
+}
+
+/// Remove every `/etc/resolver` file this helper installed, whichever
+/// connection put it there.
+///
+/// [`revert_dns`] needs a connection name; uninstalling has none to give. It
+/// runs in a *different process* from the helper that applied them, so the
+/// in-memory view is empty and the records on disk are the only account of
+/// what was written. Left behind, each file quietly points a domain at a
+/// nameserver that is only reachable through a tunnel that no longer exists —
+/// which looks like broken DNS, not like a leftover.
+pub fn purge_dns() {
+    let Ok(entries) = std::fs::read_dir(RUN_DIR) else {
+        return;
+    };
+    let mut removed_any = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_record = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("dns-") && n.ends_with(".record"))
+            .unwrap_or(false);
+        if !is_record {
+            continue;
+        }
+        // Re-validated on the way out exactly as on the way in: this record is
+        // a file we wrote, but it is still a filename being turned into a path.
+        if let Some(domain) = std::fs::read_to_string(&path).ok().and_then(|d| safe_domain(&d)) {
+            let _ = std::fs::remove_file(resolver_path(&domain));
+            removed_any = true;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    if removed_any {
+        flush_dns();
+    }
+}
+
+/// SIGTERM every openvpn running from *our* installed copy.
+///
+/// Matched by executable path, never by process name — the same rule
+/// [`charon_stop`] follows. `openvpn` is a common binary and another client's
+/// live tunnel is not ours to take down.
+///
+/// This exists because SSL tunnels are children of the helper, and booting the
+/// helper out of launchd does not reliably take them with it. An orphaned
+/// openvpn keeps its utun, its routes and its default-route override, with the
+/// app that could have stopped it now uninstalled.
+pub fn kill_our_openvpn() {
+    let ours = Path::new(MACOS_SUPPORT_DIR).join("openvpn").join("openvpn");
+    let ours = ours.to_string_lossy().to_string();
+    let Ok(out) = Command::new("/usr/bin/pgrep").args(["-x", "openvpn"]).output() else {
+        return;
+    };
+    for pid in String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+    {
+        let Ok(info) = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        else {
+            continue;
+        };
+        if String::from_utf8_lossy(&info.stdout).trim() != ours {
+            continue;
+        }
+        // SIGTERM, so openvpn runs its own route/utun teardown on the way out.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
 }
 
 /// Where a connection's applied domain is recorded. The connection name comes

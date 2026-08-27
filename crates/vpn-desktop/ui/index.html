@@ -249,6 +249,7 @@
   .side-version button { background: none; border: 0; padding: 0; font: inherit; color: var(--accent);
     cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
   .side-version button[disabled] { color: var(--faint); text-decoration: none; cursor: default; }
+  .side-version button.danger { color: var(--crit); }
 
   /* gateway-override modal field */
   /* Drag-and-drop import overlay */
@@ -396,6 +397,11 @@
       <div class="side-foot"><span id="foot-led" class="led"></span><span id="foot-text">connecting to vici…</span><button id="daemon-btn" class="btn-sm" style="display:none">Start</button></div>
       <div class="side-version" id="side-helper" style="display:none"><span id="sh-text">helper</span><span class="spacer"></span><button type="button" id="sh-action">Install</button></div>
       <div class="side-version"><span>v<span id="app-version">—</span></span><span class="spacer"></span><button type="button" id="check-update">Check for updates</button></div>
+      <!-- macOS only. Dragging the bundle to the Trash is the platform's
+           uninstall, but it cannot remove the LaunchDaemon, the root-owned
+           copies of charon and openvpn, or any /etc/resolver file — all of
+           which need root. So the app removes itself. -->
+      <div class="side-version" id="side-uninstall" style="display:none"><span class="spacer"></span><button type="button" id="uninstall-btn" class="danger">Uninstall VPN Client</button></div>
     </aside>
 
     <section class="main">
@@ -492,6 +498,27 @@
     <h3 id="del-title" class="mono">Delete <span id="del-name">profile</span>?</h3>
     <div class="mbody" id="del-body"></div>
     <div class="mfoot"><button class="btn btn-ghost" id="del-cancel">Cancel</button><button class="btn btn-danger" id="del-confirm">Delete profile</button></div>
+  </div>
+</div>
+
+<!-- Uninstalling is the one action here that removes other people's work along
+     with our own — every profile and every saved key — so it names all of it
+     before asking. -->
+<div class="overlay" id="uninst-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="uninst-title">
+    <h3 id="uninst-title" class="mono">Uninstall VPN Client?</h3>
+    <div class="mbody" id="uninst-body"></div>
+    <div class="mfoot"><button class="btn btn-ghost" id="uninst-cancel">Cancel</button><button class="btn btn-danger" id="uninst-confirm">Uninstall</button></div>
+  </div>
+</div>
+
+<!-- Shown after the fact, because by then the bundle is in the Trash and there
+     is no second chance to report what happened. -->
+<div class="overlay" id="uninst-done-overlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="uninst-done-title">
+    <h3 id="uninst-done-title" class="mono">VPN Client removed</h3>
+    <div class="mbody" id="uninst-done-body"></div>
+    <div class="mfoot"><button class="btn btn-primary" id="uninst-quit">Quit</button></div>
   </div>
 </div>
 
@@ -1897,6 +1924,9 @@
   function renderHelper() {
     var row = $("side-helper");
     var bar = $("helper-bar");
+    // `supported` is "this is macOS" — the same condition that gates the
+    // in-app uninstall, since both exist because of the LaunchDaemon.
+    $("side-uninstall").style.display = helperState.supported ? "" : "none";
     if (!helperState.supported) { row.style.display = "none"; bar.className = "helper-bar"; return; }
 
     // Sidebar row: always present on macOS, so the state is visible and the
@@ -2131,6 +2161,59 @@
     log("CFG", "profile deleted: " + p.name, "");
     showNotice('<span class="led ok" style="box-shadow:none"></span><div>Deleted <b>' + esc(p.name) + "</b>.</div>", "");
   }
+
+  /* ---------- uninstall the app (macOS) ---------- */
+  function openUninstall() {
+    var saved = profiles.filter(function (p) { return p.stored; }).length;
+    var parts = ["the background helper, and the copies of charon and openvpn it installed"];
+    if (profiles.length) {
+      parts.push("<b>" + profiles.length + (profiles.length === 1 ? " profile" : " profiles") + "</b>");
+    }
+    if (saved) {
+      parts.push(saved + (saved === 1 ? " saved key or login" : " saved keys and logins") + " in " + KEYSTORE);
+    }
+    var body = "This removes " + parts.join(", ") + ", and moves VPN Client itself to the Trash.";
+    var up = Object.keys(state).filter(function (k) {
+      return state[k] === "established" || state[k] === "connecting";
+    }).length;
+    if (up) { body += " " + (up === 1 ? "The open tunnel is" : "Open tunnels are") + " disconnected first."; }
+    body += " macOS will ask for your password once, to remove the parts that need root.";
+    if (profiles.length) {
+      body += "<br><br>Profiles cannot be recovered from here — keep a copy of the files you imported if you may want them again.";
+    }
+    $("uninst-body").innerHTML = body;
+    $("uninst-confirm").classList.remove("busy");
+    $("uninst-overlay").classList.add("show");
+    $("uninst-cancel").focus();
+  }
+
+  function closeUninstall() { $("uninst-overlay").classList.remove("show"); }
+
+  async function onUninstallConfirm() {
+    $("uninst-confirm").classList.add("busy");
+    var msg;
+    try {
+      msg = await TAURI.invoke("uninstall_app");
+    } catch (e) {
+      // Cancelling the password prompt lands here, and nothing has been
+      // removed: leave the dialog open so it can simply be tried again.
+      $("uninst-confirm").classList.remove("busy");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+      return;
+    }
+    closeUninstall();
+    // No refresh: the profiles are gone and the backend that served them is
+    // half-removed. The only thing left to do is report and quit.
+    $("uninst-done-body").textContent = String(msg);
+    $("uninst-done-overlay").classList.add("show");
+    $("uninst-quit").focus();
+  }
+
+  $("uninstall-btn").addEventListener("click", openUninstall);
+  $("uninst-cancel").addEventListener("click", closeUninstall);
+  $("uninst-confirm").addEventListener("click", onUninstallConfirm);
+  $("uninst-overlay").addEventListener("click", function (e) { if (e.target === $("uninst-overlay")) { closeUninstall(); } });
+  $("uninst-quit").addEventListener("click", function () { if (TAURI) { TAURI.invoke("quit_app"); } });
 
   $("action").addEventListener("click", onAction);
   $("compact-action").addEventListener("click", onAction);

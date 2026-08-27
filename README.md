@@ -220,7 +220,32 @@ launchd runs the helper as root and the helper execs both binaries as root, so
 neither may live anywhere an unprivileged user can write — and an app bundle
 sitting in `~/Applications` or `~/Downloads` is exactly that.
 
-`sudo ./target/release/vpn-broker uninstall` removes all of it.
+`sudo ./target/release/vpn-broker uninstall` removes all of it, plus
+`/var/run/ipsec-vpn`, `/var/log/ipsec-vpn-helper.log` and any `/etc/resolver`
+file a tunnel left behind. It stops charon and our openvpn processes *before*
+the launchd bootout, since afterwards nothing is left that can undo their
+routes and utun devices.
+
+#### Uninstalling
+
+Dragging the bundle to the Trash is macOS' uninstall, and here it is not
+enough: the LaunchDaemon, the root-owned charon and openvpn, and any
+`/etc/resolver` file survive it and need root to remove. So the app uninstalls
+itself — **Uninstall VPN Client** at the bottom of the sidebar (macOS only). It
+disconnects, runs the helper's own `uninstall` behind one authorization prompt,
+deletes this user's profiles, keychain entries and WebView state, and moves the
+bundle to the Trash; then the window reports what happened and quits.
+
+By hand, the same thing is:
+
+```bash
+sudo "/Library/PrivilegedHelperTools/dev.jackolix.ipsecvpn.helper" uninstall
+rm -rf ~/.config/ipsec-vpn \
+       ~/Library/{Caches,WebKit,HTTPStorages}/dev.jackolix.ipsecvpn \
+       "~/Library/Saved Application State/dev.jackolix.ipsecvpn.savedState"
+security delete-generic-password -s dev.jackolix.ipsecvpn   # once per profile
+rm -rf "/Applications/VPN Client.app"
+```
 
 #### Who may drive the daemon
 
