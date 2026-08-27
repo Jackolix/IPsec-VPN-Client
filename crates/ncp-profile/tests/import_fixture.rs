@@ -1,8 +1,9 @@
 //! End-to-end fixture test: NCP ini -> config model -> swanctl.conf.
 //!
-//! The fixture is a structural copy of the real ACME_SITE_01 export with the
-//! PSK and production gateway replaced. This pins the code-mapping table:
-//! any change to how codes are interpreted shows up here.
+//! The fixture is a structural copy of a real NCP export with the PSK, the
+//! production gateway and the customer's own identifiers and addresses all
+//! replaced. This pins the code-mapping table: any change to how codes are
+//! interpreted shows up here.
 
 use ncp_profile::import_profile;
 use vpn_core::swanctl::{render, SecretRendering};
