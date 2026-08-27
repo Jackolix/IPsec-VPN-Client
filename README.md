@@ -24,6 +24,15 @@ container.
   never commit one, never log the `Secret` value. The only exceptions are the
   redacted test fixtures (`crates/*/tests/fixtures/*.redacted.*`), whose
   keys and addresses are replaced.
+- **This repository is public, so "redacted" means the customer too.** A
+  fixture, a doc example or a UI demo profile must carry no customer name, no
+  connection name, no IKE identity and no internal subnet from a real
+  deployment — not just no PSK and no gateway. The IKE identity is half of an
+  identity+PSK credential pair, and an internal subnet maps someone's network;
+  neither is ours to publish. Name fixtures for what they are
+  (`ncp_export.redacted.ini`), not for whose export they came from, and invent
+  the identifiers (`ACME_SITE_01`, `10.0.15.0/24`) rather than lightly
+  disguising the real ones.
 - Generated `*.swanctl.conf` files (in `out/`) contain the PSK too and are
   gitignored as well.
 - **Connect dials the gateway named in the profile.** The desktop app connects
