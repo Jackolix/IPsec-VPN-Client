@@ -28,7 +28,14 @@
   .app { height: 100vh; display: flex; flex-direction: column; }
 
   /* Custom titlebar: the native decoration is off (tauri.conf.json), so this
-     row is the drag region and carries its own window controls. */
+     row is the drag region and carries its own window controls.
+
+     macOS is the exception. There the window keeps its decoration and uses
+     titleBarStyle "Overlay" (tauri.macos.conf.json), so the real traffic
+     lights float over this same bar: the design is unchanged, but the window
+     controls are the system's, which is what a Mac user reaches for. The bar
+     just gets left padding so the brand does not sit underneath them, and the
+     Windows-style buttons are dropped. */
   .titlebar {
     display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 0 0 16px;
     background: linear-gradient(180deg,#16212f,#121b27); border-bottom: 1px solid var(--line-soft); flex: 0 0 auto;
@@ -47,6 +54,8 @@
   .win-btn:hover { background: rgba(255,255,255,.07); color: var(--text); }
   .win-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .win-btn.close:hover { background: #c42b1c; color: #fff; }
+  body.macos .win-controls { display: none; }
+  body.macos .titlebar { padding-left: 82px; }
   .win-btn .ic-restore { display: none; }
   body.maximized .win-btn .ic-restore { display: block; }
   body.maximized .win-btn .ic-max { display: none; }
@@ -626,10 +635,15 @@
 
   function sanitize(n) { var o = (n || "").replace(/[^A-Za-z0-9_-]/g, "_"); return o.length ? o : "conn"; }
 
-  // Name the OS credential store per platform, for user-facing copy.
+  // Platform flags. IS_MAC also drives the native window chrome further down.
   var IS_WIN = /Windows/.test(navigator.userAgent);
+  var IS_MAC = /Mac|iPhone|iPad/.test(navigator.userAgent);
+  // Platforms where the app owns a native daemon it can start and stop itself.
+  // Everything else (the Linux dev container) manages its own charon, and the
+  // app must not try to launch one.
+  var NATIVE_BACKEND = IS_WIN || IS_MAC;
   var KEYSTORE = IS_WIN ? "Windows Credential Manager"
-    : /Mac/.test(navigator.userAgent) ? "the macOS Keychain"
+    : IS_MAC ? "the macOS Keychain"
     : "the OS keychain";
 
   // Demo data used only when the page is opened outside the Tauri shell.
@@ -1790,12 +1804,19 @@
     log("NET", "virtual IP released, CHILD_SA removed");
   }
 
-  /* ---------- native backend (charon-svc) lifecycle ---------- */
-  // On Windows the app spawns strongSwan's native charon-svc itself (it needs
-  // Administrator for the Windows Filtering Platform, hence a UAC prompt); the
-  // Linux dev container manages its own charon, so the button is Windows-only.
+  /* ---------- native backend lifecycle ---------- */
+  // Windows and macOS both ship their own strongSwan daemon and the app owns
+  // its lifecycle: charon-svc.exe on Windows (elevated, since it drives the
+  // Windows Filtering Platform) and charon on macOS (root, for utun, routes
+  // and the virtual IP). Either way the button and the auto-start below apply.
+  //
+  // Whether that costs the user a prompt depends on the privileged helper: with
+  // it installed, starting and stopping are silent; without it the app falls
+  // back to a UAC / authorization prompt.
+  //
+  // The Linux dev container manages its own charon, so neither applies there.
   var daemonUp = false, daemonBusy = false;
-  var DAEMON_UI = TAURI && IS_WIN;
+  var DAEMON_UI = TAURI && NATIVE_BACKEND;
 
   function renderDaemon() {
     $("foot-led").className = "led" + (!TAURI ? "" : daemonUp ? " ok" : " warn");
@@ -1806,8 +1827,8 @@
     btn.style.display = "";
     btn.textContent = daemonBusy ? "…" : daemonUp ? "Stop" : "Start";
     btn.className = "btn-sm" + (daemonBusy ? " busy" : "");
-    btn.title = daemonUp ? "Stop charon-svc (elevation prompt)"
-      : "Start charon-svc on this host (elevation prompt)";
+    btn.title = daemonUp ? "Stop the VPN backend on this host"
+      : "Start the VPN backend on this host";
   }
 
   async function refreshDaemon() {
@@ -1820,13 +1841,16 @@
   async function ensureDaemon() {
     if (!TAURI) { return true; }
     await refreshDaemon();
-    if (daemonUp || !IS_WIN) { return daemonUp || !IS_WIN; }
-    log("KNL", "starting native backend charon-svc — approve the elevation prompt", "");
+    // Gated on NATIVE_BACKEND, not on Windows. macOS has its own native daemon
+    // now, and gating this on IS_WIN meant Connect silently skipped starting it
+    // and went straight to a vici socket nothing was listening on.
+    if (daemonUp || !NATIVE_BACKEND) { return daemonUp || !NATIVE_BACKEND; }
+    log("KNL", "starting the native VPN backend", "");
     daemonBusy = true; renderDaemon();
     try {
       await TAURI.invoke("start_daemon");
       daemonUp = true;
-      log("KNL", "charon-svc up; vici ready on the host", "good");
+      log("KNL", "backend up; vici ready on the host", "good");
     } catch (e) {
       log("KNL", "backend did not start: " + String(e), "bad");
       showNotice('<span class="led warn" style="box-shadow:none"></span><div>Native backend didn\'t start: ' + esc(String(e)) + "</div>", "bad");
@@ -1840,10 +1864,10 @@
     try {
       if (daemonUp) {
         await TAURI.invoke("stop_daemon"); daemonUp = false;
-        log("KNL", "charon-svc stopped", "");
+        log("KNL", "backend stopped", "");
       } else {
         await TAURI.invoke("start_daemon"); daemonUp = true;
-        log("KNL", "charon-svc up; vici ready on the host", "good");
+        log("KNL", "backend up; vici ready on the host", "good");
       }
     } catch (e) {
       log("KNL", String(e), "bad");
@@ -2043,10 +2067,18 @@
   });
   // Window controls for the undecorated window. Close goes through the normal
   // CloseRequested path, so it hides to the tray like the native X did.
+  //
+  // On macOS the window is decorated instead and the system traffic lights sit
+  // on top of this bar, so our own buttons are hidden and never wired up —
+  // minimise/zoom/close all come from the system. Detection is on the webview's
+  // user agent rather than a Tauri OS call, so it needs no extra plugin.
   (function () {
+    var isMac = IS_MAC;
+    if (isMac) { document.body.classList.add("macos"); }
     var wapi = window.__TAURI__ && window.__TAURI__.window;
     if (!wapi || !wapi.getCurrentWindow) { return; }
     var win = wapi.getCurrentWindow();
+    if (isMac) { return; }
     $("win-min").addEventListener("click", function () { win.minimize().catch(function () {}); });
     $("win-max").addEventListener("click", function () { win.toggleMaximize().catch(function () {}); });
     $("win-close").addEventListener("click", function () { win.close().catch(function () {}); });
