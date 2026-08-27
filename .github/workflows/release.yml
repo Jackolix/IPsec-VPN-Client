@@ -251,18 +251,24 @@ jobs:
       # vpn-desktop's build.rs runs tauri_build::build(), which validates that
       # every resource glob in tauri.macos.conf.json resolves — so out/helper
       # must exist before ANY build of that crate, tests included.
+      # Every cargo invocation in this job names the same --target as the
+      # bundle build below. Cargo gives an explicit --target its own directory
+      # even when it matches the host, so without this the tests and the CLIs
+      # build into target/release while `cargo tauri build --target ...` builds
+      # into target/aarch64-apple-darwin/release — compiling the whole workspace
+      # twice, and sharing nothing between them.
       - name: Build + stage the privileged helper
         run: |
-          cargo build --release -p vpn-broker
+          cargo build --release --target aarch64-apple-darwin -p vpn-broker
           mkdir -p out/helper
-          cp target/release/vpn-broker out/helper/
+          cp target/aarch64-apple-darwin/release/vpn-broker out/helper/
           ls -la out/helper
 
       - name: Run tests
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --target aarch64-apple-darwin
 
       - name: Build CLI binaries
-        run: cargo build --release -p vpn-agent -p vpn-cli
+        run: cargo build --release --target aarch64-apple-darwin -p vpn-agent -p vpn-cli
 
       - uses: cargo-bins/cargo-binstall@main
 
@@ -379,20 +385,25 @@ jobs:
       # still gets the "cannot be opened" dialog for an app that was notarised
       # perfectly well.
       #
-      # This verifies rather than hopes: if the app is not accepted by
-      # Gatekeeper here, it will not be accepted on a user's Mac either, and the
-      # release fails now instead of on their machine.
-      - name: Staple the notarisation ticket and verify Gatekeeper accepts it
+      # Tauri staples the .app itself, before it builds the dmg from it, so this
+      # VERIFIES that rather than redoing it — if a future version stops, the
+      # validate fails here rather than silently shipping an unstapled app. The
+      # dmg it only signs, so that one is stapled here.
+      #
+      # All of it is a gate, not a formality: if Gatekeeper does not accept the
+      # app on this runner it will not accept it on a user's Mac either, and the
+      # release should fail now rather than on their machine.
+      - name: Verify the notarisation ticket and that Gatekeeper accepts it
         run: |
           set -euo pipefail
           bundle=target/aarch64-apple-darwin/release/bundle
           app=$(find "$bundle/macos" -maxdepth 1 -name '*.app' | head -1)
           dmg=$(find "$bundle/dmg" -maxdepth 1 -name '*.dmg' | head -1)
-          [ -n "$app" ] || { echo "no .app was built" >&2; exit 1; }
+          # Requires "app" among bundle.targets. Without it Tauri treats the
+          # .app as an intermediate and deletes it once the dmg is built —
+          # which also means no updater artifact is produced at all.
+          [ -n "$app" ] || { echo "no .app was built — is \"app\" in bundle.targets?" >&2; exit 1; }
 
-          # The .app may already be stapled by the bundler; stapling twice is a
-          # no-op, so this is safe either way.
-          xcrun stapler staple "$app"
           xcrun stapler validate "$app"
 
           # Every nested Mach-O must carry the same signature, or the whole
@@ -400,14 +411,19 @@ jobs:
           # kept its ad-hoc signature.
           codesign --verify --deep --strict --verbose=2 "$app"
 
-          # The verdict a user's Mac will reach on first launch.
+          # The verdict a user's Mac reaches on first launch.
           spctl --assess --type execute --verbose=4 "$app"
 
-          if [ -n "$dmg" ]; then
-            xcrun stapler staple "$dmg"
-            xcrun stapler validate "$dmg"
-          fi
-          echo "== stapled and accepted =="
+          [ -n "$dmg" ] || { echo "no .dmg was built" >&2; exit 1; }
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
+          # The updater consumes these two, and the release job cannot build a
+          # manifest without them. Checked here, next to the cause.
+          tar=$(find "$bundle/macos" -maxdepth 1 -name '*.app.tar.gz' | head -1)
+          [ -n "$tar" ] || { echo "no .app.tar.gz — the updater artifact was not produced" >&2; exit 1; }
+          [ -f "$tar.sig" ] || { echo "no signature beside $tar" >&2; exit 1; }
+          echo "== stapled, accepted, and the updater artifact is present =="
 
       - name: Collect release assets
         run: |
@@ -477,7 +493,10 @@ jobs:
           # the broker service hooks, so it is what an update runs. macOS
           # updates consume the .app.tar.gz — never the .dmg.
           win=$(pick "*_${ver}_*-setup.exe")
-          mac=$(pick "*_${ver}_*.app.tar.gz")
+          # Not version-stamped, unlike every other bundle: Tauri names it after
+          # the product alone ("VPN-Client.app.tar.gz"), so matching on the
+          # version here would never find it.
+          mac=$(pick "*.app.tar.gz")
           [ -f "$win.sig" ] || { echo "no signature beside $win" >&2; exit 1; }
           [ -f "$mac.sig" ] || { echo "no signature beside $mac" >&2; exit 1; }
 
