@@ -27,3 +27,6 @@ crates/vpn-desktop/gen/
 
 # Native daemon build tree (sources + per-arch prefixes).
 /build/
+
+# Finder metadata. Uninteresting everywhere, and a dmg build leaves them behind.
+.DS_Store

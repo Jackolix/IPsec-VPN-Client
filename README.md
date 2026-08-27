@@ -327,6 +327,24 @@ offline user still sees "cannot be opened" for a perfectly notarised build. The
 job staples both and then runs `spctl --assess` — the same verdict a user's Mac
 reaches — so a release that would warn users fails in CI instead.
 
+The dmg gets a background image, the icon positions and the Applications drop
+link from `bundle.macOS.dmg` in `tauri.macos.conf.json`. Two things about that
+are worth knowing before touching it:
+
+* Tauri passes create-dmg `--skip-jenkins` whenever `CI` is set, which skips the
+  whole AppleScript that applies *all* of it. A locally built dmg would be
+  themed and every released one plain, silently. The build step sets
+  `TAURI_BUNDLER_DMG_IGNORE_CI=true` to opt out, and carries a
+  `timeout-minutes` because that AppleScript waits for Finder to write a
+  `.DS_Store` in a loop with no timeout of its own.
+* The background is a **multi-resolution TIFF**, not a PNG. Finder draws it at
+  natural pixel size, so a 660x400 PNG is soft on every Retina display;
+  `tiffutil -cathidpicheck` packs a 1x and a 2x image into one file and Finder
+  picks per display. `scripts/make-dmg-background.sh` regenerates
+  `crates/vpn-desktop/dmg/background.tiff` from a CoreGraphics drawing; the
+  output is committed, so a release never depends on redrawing it (and cannot
+  change because a system font did).
+
 **Windows** gets an **installer** (NSIS `*-setup.exe`
 and an MSI) that bundles the app, `charon-svc.exe` + its DLLs (installed to
 `<app>\charon\`) **and** the privileged broker (`vpn-broker.exe`), plus the

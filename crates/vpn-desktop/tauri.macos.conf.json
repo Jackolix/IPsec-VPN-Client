@@ -27,7 +27,13 @@
       "../../out/openvpn-macos/*": "openvpn/"
     },
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "dmg": {
+        "background": "dmg/background.tiff",
+        "windowSize": { "width": 660, "height": 400 },
+        "appPosition": { "x": 180, "y": 170 },
+        "applicationFolderPosition": { "x": 480, "y": 170 }
+      }
     }
   }
 }

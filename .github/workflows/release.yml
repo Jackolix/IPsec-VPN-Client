@@ -363,7 +363,17 @@ jobs:
       # user still gets the unidentified-developer dialog.
       - name: Build the app bundle (signed + notarised)
         working-directory: crates/vpn-desktop
+        # The dmg step below drives Finder through AppleScript, and if the
+        # runner's Finder ever stops answering it waits forever rather than
+        # failing (create-dmg loops until .DS_Store appears). Cap it so a stuck
+        # release fails in minutes instead of at the job timeout.
+        timeout-minutes: 45
         env:
+          # Tauri passes create-dmg --skip-jenkins whenever CI is set, which
+          # skips the AppleScript that applies the background image and the icon
+          # positions entirely — a locally built dmg would be themed and every
+          # released one plain. The runner does have a Finder, so opt out.
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -371,6 +381,25 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
         run: cargo tauri build --target aarch64-apple-darwin
+
+      # A dmg whose background never got applied still builds, signs and
+      # notarises perfectly — the failure is invisible until someone opens it.
+      # `--skip-jenkins` copies the image in and then skips the AppleScript that
+      # references it, so the file's presence proves nothing: the alias inside
+      # .DS_Store is the only thing that says Finder actually applied it.
+      - name: Check the dmg is themed
+        run: |
+          set -euo pipefail
+          dmg=$(find target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -1)
+          [ -n "$dmg" ] || { echo "no .dmg was built" >&2; exit 1; }
+          mnt=$(mktemp -d)
+          trap 'hdiutil detach "$mnt" -quiet -force || true' EXIT
+          hdiutil attach "$dmg" -nobrowse -readonly -quiet -mountpoint "$mnt"
+          [ -f "$mnt/.background/background.tiff" ] \
+            || { echo "the dmg has no background image" >&2; exit 1; }
+          strings "$mnt/.DS_Store" | grep -q background.tiff \
+            || { echo "the dmg background was never applied by Finder — did --skip-jenkins come back?" >&2; exit 1; }
+          echo "dmg background applied"
 
       # Tauri notarises the .app and staples it, then builds the dmg FROM the
       # stapled app and only signs that. So the dmg has no ticket of its own,
