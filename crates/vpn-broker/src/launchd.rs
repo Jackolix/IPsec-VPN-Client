@@ -1,0 +1,225 @@
+//! Install and remove the macOS LaunchDaemon.
+//!
+//! This is the counterpart of the Windows `install` module (which registers an
+//! SCM service). It runs *as root* — the app elevates it once with a single
+//! authorization prompt — and does four things:
+//!
+//!   1. copies the helper binary to /Library/PrivilegedHelperTools,
+//!   2. copies the charon tree out of the app bundle into
+//!      /Library/Application Support/dev.jackolix.ipsecvpn,
+//!   3. writes the launchd plist,
+//!   4. bootstraps the daemon.
+//!
+//! Step 2 is the security-critical one. launchd runs the helper as root and the
+//! helper execs charon as root, so neither may live in a directory an
+//! unprivileged user can write — and an app bundle is exactly that, sitting in
+//! ~/Applications or wherever it was dragged. Copying to a root-owned location
+//! and chowning to root:wheel 0755 is what makes "root runs this binary" safe.
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::protocol::{
+    MACOS_CHARON_DIR, MACOS_HELPER_BIN, MACOS_LABEL, MACOS_PLIST, MACOS_SUPPORT_DIR,
+};
+
+fn plist_contents() -> String {
+    // KeepAlive so a crashed helper comes back; RunAtLoad so it is up before
+    // the GUI asks for anything. The log goes to /var/log because /var/run is
+    // cleared on boot and launchd will not create a missing directory for it.
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{MACOS_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{MACOS_HELPER_BIN}</string>
+        <string>run</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/var/log/ipsec-vpn-helper.log</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// Copy `src` to `dst` and make it root-owned and non-writable by anyone else.
+fn install_root_owned(src: &Path, dst: &Path, mode: u32) -> Result<(), String> {
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    // Remove first: overwriting a running binary in place fails with ETXTBSY.
+    let _ = std::fs::remove_file(dst);
+    std::fs::copy(src, dst)
+        .map_err(|e| format!("cannot copy {} to {}: {e}", src.display(), dst.display()))?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("cannot set mode on {}: {e}", dst.display()))?;
+    chown_root(dst)
+}
+
+fn chown_root(path: &Path) -> Result<(), String> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| "path contains a NUL".to_string())?;
+    // 0:0 — root:wheel. Anything else and an unprivileged user could replace
+    // the binary that root is about to execute.
+    if unsafe { libc::chown(c.as_ptr(), 0, 0) } != 0 {
+        return Err(format!(
+            "cannot chown {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn copy_tree_root_owned(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
+    chown_root(dst)?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("cannot set mode on {}: {e}", dst.display()))?;
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let meta = entry.metadata().map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            copy_tree_root_owned(&from, &to)?;
+        } else {
+            // 0755 throughout: charon and its dylibs are all executable, and
+            // strongswan.conf being world-readable is harmless (it holds no
+            // secret — the PSK is pushed over vici, never written to disk).
+            install_root_owned(&from, &to, 0o755)?;
+        }
+    }
+    Ok(())
+}
+
+/// Install the helper and start it. `helper_src` is this binary, `charon_src`
+/// the `charon/` directory inside the app bundle. Must run as root.
+pub fn install(helper_src: &Path, charon_src: &Path) -> Result<String, String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("installing the helper needs root".to_string());
+    }
+    if !charon_src.join("charon").is_file() {
+        return Err(format!(
+            "no charon found at {} — build it with scripts/build-strongswan-macos.sh",
+            charon_src.display()
+        ));
+    }
+
+    // Stop an existing one first, so the binary is not busy and the new one is
+    // what comes back.
+    let _ = bootout();
+
+    install_root_owned(helper_src, Path::new(MACOS_HELPER_BIN), 0o755)?;
+    copy_tree_root_owned(charon_src, Path::new(MACOS_CHARON_DIR))?;
+
+    std::fs::write(MACOS_PLIST, plist_contents())
+        .map_err(|e| format!("cannot write {MACOS_PLIST}: {e}"))?;
+    std::fs::set_permissions(MACOS_PLIST, std::fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("cannot set mode on {MACOS_PLIST}: {e}"))?;
+    chown_root(Path::new(MACOS_PLIST))?;
+
+    // `bootstrap system` is the modern replacement for `launchctl load`.
+    let out = Command::new("/bin/launchctl")
+        .args(["bootstrap", "system", MACOS_PLIST])
+        .output()
+        .map_err(|e| format!("cannot run launchctl: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("launchctl bootstrap failed: {}", err.trim()));
+    }
+    Ok(format!("helper installed and started ({MACOS_LABEL})"))
+}
+
+/// Stop and remove the helper. Must run as root.
+pub fn uninstall() -> Result<String, String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("removing the helper needs root".to_string());
+    }
+    let _ = bootout();
+    let _ = std::fs::remove_file(MACOS_PLIST);
+    let _ = std::fs::remove_file(MACOS_HELPER_BIN);
+    let _ = std::fs::remove_dir_all(MACOS_SUPPORT_DIR);
+    Ok("helper removed".to_string())
+}
+
+fn bootout() -> Result<(), String> {
+    let out = Command::new("/bin/launchctl")
+        .args(["bootout", &format!("system/{MACOS_LABEL}")])
+        .output()
+        .map_err(|e| format!("cannot run launchctl: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Is the daemon registered with launchd?
+pub fn installed() -> bool {
+    Path::new(MACOS_PLIST).is_file() && Path::new(MACOS_HELPER_BIN).is_file()
+}
+
+/// The `charon/` directory inside the running app bundle, for [`install`].
+/// `Contents/MacOS/vpn-broker` → `Contents/Resources/charon`.
+pub fn bundled_charon_dir(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    for candidate in [
+        // Bundled: the helper ships at Contents/Resources/helper/vpn-broker and
+        // charon beside it at Contents/Resources/charon.
+        dir.join("../charon"),
+        // Contents/MacOS/<exe> -> Contents/Resources/charon.
+        dir.join("../Resources/charon"),
+        dir.join("charon"),
+        // Dev: target/release/vpn-broker -> repo/out/strongswan-macos, so the
+        // helper can be installed straight from a cargo build.
+        dir.join("../../out/strongswan-macos"),
+    ] {
+        if candidate.join("charon").is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plist_contents;
+
+    /// launchd silently ignores a malformed plist, which would present as "the
+    /// helper installed fine but never starts". Check it parses.
+    #[test]
+    fn the_generated_plist_is_valid() {
+        let dir = std::env::temp_dir().join("vpn-helper-plist-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.plist");
+        std::fs::write(&path, plist_contents()).unwrap();
+        let out = std::process::Command::new("/usr/bin/plutil")
+            .arg("-lint")
+            .arg(&path)
+            .output()
+            .expect("plutil");
+        assert!(
+            out.status.success(),
+            "plutil rejected the plist: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("/Library/PrivilegedHelperTools/"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
