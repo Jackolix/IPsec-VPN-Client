@@ -1838,13 +1838,18 @@
     $("foot-led").className = "led" + (!TAURI ? "" : daemonUp ? " ok" : " warn");
     $("foot-text").textContent = !TAURI ? "preview (no backend)"
       : daemonUp ? "charon · vici" : "backend stopped";
+    // Only Start is offered. There is no Stop: the backend coming down is not
+    // something a user wants on its own — it tears down every live tunnel with
+    // it — and a connect starts it anyway, so the button exists purely to
+    // recover a backend that failed to come up. Stopping it is a maintenance
+    // action, and lives with the CLI (scripts/run-charon-macos.sh --stop, or
+    // stopping the service on Windows).
     var btn = $("daemon-btn");
-    if (!DAEMON_UI) { btn.style.display = "none"; return; }
+    if (!DAEMON_UI || daemonUp) { btn.style.display = "none"; return; }
     btn.style.display = "";
-    btn.textContent = daemonBusy ? "…" : daemonUp ? "Stop" : "Start";
+    btn.textContent = daemonBusy ? "…" : "Start";
     btn.className = "btn-sm" + (daemonBusy ? " busy" : "");
-    btn.title = daemonUp ? "Stop the VPN backend on this host"
-      : "Start the VPN backend on this host";
+    btn.title = "Start the VPN backend on this host";
   }
 
   async function refreshDaemon() {
@@ -1938,13 +1943,8 @@
     if (daemonBusy) { return; }
     daemonBusy = true; renderDaemon();
     try {
-      if (daemonUp) {
-        await TAURI.invoke("stop_daemon"); daemonUp = false;
-        log("KNL", "backend stopped", "");
-      } else {
-        await TAURI.invoke("start_daemon"); daemonUp = true;
-        log("KNL", "backend up; vici ready on the host", "good");
-      }
+      await TAURI.invoke("start_daemon"); daemonUp = true;
+      log("KNL", "backend up; vici ready on the host", "good");
     } catch (e) {
       log("KNL", String(e), "bad");
       showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
@@ -2406,7 +2406,21 @@
   // Checked once at startup rather than polled: installing or removing the
   // helper goes through this window, and a launchd daemon does not come and go
   // on its own the way the backend can.
-  refreshHelper();
+  //
+  // On the very first run the helper is set up without being asked — it is
+  // meant to be the default, the way the Windows installer registers the broker
+  // service, not something to discover. The backend answers at most once per
+  // user, so declining is remembered; the strip and the sidebar row remain for
+  // anyone who changes their mind.
+  refreshHelper().then(function () {
+    if (!TAURI) { return; }
+    return TAURI.invoke("helper_setup_pending").then(function (pending) {
+      if (pending) {
+        log("KNL", "setting up the VPN helper so connecting won't ask for your password", "");
+        return doHelper(true);
+      }
+    }).catch(function () {});
+  });
   // Keep the backend indicator live (it can be started/stopped out-of-band).
   if (TAURI) { setInterval(function () { if (!daemonBusy) { refreshDaemon(); } }, 4000); }
 

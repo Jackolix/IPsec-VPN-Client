@@ -192,6 +192,13 @@ sudo ./target/release/vpn-broker install    # reports the datapaths it installed
 open "target/release/bundle/macos/VPN Client.app"
 ```
 
+The app sets the helper up on **first launch** — one authorization prompt, once
+— so it is the default rather than something to discover, the way the Windows
+installer registers the broker service. Declining is remembered; the strip under
+the titlebar and the sidebar row offer it again whenever you want. Once
+installed, launchd loads it at boot and it starts charon with it, so the backend
+is simply always running in the background.
+
 Without the helper everything still works, but each connect and disconnect
 raises an authorization prompt — charon needs root for utun, the virtual IP and
 routes, and so does `/etc/resolver`. To drive it by hand instead:

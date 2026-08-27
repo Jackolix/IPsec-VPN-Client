@@ -73,6 +73,24 @@ fn run_macos(cmd: Option<&str>) -> i32 {
             // A staged .ovpn holds a private key and its auth file holds a
             // password; a crash is exactly when those get orphaned.
             privileged::ssl_sweep();
+
+            // Bring charon up with the daemon, the way the Windows service
+            // supervises charon-svc as part of its own lifecycle. launchd loads
+            // this at boot, so the backend is simply always there: no "backend
+            // stopped" for a user to notice, and no start on the critical path
+            // of a connect.
+            //
+            // On its own thread, because it waits for the vici socket and the
+            // control socket must be accepting requests meanwhile. A failure is
+            // logged and left alone — a connect will ask for a start again, and
+            // that path reports the reason to the GUI.
+            std::thread::spawn(|| {
+                let resp = privileged::charon_start();
+                if !resp.ok {
+                    eprintln!("helper: could not start charon at load: {}", resp.msg);
+                }
+            });
+
             if let Err(e) = unix_ipc::serve(handler) {
                 eprintln!("helper: {e}");
                 return 1;
