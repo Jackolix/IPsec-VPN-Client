@@ -23,7 +23,8 @@
     "resources": {
       "../../out/strongswan-macos/*": "charon/",
       "../../out/strongswan-macos/etc/*": "charon/etc/",
-      "../../out/helper/*": "helper/"
+      "../../out/helper/*": "helper/",
+      "../../out/openvpn-macos/*": "openvpn/"
     },
     "macOS": {
       "minimumSystemVersion": "11.0"

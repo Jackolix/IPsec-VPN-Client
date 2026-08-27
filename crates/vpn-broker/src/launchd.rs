@@ -106,8 +106,18 @@ fn copy_tree_root_owned(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// Install the helper and start it. `helper_src` is this binary, `charon_src`
-/// the `charon/` directory inside the app bundle. Must run as root.
-pub fn install(helper_src: &Path, charon_src: &Path) -> Result<String, String> {
+/// the `charon/` directory inside the app bundle, and `openvpn_src` the
+/// `openvpn/` one when the SSL VPN datapath is staged. Must run as root.
+///
+/// openvpn is copied for exactly the same reason charon is: the helper runs it
+/// as root, so it must not live anywhere an unprivileged user can write. It is
+/// optional only so a build without the SSL datapath staged still installs a
+/// working IPsec helper.
+pub fn install(
+    helper_src: &Path,
+    charon_src: &Path,
+    openvpn_src: Option<&Path>,
+) -> Result<String, String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("installing the helper needs root".to_string());
     }
@@ -124,6 +134,11 @@ pub fn install(helper_src: &Path, charon_src: &Path) -> Result<String, String> {
 
     install_root_owned(helper_src, Path::new(MACOS_HELPER_BIN), 0o755)?;
     copy_tree_root_owned(charon_src, Path::new(MACOS_CHARON_DIR))?;
+    let mut datapaths = "IPsec".to_string();
+    if let Some(src) = openvpn_src {
+        copy_tree_root_owned(src, &Path::new(MACOS_SUPPORT_DIR).join("openvpn"))?;
+        datapaths.push_str(" + SSL");
+    }
 
     std::fs::write(MACOS_PLIST, plist_contents())
         .map_err(|e| format!("cannot write {MACOS_PLIST}: {e}"))?;
@@ -140,7 +155,7 @@ pub fn install(helper_src: &Path, charon_src: &Path) -> Result<String, String> {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("launchctl bootstrap failed: {}", err.trim()));
     }
-    Ok(format!("helper installed and started ({MACOS_LABEL})"))
+    Ok(format!("helper installed and started ({MACOS_LABEL}); datapaths: {datapaths}"))
 }
 
 /// Stop and remove the helper. Must run as root.
@@ -170,6 +185,23 @@ fn bootout() -> Result<(), String> {
 /// Is the daemon registered with launchd?
 pub fn installed() -> bool {
     Path::new(MACOS_PLIST).is_file() && Path::new(MACOS_HELPER_BIN).is_file()
+}
+
+/// The `openvpn/` directory staged beside the helper, for [`install`]. Same
+/// search as [`bundled_charon_dir`]; `None` when the SSL datapath is not built.
+pub fn bundled_openvpn_dir(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    for candidate in [
+        dir.join("../openvpn"),
+        dir.join("../Resources/openvpn"),
+        dir.join("openvpn"),
+        dir.join("../../out/openvpn-macos"),
+    ] {
+        if candidate.join("openvpn").is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// The `charon/` directory inside the running app bundle, for [`install`].

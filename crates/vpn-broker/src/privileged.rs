@@ -224,6 +224,128 @@ fn record_path(conn: &str) -> PathBuf {
     Path::new(RUN_DIR).join(format!("dns-{safe}.record"))
 }
 
+
+// ---- SSL VPN (OpenVPN) ----------------------------------------------------
+//
+// The Windows broker keeps an adapter *slot* per tunnel, because openvpn there
+// reuses an existing wintun adapter rather than making one, so concurrent
+// tunnels have to be handed distinct pre-created devices. macOS has none of
+// that: openvpn opens a fresh utun per process. So this registry is only a map
+// from connection name to running process — no slots to reserve, release, or
+// run out of.
+
+use crate::openvpn;
+use std::sync::{Mutex, OnceLock};
+
+struct SslEntry {
+    name: String,
+    tunnel: openvpn::Tunnel,
+}
+
+/// Live SSL tunnels. A `OnceLock` rather than state threaded through the
+/// handler because launchd owns this process's lifetime and there is exactly
+/// one registry in it.
+fn registry() -> &'static Mutex<Vec<SslEntry>> {
+    static REG: OnceLock<Mutex<Vec<SslEntry>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Drop tunnels whose process has exited, so a crashed openvpn does not keep
+/// a name reserved forever.
+fn prune(reg: &mut Vec<SslEntry>) {
+    // retain_mut: is_alive reaps the child, so it needs &mut.
+    reg.retain_mut(|e| e.tunnel.is_alive());
+}
+
+pub fn ssl_connect(
+    name: &str,
+    config: &str,
+    username: &str,
+    password: &str,
+    allow_full: bool,
+) -> Response {
+    // Reconnecting a name replaces that tunnel and leaves any other alone. Take
+    // it out and tear it down with the lock released — disconnect waits on the
+    // process, and a status query should not block behind it.
+    let old = {
+        let mut reg = registry().lock().unwrap();
+        prune(&mut reg);
+        reg.iter()
+            .position(|e| e.name == name)
+            .map(|i| reg.remove(i))
+    };
+    if let Some(old) = old {
+        old.tunnel.disconnect();
+    }
+
+    // slot 0: unused on macOS, where openvpn opens its own utun.
+    match openvpn::connect(config, username, password, 0, allow_full) {
+        Ok(tunnel) => {
+            let ip = tunnel.vpn_ip.clone().unwrap_or_default();
+            registry().lock().unwrap().push(SslEntry {
+                name: name.to_string(),
+                tunnel,
+            });
+            Response::ok(ip)
+        }
+        // Encoded as JSON so the GUI can show the short reason in its banner and
+        // openvpn's own log in the panel, rather than one wall of text.
+        Err(e) => Response::err(
+            serde_json::json!({ "reason": e.reason, "log": e.log }).to_string(),
+        ),
+    }
+}
+
+/// Tear down the tunnel called `name`, or every one of them when it is empty.
+pub fn ssl_disconnect(name: &str) -> Response {
+    let doomed: Vec<SslEntry> = {
+        let mut reg = registry().lock().unwrap();
+        if name.is_empty() {
+            std::mem::take(&mut *reg)
+        } else {
+            let mut out = Vec::new();
+            while let Some(i) = reg.iter().position(|e| e.name == name) {
+                out.push(reg.remove(i));
+            }
+            out
+        }
+    };
+    for entry in doomed {
+        entry.tunnel.disconnect();
+    }
+    Response::ok("")
+}
+
+pub fn ssl_status() -> Response {
+    let mut reg = registry().lock().unwrap();
+    prune(&mut reg);
+    let up: Vec<serde_json::Value> = reg
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name,
+                "ip": e.tunnel.vpn_ip.clone().unwrap_or_default(),
+                // What the gateway pushed: whether it took the default route,
+                // and the search domain it named.
+                "full": e.tunnel.pushed.full,
+                "domain": e.tunnel.pushed.domain.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+    drop(reg);
+    if up.is_empty() {
+        Response::ok("")
+    } else {
+        Response::ok(serde_json::Value::Array(up).to_string())
+    }
+}
+
+/// Remove any config and credential files left by a previous run of the helper
+/// — both carry secrets, and a crash is exactly when they get orphaned.
+pub fn ssl_sweep() {
+    openvpn::sweep_stale_configs();
+}
+
 #[cfg(test)]
 mod tests {
     use super::{record_path, safe_domain};

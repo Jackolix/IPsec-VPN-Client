@@ -8,7 +8,10 @@
 //! privilege boundary; keep it airtight.
 
 use crate::protocol::{Request, Response};
-use crate::{charon, ipc, nrpt, openvpn};
+use crate::{charon, ipc, nrpt};
+// openvpn now lives in the lib, shared with the macOS helper, so it is reached
+// through the crate rather than as a sibling bin module.
+use vpn_broker::openvpn;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Child;
