@@ -11,6 +11,7 @@ mod creds;
 mod daemon;
 mod deeplink;
 mod dns;
+mod helper;
 mod overrides;
 mod portal;
 mod ssl;
@@ -488,6 +489,12 @@ fn dev(args: &[String]) {
         }
         Some("reset-edit") => backend::reset_profile_edit(&state, args.get(1).cloned().unwrap_or_default())
             .map(|_| "reset".to_string()),
+        Some("helper-install") => helper::install(),
+        Some("helper-uninstall") => helper::uninstall(),
+        Some("helper-status") => {
+            let (installed, reachable) = helper::status();
+            Ok(format!("installed: {installed}, reachable: {reachable}"))
+        }
         Some("daemon-start") => backend::daemon_start(&state).map(|_| "started".to_string()),
         Some("daemon-stop") => backend::daemon_stop(&state).map(|_| "stopped".to_string()),
         Some("save-creds") => {
