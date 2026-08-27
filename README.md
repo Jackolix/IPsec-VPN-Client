@@ -286,8 +286,21 @@ it builds, but those are plain `resources` copied in carrying only the ad-hoc
 signature the build scripts gave them, and notarisation rejects a bundle whose
 nested Mach-O files are not all signed the same way. Secrets:
 `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
-`APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` — the last three together are what
-make Tauri actually notarise rather than only sign.
+plus an App Store Connect API key for notarising: `APPLE_API_ISSUER`,
+`APPLE_API_KEY` (the Key ID) and `APPLE_API_KEY_P8` (the `.p8`, base64-encoded).
+
+Signing and notarising need different credentials because they are different
+operations: signing is offline cryptography, while notarising uploads the build
+to Apple and is an authenticated API call. An API key is used rather than an
+Apple ID and app-specific password because it belongs to the team rather than a
+person — revocable on its own, and it does not stop working when someone changes
+their password or leaves.
+
+Notarising is also not the last step. The ticket it issues has to be **stapled**
+to the app and the dmg, or Gatekeeper has to reach Apple on first launch and an
+offline user still sees "cannot be opened" for a perfectly notarised build. The
+job staples both and then runs `spctl --assess` — the same verdict a user's Mac
+reaches — so a release that would warn users fails in CI instead.
 
 **Windows** gets an **installer** (NSIS `*-setup.exe`
 and an MSI) that bundles the app, `charon-svc.exe` + its DLLs (installed to

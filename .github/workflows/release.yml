@@ -276,11 +276,23 @@ jobs:
         env:
           KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          API_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
           [ -n "$KEY" ] || { echo "TAURI_SIGNING_PRIVATE_KEY is not set — the bundle cannot be signed for the updater. See README, 'Updating the app'." >&2; exit 1; }
           # Gatekeeper blocks an unsigned app on any machine but the one that
           # built it, so a release without a Developer ID is not shippable.
           [ -n "$CERT" ] || { echo "APPLE_CERTIFICATE is not set — the app would not pass Gatekeeper on any other Mac." >&2; exit 1; }
+          # Signing is offline; notarising is an authenticated call to Apple, so
+          # it needs a credential of its own. Without these the app is signed but
+          # never submitted, and every user still gets the unidentified-developer
+          # dialog — a failure that only shows up on someone else's Mac.
+          # Named explicitly rather than derived from the variable, so the
+          # message points at the secret you actually have to go and set.
+          [ -n "$API_KEY" ]    || { echo "APPLE_API_KEY is not set — the app would be signed but not notarised." >&2; exit 1; }
+          [ -n "$API_ISSUER" ] || { echo "APPLE_API_ISSUER is not set — the app would be signed but not notarised." >&2; exit 1; }
+          [ -n "$API_P8" ]     || { echo "APPLE_API_KEY_P8 is not set — the app would be signed but not notarised." >&2; exit 1; }
 
       # Notarisation staples the whole bundle, and every Mach-O inside it has to
       # carry the same Developer ID signature with the hardened runtime. Tauri
@@ -319,19 +331,46 @@ jobs:
           echo "== signed =="
           ls -la out/strongswan-macos out/openvpn-macos out/helper
 
-      # APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID together are what make Tauri
-      # notarise; without them it signs but does not submit, and Gatekeeper
-      # still shows the "unidentified developer" prompt on first launch.
+      # notarytool takes the key as a FILE, so the secret (which holds the .p8
+      # base64-encoded) has to be materialised. Into RUNNER_TEMP rather than the
+      # workspace, so it cannot be picked up by an artifact upload, and 0600
+      # because it is a private key. Removed again below, whatever happens.
+      - name: Stage the App Store Connect API key
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          umask 077
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$path"
+          # A truncated or mis-encoded secret fails deep inside notarytool with
+          # an unhelpful message; check the shape here instead.
+          head -1 "$path" | grep -q 'BEGIN PRIVATE KEY' \
+            || { echo "APPLE_API_KEY_P8 did not decode to a PEM private key — check it is the base64 of the .p8 file." >&2; exit 1; }
+          echo "APPLE_API_KEY_PATH=$path" >> "$GITHUB_ENV"
+
+      # An App Store Connect API key rather than an Apple ID: it is not tied to
+      # a person, is revocable on its own, and does not stop working when
+      # someone changes their password or leaves. These three together are what
+      # make Tauri notarise; without them it signs but never submits, and every
+      # user still gets the unidentified-developer dialog.
       - name: Build the app bundle (signed + notarised)
         working-directory: crates/vpn-desktop
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
         run: cargo tauri build --target aarch64-apple-darwin
+
+      # The key outlives the build step otherwise, and a later failure would
+      # leave a private key on the runner image.
+      - name: Remove the API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8
 
       # Notarisation alone is not enough for a clean install. It records the
       # approval on Apple's servers; STAPLING attaches the ticket to the file
