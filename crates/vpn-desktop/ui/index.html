@@ -233,6 +233,14 @@
   .update-bar .ub-text { flex: 1; min-width: 0; }
   .update-bar .ub-sub { color: var(--muted); }
   .update-bar b { font-family: var(--mono); }
+  /* Helper strip: same shape and placement as the update strip, because it is
+     the same kind of message — a one-time action worth interrupting for. Shown
+     only on macOS, and only until the helper is installed. */
+  .helper-bar { display: none; align-items: center; gap: 12px; flex: 0 0 auto; padding: 9px 16px;
+    font-size: var(--fs-sm); color: #bcd9ff; background: var(--accent-soft); border-bottom: 1px solid var(--accent-line); }
+  .helper-bar.show { display: flex; }
+  .helper-bar.bad { color: #f0a996; background: var(--crit-soft); border-bottom-color: rgba(240,96,58,.4); }
+  .helper-bar .hb-text { flex: 1; min-width: 0; }
   .ub-progress { flex: 0 0 150px; height: 5px; border-radius: 3px; background: rgba(0,0,0,.35); overflow: hidden; }
   .ub-fill { height: 100%; width: 0; background: var(--accent); transition: width .18s linear; }
   .side-version { padding: 0 16px 11px; font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint);
@@ -370,6 +378,13 @@
     <button id="ub-later" class="btn btn-ghost btn-sm">Later</button>
   </div>
 
+  <div class="helper-bar" id="helper-bar" role="status">
+    <span class="led warn" style="box-shadow:none" aria-hidden="true"></span>
+    <div class="hb-text" id="hb-text"></div>
+    <button id="hb-install" class="btn btn-primary btn-sm">Install helper</button>
+    <button id="hb-later" class="btn btn-ghost btn-sm">Not now</button>
+  </div>
+
   <div class="body">
     <aside class="sidebar">
       <div class="side-head"><h2>Profiles</h2><button class="btn-import" id="import-btn">+ Import profile</button></div>
@@ -379,6 +394,7 @@
       </div>
       <ul class="profiles" id="profile-list"></ul>
       <div class="side-foot"><span id="foot-led" class="led"></span><span id="foot-text">connecting to vici…</span><button id="daemon-btn" class="btn-sm" style="display:none">Start</button></div>
+      <div class="side-version" id="side-helper" style="display:none"><span id="sh-text">helper</span><span class="spacer"></span><button type="button" id="sh-action">Install</button></div>
       <div class="side-version"><span>v<span id="app-version">—</span></span><span class="spacer"></span><button type="button" id="check-update">Check for updates</button></div>
     </aside>
 
@@ -1858,6 +1874,66 @@
     return daemonUp;
   }
 
+  /* ---------- privileged helper ---------- */
+  // Without it every connect and disconnect raises an authorization prompt:
+  // charon needs root for utun, the virtual IP and routes, and so does
+  // /etc/resolver. Installing it costs one prompt, once. macOS only — Windows
+  // registers its broker from the installer, and Linux has no helper.
+  var helperState = { supported: false, installed: false, reachable: false };
+  var helperBusy = false;
+
+  async function refreshHelper() {
+    if (!TAURI) { return; }
+    try { helperState = await TAURI.invoke("helper_status"); }
+    catch (e) { helperState = { supported: false, installed: false, reachable: false }; }
+    renderHelper();
+  }
+
+  function renderHelper() {
+    var row = $("side-helper");
+    var bar = $("helper-bar");
+    if (!helperState.supported) { row.style.display = "none"; bar.className = "helper-bar"; return; }
+
+    // Sidebar row: always present on macOS, so the state is visible and the
+    // install is reachable again after the strip has been dismissed.
+    row.style.display = "";
+    var ok = helperState.installed && helperState.reachable;
+    $("sh-text").textContent = helperBusy ? "helper · working…"
+      : ok ? "helper · active"
+      : helperState.installed ? "helper · not responding" : "helper · not installed";
+    var act = $("sh-action");
+    act.textContent = ok ? "Remove" : "Install";
+    act.disabled = helperBusy;
+
+    // The strip only nags while there is something to fix, and only until it
+    // is dismissed for this run.
+    if (ok || helperDismissed) { bar.className = "helper-bar"; return; }
+    $("hb-text").innerHTML = helperState.installed
+      ? "The VPN helper is installed but not responding. Reinstall it to stop connect and disconnect prompting."
+      : "Install the VPN helper so connecting and disconnecting stop asking for your password. It needs your password once.";
+    bar.className = "helper-bar show";
+  }
+  var helperDismissed = false;
+
+  async function doHelper(install) {
+    if (helperBusy) { return; }
+    helperBusy = true; renderHelper();
+    try {
+      var msg = await TAURI.invoke(install ? "install_helper" : "uninstall_helper");
+      log("KNL", String(msg), install ? "good" : "");
+      helperDismissed = false;
+    } catch (e) {
+      log("KNL", "helper: " + String(e), "bad");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+    } finally {
+      helperBusy = false;
+      await refreshHelper();
+      // Installing the helper changes who owns charon, so the footer's
+      // Start/Stop state can be stale afterwards.
+      await refreshDaemon();
+    }
+  }
+
   async function onDaemonBtn() {
     if (daemonBusy) { return; }
     daemonBusy = true; renderDaemon();
@@ -2094,6 +2170,13 @@
     win.onResized(syncMax).catch(function () {});
     syncMax();
   })();
+  $("hb-install").addEventListener("click", function () { doHelper(true); });
+  $("hb-later").addEventListener("click", function () {
+    helperDismissed = true; renderHelper();
+  });
+  $("sh-action").addEventListener("click", function () {
+    doHelper(!(helperState.installed && helperState.reachable));
+  });
   $("cpick-btn").addEventListener("click", function () { cpickOpen ? closeCpick() : openCpick(); });
   $("cpick-search").addEventListener("input", function (e) {
     cpickQuery = e.target.value.trim(); cpickHi = 0; renderCompactSelect();
@@ -2320,6 +2403,10 @@
 
   renderDaemon();
   refreshDaemon();
+  // Checked once at startup rather than polled: installing or removing the
+  // helper goes through this window, and a launchd daemon does not come and go
+  // on its own the way the backend can.
+  refreshHelper();
   // Keep the backend indicator live (it can be started/stopped out-of-band).
   if (TAURI) { setInterval(function () { if (!daemonBusy) { refreshDaemon(); } }, 4000); }
 
