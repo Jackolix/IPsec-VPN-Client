@@ -31,6 +31,29 @@
     "active": true,
     "targets": ["app", "nsis", "msi", "deb", "appimage", "dmg"],
     "createUpdaterArtifacts": true,
+    "fileAssociations": [
+      {
+        "ext": ["scx"],
+        "name": "VPN Client.scx",
+        "description": "Sophos Connect VPN profile",
+        "role": "Viewer",
+        "mimeType": "application/x-sophos-vpn-profile"
+      },
+      {
+        "ext": ["tgb"],
+        "name": "VPN Client.tgb",
+        "description": "Sophos VPN profile (legacy)",
+        "role": "Viewer",
+        "mimeType": "application/x-sophos-vpn-profile"
+      },
+      {
+        "ext": ["pro"],
+        "name": "VPN Client.pro",
+        "description": "Sophos VPN provisioning file",
+        "role": "Viewer",
+        "mimeType": "application/x-sophos-vpn-provisioning"
+      }
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

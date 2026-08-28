@@ -2794,9 +2794,11 @@
       ubShow("Downloaded — verifying the signature, then starting the installer. The app will close and reopen.");
     });
     EVT.listen("drag-active", function (e) { $("dropzone").classList.toggle("show", !!e.payload); });
-    EVT.listen("profiles-changed", function (e) {
+    // Profiles that just landed on disk: a drag-and-drop onto the window, or a
+    // file the OS opened with this app.
+    function profilesImported(ids) {
       $("dropzone").classList.remove("show");
-      var ids = (e && e.payload) || [];
+      ids = ids || [];
       refresh().then(function () {
         if (ids.length) {
           var p = profiles.filter(function (x) { return x.id === ids[0]; })[0];
@@ -2804,7 +2806,8 @@
         }
         showNotice('<span class="led ok" style="box-shadow:none"></span><div>Imported ' + ids.length + ' profile' + (ids.length === 1 ? "" : "s") + ".</div>", "");
       });
-    });
+    }
+    EVT.listen("profiles-changed", function (e) { profilesImported(e && e.payload); });
     // A drop that imported nothing reports why here, instead of looking dead.
     EVT.listen("import-error", function (e) {
       $("dropzone").classList.remove("show");
@@ -2841,11 +2844,14 @@
       $("dropzone").classList.remove("show");
       if (e && e.payload) { handleProvisioning(e.payload); }
     });
-    // A link that launched the app was staged before this web view existed, so
-    // it could not have been emitted at anything — collect it here instead.
+    // A link — or a profile file — that launched the app was dealt with before
+    // this web view existed, so nothing could have been emitted at it. Collect
+    // it here instead. This call is also what tells the backend the listeners
+    // above are attached, so everything after it arrives as an event.
     TAURI.invoke("take_link_request").then(function (req) {
       if (!req) { return; }
       if (req.kind === "confirm") { return handleLinkImport(req); }
+      if (req.kind === "imported") { return profilesImported(req.ids); }
       if (req.kind === "provisioning") { return handleProvisioning(req); }
       showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(req.message || "that link could not be imported")) + "</div>", "bad");
     }).catch(function () {});

@@ -28,6 +28,57 @@
                        Value="registered-by-installer"
                        KeyPath="yes" />
       </Component>
+
+      <!-- Offer the app for `.ini` without claiming the extension.
+
+           The `.scx`, `.tgb` and `.pro` associations come from
+           bundle.fileAssociations, which the WiX template turns into advertised
+           ProgIds that own those extensions outright. `.ini` is Windows' generic
+           settings-file extension, so it only gets an OpenWithProgids entry
+           here: the app appears in Explorer's "Open with" list (and can be made
+           the default by the user), while the system default is left alone.
+           installer-hooks.nsh does the same thing for the NSIS installer, down
+           to the ProgID name.
+
+           The executable is named through `[INSTALLDIR]`, as the broker's custom
+           actions below do. A `[#Path]` file reference would be tidier — that is
+           the File id Tauri's template gives the main binary — but it fails
+           ICE69: this component lives in its own feature, and a formatted string
+           may not reference a file belonging to another one. So `vpn-desktop.exe`
+           (Tauri's mainBinaryName for this crate) is spelled out, and tracks the
+           crate's binary name by hand.
+
+           Win64 so the values land in the real HKLM\Software\Classes rather than
+           being redirected into Wow6432Node. -->
+      <Component Id="ProfileFileTypes" Guid="a44a4b86-24a8-42f5-bd0b-f200781f163d" Win64="yes">
+        <RegistryKey Root="HKLM" Key="Software\Classes\VPN Client.ini">
+          <RegistryValue Type="string" Value="NCP VPN profile" KeyPath="yes" />
+          <RegistryValue Name="FriendlyTypeName" Type="string" Value="NCP VPN profile" />
+        </RegistryKey>
+        <RegistryValue Root="HKLM" Key="Software\Classes\VPN Client.ini\DefaultIcon"
+                       Type="string" Value="[INSTALLDIR]vpn-desktop.exe,0" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\VPN Client.ini\shell"
+                       Type="string" Value="open" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\VPN Client.ini\shell\open"
+                       Type="string" Value="Open with [ProductName]" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\VPN Client.ini\shell\open\command"
+                       Type="string" Value="&quot;[INSTALLDIR]vpn-desktop.exe&quot; &quot;%1&quot;" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.ini\OpenWithProgids"
+                       Name="VPN Client.ini" Type="string" Value="" />
+
+        <!-- The same offer from the application's own side, which is what lists
+             it under "Open with" for every profile format it reads. The
+             executable's name is part of the key here too. -->
+        <RegistryKey Root="HKLM" Key="Software\Classes\Applications\vpn-desktop.exe">
+          <RegistryValue Name="FriendlyAppName" Type="string" Value="[ProductName]" />
+          <RegistryValue Key="shell\open\command" Type="string"
+                         Value="&quot;[INSTALLDIR]vpn-desktop.exe&quot; &quot;%1&quot;" />
+          <RegistryValue Key="SupportedTypes" Name=".ini" Type="string" Value="" />
+          <RegistryValue Key="SupportedTypes" Name=".scx" Type="string" Value="" />
+          <RegistryValue Key="SupportedTypes" Name=".tgb" Type="string" Value="" />
+          <RegistryValue Key="SupportedTypes" Name=".pro" Type="string" Value="" />
+        </RegistryKey>
+      </Component>
     </ComponentGroup>
 
     <!-- `install` creates the auto-start LocalSystem service and starts it, so no

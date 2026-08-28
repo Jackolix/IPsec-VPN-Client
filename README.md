@@ -50,7 +50,7 @@ container.
 | `crates/sophos-profile` | Sophos importers: `.scx` (Sophos Connect — JSON, close to a serialised swanctl connection), `.tgb` (legacy Cyberoam/TheGreenBow — ini-shaped, IKEv1, algorithms reached through a chain of section references) and `.pro` (a pointer to a user portal, not a connection). Same policy as the NCP importer: hard error on anything safety-critical it cannot map, warning on anything merely unconfirmed. |
 | `crates/vici` | Hand-rolled client for strongSwan's vici control protocol: a cross-platform message codec plus packet framing and a blocking request/event client (Unix and TCP transports). |
 | `crates/vpn-control` | Shared connection logic used by both the CLI and the GUI: the config→vici bridge, `list-sa` status parsing, and the connect/status/disconnect flows over a `Transport` (Unix socket or TCP). `connect_logged` registers for charon's `log` event around `initiate` and returns the captured handshake transcript. |
-| `crates/vpn-desktop` | Tauri desktop app. Rust backend interprets profiles natively and calls `vpn-control`; the web UI (`ui/`) drives it via `invoke`. Native file-picker + drag-drop import, system tray, DNS-over-tunnel (NRPT), PSK in the OS keychain (`src/creds.rs`, `keyring`) taking precedence over the plaintext `.ini`. Hosts behind the tunnel (`src/hosts.rs`) with an unprivileged reachability check on both platforms (`src/reach.rs`) — see *Hosts and equipment*. Run headlessly with `--selftest`; drive the backend flows with `--dev <cmd>`. |
+| `crates/vpn-desktop` | Tauri desktop app. Rust backend interprets profiles natively and calls `vpn-control`; the web UI (`ui/`) drives it via `invoke`. Native file-picker, drag-drop and file-association import, system tray, DNS-over-tunnel (NRPT), PSK in the OS keychain (`src/creds.rs`, `keyring`) taking precedence over the plaintext `.ini`. Hosts behind the tunnel (`src/hosts.rs`) with an unprivileged reachability check on both platforms (`src/reach.rs`) — see *Hosts and equipment*. Run headlessly with `--selftest`; drive the backend flows with `--dev <cmd>`. |
 | `crates/vpn-broker` | The privileged helper, on both platforms. **Windows**: a LocalSystem **service** that supervises `charon-svc.exe` and applies/reverts NRPT DNS rules for the unelevated GUI over an ACL'd named pipe (`src/ipc.rs`), registered by the installer. **macOS**: a launchd **LaunchDaemon** (`src/launchd.rs`) serving the same requests over a Unix socket (`src/unix_ipc.rs`), doing charon's lifecycle and `/etc/resolver` DNS (`src/privileged.rs`). The `protocol` is shared because the shape is (one request, one response, newline JSON); `src/openvpn.rs`, the SSL VPN supervisor, is shared too — only its adapter handling is Windows-specific. On both, the GUI falls back to an elevation prompt when the helper isn't installed. |
 | `crates/vpn-agent` | CLI agent over `vpn-control`: imports a profile and drives charon (`connect` / `status` / `disconnect`). The PSK is pushed via `load-shared` in memory — no swanctl.conf with the secret is written to disk. |
 | `crates/vpn-cli` | Phase 0 CLI: `show` (redacted interpretation) and `generate` (writes swanctl.conf). Kept for inspection/debugging. |
@@ -654,6 +654,29 @@ Two limits worth knowing: the list is IPv4-only, matching the rest of the config
 model, and SSL VPN profiles have no host list — an OpenVPN tunnel's routes are
 pushed by the gateway at connect time, so there are no traffic selectors to say
 whether a host is carried.
+
+## Opening a profile from the file manager
+
+A profile does not have to be dragged onto the window: the installer tells the
+OS that this app reads VPN profiles, so double-clicking one imports it.
+
+| Extension | Registered as | Why |
+| --- | --- | --- |
+| `.scx`, `.tgb`, `.pro` | the default handler | They belong to a VPN client or to nothing at all. Where Sophos Connect is installed, `.scx` is its (`sc.ScxDocument.1`) and this takes it over — the installer saves the previous handler and restores it on uninstall. |
+| `.ini` | an "Open with" entry only | `.ini` is Windows' generic settings-file extension. Claiming it would repaint every `.ini` on the machine and route them all here; the app is offered for one instead, and the user can promote it to the default themselves. |
+
+Windows and Linux start the app with the file's path on the command line — a
+cold start, or a second launch that the single-instance plugin folds into the
+running one; macOS raises an `Opened` event instead. All three land in
+`fileopen.rs`, which imports the file exactly as a drag-and-drop does: the user
+picked it out of their own file system, so it needs no confirmation dialog (a
+profile arriving from a web page does — see below). A `.pro` opens the portal
+sign-in, and a file that is not a profile reports why.
+
+The full associations come from `bundle.fileAssociations` in `tauri.conf.json`;
+the `.ini` offer is written by `installer-hooks.nsh` (NSIS) and `installer.wxs`
+(MSI), which also correct the unquoted `open` command Tauri's own association
+macro emits — every path this app installs to has a space in it.
 
 ## Importing from the web (`itmvpn://` links)
 

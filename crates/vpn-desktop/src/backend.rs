@@ -432,6 +432,23 @@ fn profile_path(state: &AppState, id: &str) -> PathBuf {
         .unwrap_or_else(|| state.profile_dir.join(format!("{id}.ini")))
 }
 
+/// Is this a file the app can be handed for import — a profile, or the `.pro`
+/// that names a portal to fetch one from? What the file picker offers, what a
+/// drag-and-drop accepts, and what the OS may open with this app all come down
+/// to this.
+///
+/// The provisioning extension is in here so that a `.pro` reaches the importer
+/// and gets its explanation from `parse_text`, rather than a flat "unsupported
+/// file type".
+pub fn is_importable_path(path: &std::path::Path) -> bool {
+    is_profile_extension(path)
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("pro"))
+            .unwrap_or(false)
+}
+
 /// Is this a file extension we import profiles from?
 fn is_profile_extension(path: &std::path::Path) -> bool {
     path.extension()
@@ -562,15 +579,7 @@ pub fn profiles_dir(state: &AppState) -> String {
 /// A Sophos `.pro` is refused here on purpose: it holds no connection, and
 /// storing it would put an entry in the list that can never be connected.
 pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Result<String, String> {
-    // Accept the provisioning extension so the file gets the explanation from
-    // `parse_text` rather than a flat "unsupported file type".
-    let known = is_profile_extension(src)
-        || src
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pro"))
-            .unwrap_or(false);
-    if !known {
+    if !is_importable_path(src) {
         return Err(format!(
             "only {} profiles can be imported",
             PROFILE_EXTENSIONS
@@ -709,31 +718,41 @@ struct PendingImport {
     text: String,
 }
 
-/// Everything an `itmvpn://` link left behind for the UI to act on.
+/// Everything that arrived from outside the window — an `itmvpn://` link or a
+/// profile file the shell opened — waiting for the UI to act on it.
 #[derive(Default)]
 struct Staged {
-    /// A request the window has not been told about yet. A link that *launched*
-    /// the app is staged before the web view has attached its event listeners,
-    /// so it would miss an emitted event; it collects the request from here
-    /// instead, once, on load ([`take_link_request`]).
+    /// A request the window has not been told about yet. Anything that
+    /// *launched* the app lands before the web view has attached its event
+    /// listeners, so it would miss an emitted event; it collects the request
+    /// from here instead, once, on load ([`take_link_request`]).
     undelivered: Option<LinkRequest>,
     /// The profile itself, held until it is confirmed or declined.
     profile: Option<PendingImport>,
+    /// Set by the web view's first [`take_link_request`], which it calls on load.
+    /// Until then an emitted event has nobody listening for it, so a request has
+    /// to be parked instead — see [`ui_ready`].
+    ui_ready: bool,
 }
 
-/// What a deep link turned out to be asking for.
+/// What something handed to the app from outside the window — a deep link, or a
+/// profile file opened from the shell — turned out to be asking for.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum LinkRequest {
     /// A profile is staged; the UI shows this and calls [`commit_link_import`]
-    /// if the user agrees.
+    /// if the user agrees. Only deep links stage: a file the user opened from
+    /// the shell is theirs already and lands directly, as `Imported`.
     Confirm(ImportPreview),
-    /// The link carried a `.pro`, which names a portal rather than holding a
+    /// Profiles that are already on disk — a file opened from the shell, which
+    /// needs no confirmation. Carries the ids so the UI can select the new one.
+    Imported { ids: Vec<String> },
+    /// The link or file was a `.pro`, which names a portal rather than holding a
     /// connection — the same sign-in the GUI runs for a dropped `.pro`.
     Provisioning { url: String, name: String, otp: bool },
-    /// The link was malformed or carried something that is not a profile. Kept
-    /// as a request of its own so a link that launched the app can still explain
-    /// itself once the window is up, instead of the launch looking like nothing
+    /// The link was malformed, or the file was not a profile. Kept as a request
+    /// of its own so something that launched the app can still explain itself
+    /// once the window is up, instead of the launch looking like nothing
     /// happened.
     Failed { message: String },
 }
@@ -903,9 +922,19 @@ pub fn defer_link_request(state: &AppState, request: LinkRequest) {
     pending_slot(state).undelivered = Some(request);
 }
 
-/// Hand the window whatever a link left for it, once.
+/// Hand the window whatever a link (or an opened file) left for it, once. Also
+/// marks the web view as listening: it calls this on load, so everything after
+/// it can be emitted rather than parked.
 pub fn take_link_request(state: &AppState) -> Option<LinkRequest> {
-    pending_slot(state).undelivered.take()
+    let mut slot = pending_slot(state);
+    slot.ui_ready = true;
+    slot.undelivered.take()
+}
+
+/// Has the web view attached its event listeners yet? Until it has, a request
+/// must be parked with [`defer_link_request`] instead of emitted.
+pub fn ui_ready(state: &AppState) -> bool {
+    pending_slot(state).ui_ready
 }
 
 /// Write the staged profile out — the user said yes. `token` is the one the

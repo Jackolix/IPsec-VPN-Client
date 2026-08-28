@@ -11,6 +11,7 @@ mod creds;
 mod daemon;
 mod deeplink;
 mod dns;
+mod fileopen;
 mod helper;
 mod hosts;
 mod overrides;
@@ -771,8 +772,11 @@ fn main() {
     with_app_menu(tauri::Builder::default())
         // Must be the first plugin registered: a second launch hands off to
         // this instance (focusing its window) instead of opening a duplicate.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            tray::reveal(app);
+        // A second launch is also how the shell opens a profile file when this
+        // app is already running, so its arguments are worth reading before the
+        // window comes forward.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            fileopen::second_instance(app, argv, cwd);
         }))
         .plugin(tauri_plugin_dialog::init())
         // Registered after single-instance, whose `deep-link` feature hands a
@@ -822,6 +826,10 @@ fn main() {
             tray::build(app.handle())?;
             update::watch(app.handle());
             deeplink::watch(app.handle());
+            // A profile file the shell started this launch to open. Parked here
+            // and collected by the web view on load, like a link that launched
+            // the app.
+            fileopen::watch(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -879,8 +887,17 @@ fn main() {
             }
             _ => {}
         })
-        .run(tauri::generate_context!())
-        .expect("error while running the VPN Client");
+        .build(tauri::generate_context!())
+        .expect("error while building the VPN Client")
+        // Built rather than run outright, only so this closure exists: macOS
+        // delivers a file opened from Finder as an event here, where Windows and
+        // Linux pass it on the command line.
+        .run(|_app, _event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = &_event {
+                fileopen::opened(_app, urls);
+            }
+        });
 }
 
 /// System-tray icon + menu, so the app keeps running (and the tunnel stays up)

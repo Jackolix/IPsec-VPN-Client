@@ -151,14 +151,14 @@ pub fn watch(app: &tauri::AppHandle) {
     // setup — before this listener could exist — so the cold-start case has to
     // be picked up from `get_current` rather than from the event. It is also too
     // early to emit anything: the web view has not attached its listeners yet,
-    // so that request is parked for the UI to collect on load instead.
+    // so `deliver` parks that request for the UI to collect on load instead.
     if let Ok(Some(urls)) = app.deep_link().get_current() {
-        handle(app, urls, Delivery::Deferred);
+        handle(app, urls);
     }
 
     let handle_app = app.clone();
     app.deep_link().on_open_url(move |event| {
-        handle(&handle_app, event.urls(), Delivery::Emit);
+        handle(&handle_app, event.urls());
     });
 
     // An installed client has the scheme registered by its installer; a dev
@@ -175,21 +175,28 @@ pub fn watch(app: &tauri::AppHandle) {
     }
 }
 
-/// How the result reaches the window: emitted at a window that is already
-/// listening, or parked for one that is still loading.
-enum Delivery {
-    Emit,
-    Deferred,
+/// Pick the one URL this module owns.
+///
+/// Only the first `itmvpn://` URL is acted on: the window can show one
+/// confirmation at a time, and a launch never carries more than one.
+///
+/// The rest are skipped rather than reported, because on macOS this is not an
+/// `itmvpn://`-only channel: the deep-link plugin hooks `RunEvent::Opened`,
+/// which is also how Finder delivers a profile *file* — and that belongs to
+/// [`crate::fileopen`], which is handed the very same event. Calling a
+/// `file://` URL a malformed link would put an error on screen next to the
+/// import that just succeeded, and on a cold start would overwrite it in the
+/// parking slot the two share.
+fn ours(urls: Vec<url::Url>) -> Option<url::Url> {
+    urls.into_iter()
+        .find(|u| u.scheme().eq_ignore_ascii_case(SCHEME))
 }
 
 /// Turn an incoming URL into a pending import the UI can confirm.
-///
-/// Only the first URL is acted on: the window can show one confirmation at a
-/// time, and a launch never carries more than one.
-fn handle(app: &tauri::AppHandle, urls: Vec<url::Url>, delivery: Delivery) {
-    use tauri::{Emitter, Manager};
+fn handle(app: &tauri::AppHandle, urls: Vec<url::Url>) {
+    use tauri::Manager;
 
-    let Some(url) = urls.into_iter().next() else {
+    let Some(url) = ours(urls) else {
         return;
     };
     // Bring the window up first, or the confirmation would sit behind the
@@ -203,32 +210,9 @@ fn handle(app: &tauri::AppHandle, urls: Vec<url::Url>, delivery: Delivery) {
     // did nothing at all.
     let request = staged.unwrap_or_else(|message| crate::backend::LinkRequest::Failed { message });
 
-    match delivery {
-        Delivery::Deferred => crate::backend::defer_link_request(state.inner(), request),
-        Delivery::Emit => {
-            let Some(window) = app.get_webview_window("main") else {
-                return;
-            };
-            match request {
-                crate::backend::LinkRequest::Confirm(preview) => {
-                    let _ = window.emit("link-import", preview);
-                }
-                // A `.pro` in the link names a portal instead of carrying a
-                // connection; hand it to the sign-in dialog a dropped `.pro`
-                // already opens.
-                crate::backend::LinkRequest::Provisioning { url, name, otp } => {
-                    let _ = window.emit(
-                        "provisioning-dropped",
-                        serde_json::json!({ "url": url, "name": name, "otp": otp }),
-                    );
-                }
-                // Same notice a failed drag-drop import uses.
-                crate::backend::LinkRequest::Failed { message } => {
-                    let _ = window.emit("import-error", message);
-                }
-            }
-        }
-    }
+    // Emitted at the window, or parked if the link is what launched the app —
+    // and, for a `.pro`, routed to the same sign-in dialog a dropped one opens.
+    crate::fileopen::deliver(app, request);
 }
 
 #[cfg(test)]
@@ -241,6 +225,33 @@ mod tests {
 
     /// base64url of "[main]\nGateway=1.2.3.4\n".
     const SAMPLE: &str = "W21haW5dCkdhdGV3YXk9MS4yLjMuNAo";
+
+    fn urls(raw: &[&str]) -> Vec<url::Url> {
+        raw.iter()
+            .map(|u| url::Url::parse(u).expect("test url"))
+            .collect()
+    }
+
+    /// macOS hands the deep-link plugin every `RunEvent::Opened` URL, including
+    /// the `file://` one Finder sends for a double-clicked profile. That one is
+    /// `fileopen`'s, and must not be reported here as a malformed link.
+    #[test]
+    fn leaves_a_file_url_to_the_file_open_path() {
+        assert_eq!(ours(urls(&["file:///Users/u/Downloads/site.scx"])), None);
+
+        let mixed = urls(&["file:///Users/u/site.scx", "itmvpn://import?data=AA"]);
+        assert_eq!(
+            ours(mixed).map(|u| u.to_string()).as_deref(),
+            Some("itmvpn://import?data=AA"),
+            "an itmvpn link is still found behind a file url"
+        );
+
+        assert!(
+            ours(urls(&["ITMVPN://import?data=AA"])).is_some(),
+            "scheme is caseless"
+        );
+        assert_eq!(ours(Vec::new()), None);
+    }
 
     #[test]
     fn reads_an_inline_profile() {
