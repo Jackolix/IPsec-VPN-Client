@@ -578,7 +578,7 @@ diff -ruN orig/src/libstrongswan/plugins/wintun/Makefile.am work/src/libstrongsw
 diff -ruN orig/src/libstrongswan/plugins/wintun/wintun_device.c work/src/libstrongswan/plugins/wintun/wintun_device.c
 --- orig/src/libstrongswan/plugins/wintun/wintun_device.c	1970-01-01 00:00:00.000000000 +0000
 +++ work/src/libstrongswan/plugins/wintun/wintun_device.c	2026-07-13 14:47:02.076071256 +0000
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,610 @@
 +/*
 + * Copyright (C) 2023 Andreas Steffen
 + *
@@ -668,6 +668,22 @@ diff -ruN orig/src/libstrongswan/plugins/wintun/wintun_device.c work/src/libstro
 +#define TUN_NAME_LEN     40
 +
 +#define TUN_DEFAULT_MTU  1500
++
++/**
++ * How long to wait for a freshly created adapter's IP interface to turn up in
++ * the TCP/IP stack, and how often to look.
++ *
++ * WintunCreateAdapter() returns as soon as the device exists and has a LUID,
++ * but Windows registers the IP interface for it asynchronously -- until that
++ * lands, GetIpInterfaceEntry() answers ERROR_NOT_FOUND. On an idle machine the
++ * gap is imperceptible; at boot, with the PnP subsystem busy, it routinely
++ * outlasts the call. Losing that race used to fail the device outright, which
++ * takes kernel-libipsec (a critical plugin) down with it and so leaves charon
++ * dead until the service is restarted -- a whole session without IPsec because
++ * of a few hundred milliseconds. Wait it out instead.
++ */
++#define IFACE_WAIT_MS    10000
++#define IFACE_POLL_MS    200
 +
 +typedef struct private_wintun_device_t private_wintun_device_t;
 +
@@ -835,17 +851,34 @@ diff -ruN orig/src/libstrongswan/plugins/wintun/wintun_device.c work/src/libstro
 +{
 +	MIB_IPINTERFACE_ROW row;
 +	DWORD ret;
++	int waited;
 +
-+	InitializeIpInterfaceEntry(&row);
-+	row.Family = family;
-+	row.InterfaceLuid = this->luid;
++	/* Only ERROR_NOT_FOUND is worth waiting on -- that is the interface not
++	 * being registered *yet*. Any other failure is a real one, so report it
++	 * at once rather than sitting out the timeout. */
++	for (waited = 0; ; waited += IFACE_POLL_MS)
++	{
++		InitializeIpInterfaceEntry(&row);
++		row.Family = family;
++		row.InterfaceLuid = this->luid;
 +
-+	ret = GetIpInterfaceEntry(&row);
++		ret = GetIpInterfaceEntry(&row);
++		if (ret != ERROR_NOT_FOUND || waited >= IFACE_WAIT_MS)
++		{
++			break;
++		}
++		Sleep(IFACE_POLL_MS);
++	}
 +	if (ret != NO_ERROR)
 +	{
-+		DBG1(DBG_LIB, "getting interface entry for %s failed: 0x%08lx",
-+			 this->if_name, ret);
++		DBG1(DBG_LIB, "getting interface entry for %s failed: 0x%08lx "
++			 "(gave up after %dms)", this->if_name, ret, waited);
 +		return FALSE;
++	}
++	if (waited)
++	{
++		DBG1(DBG_LIB, "interface entry for %s appeared after %dms",
++			 this->if_name, waited);
 +	}
 +	row.NlMtu = mtu;
 +	/* has to be cleared when writing an IPv4 row back, otherwise the call

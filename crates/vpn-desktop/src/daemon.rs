@@ -153,8 +153,25 @@ pub fn start(addr: &str) -> Result<(), String> {
         return Ok(());
     }
     // If the broker service is installed it owns charon's lifecycle — don't
-    // elevate-spawn a second copy. Just wait for the broker to bring it up.
+    // elevate-spawn a second copy. Ask it to start charon instead.
+    //
+    // Asking rather than only waiting matters: the broker's own attempt happens
+    // seconds into boot, where it can lose the race with Windows registering
+    // the Wintun adapter's IP interface. It retries in the background, but this
+    // turns the user's next connect into an immediate retry rather than a wait
+    // for the backoff — and the request is idempotent, so a charon that is
+    // already up just answers ok.
     if vpn_broker::client::available() {
+        // Not fatal on its own — an older broker refuses the request outright,
+        // and a start already in flight refuses it too, yet either may still
+        // come up while we wait. But it is the most specific thing we know, so
+        // keep it for the error we'd otherwise report as a bare timeout.
+        let refused = match vpn_broker::client::request(&vpn_broker::protocol::Request::CharonStart)
+        {
+            Ok(r) if r.ok => None,
+            Ok(r) => Some(r.msg),
+            Err(e) => Some(e),
+        };
         let deadline = Instant::now() + Duration::from_secs(40);
         while Instant::now() < deadline {
             if is_running(addr) {
@@ -162,7 +179,11 @@ pub fn start(addr: &str) -> Result<(), String> {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        return Err("the VPN broker service is running but charon isn't responding".to_string());
+        let base = "the VPN broker service is running but charon isn't responding";
+        return Err(match refused {
+            Some(why) => format!("{base}: {why}"),
+            None => base.to_string(),
+        });
     }
     let exe = charon_exe()?;
     let dir: &Path = exe.parent().ok_or("charon-svc.exe has no parent directory")?;

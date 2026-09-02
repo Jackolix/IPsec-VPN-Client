@@ -15,7 +15,9 @@ use vpn_broker::openvpn;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Most profiles carry two DNS servers; cap generously and reject the absurd.
 const MAX_SERVERS: usize = 8;
@@ -27,6 +29,21 @@ const MAX_SUBNETS: usize = 64;
 /// with its own wintun adapter, so the cap is really about not littering the
 /// machine with adapters — no one legitimately runs eight at a time.
 const MAX_SSL_TUNNELS: usize = 8;
+
+/// Backoff for retrying a charon that would not start.
+///
+/// The service is AUTO_START, so its one start attempt lands seconds into boot,
+/// while Windows is still bringing the network stack up — and charon's Wintun
+/// device needs an adapter whose IP interface the TCP/IP stack has registered.
+/// Losing that race used to mean no IPsec until the machine was rebooted, since
+/// nothing ever tried again. Retry quickly at first, because the condition
+/// usually clears within seconds, then back off so a genuinely broken install
+/// (no charon-svc.exe, say) doesn't fill the log forever.
+const CHARON_RETRY_FIRST: Duration = Duration::from_secs(5);
+const CHARON_RETRY_MAX: Duration = Duration::from_secs(300);
+/// Granularity the retry thread wakes at while waiting out a backoff, so a
+/// service stop is noticed promptly rather than after a five-minute sleep.
+const CHARON_RETRY_TICK: Duration = Duration::from_secs(1);
 
 /// One live SSL VPN tunnel: the connection name the GUI keys it by, the wintun
 /// adapter slot it occupies, and the process itself.
@@ -75,6 +92,14 @@ pub struct Broker {
     /// The live SSL VPN (OpenVPN) tunnels, keyed by the connection name the GUI
     /// uses. Several may be up at once — one per wintun adapter slot.
     ssl: Mutex<SslRegistry>,
+    /// Serializes charon start attempts. `charon::start()` waits up to 40s for
+    /// vici, and two attempts at once would race for the same port — so a
+    /// caller that can't take this is told a start is already running rather
+    /// than queueing behind it and spawning a second charon.
+    starting: Mutex<()>,
+    /// Set once the service is going down, so the retry thread stops instead of
+    /// resurrecting charon while `shutdown` is killing it.
+    stopping: AtomicBool,
 }
 
 impl Broker {
@@ -82,6 +107,8 @@ impl Broker {
         Arc::new(Broker {
             charon: Mutex::new(None),
             ssl: Mutex::new(SslRegistry::default()),
+            starting: Mutex::new(()),
+            stopping: AtomicBool::new(false),
         })
     }
 
@@ -92,11 +119,13 @@ impl Broker {
         // start serving — it would hold a live private key.
         openvpn::sweep_stale_configs();
 
-        match charon::start() {
-            Ok(child) => *self.charon.lock().unwrap() = child,
-            // Don't fail the whole service if charon won't come up — the GUI
-            // will surface a connect failure, and DNS IPC still works.
-            Err(e) => log(&format!("charon start failed: {e}")),
+        // Don't fail the whole service if charon won't come up — the GUI will
+        // surface a connect failure, and DNS IPC still works. But do keep
+        // trying: the usual reason to fail here is losing a boot-time race, and
+        // this one attempt used to be the only one the service ever made.
+        if let Err(e) = self.try_start_charon() {
+            log(&format!("charon start failed: {e}"));
+            self.spawn_charon_retry();
         }
 
         let me = Arc::clone(self);
@@ -107,6 +136,61 @@ impl Broker {
             }
         });
         Ok(())
+    }
+
+    /// One attempt to bring charon up, recording the child when it's ours to
+    /// stop. Idempotent: a charon already listening is a success, not a reason
+    /// to start a second one.
+    fn try_start_charon(&self) -> Result<(), String> {
+        let _guard = self
+            .starting
+            .try_lock()
+            .map_err(|_| "a charon start is already in progress".to_string())?;
+
+        match charon::start() {
+            // `None` means charon was already listening — either the one we
+            // started, whose handle we must keep, or a foreign daemon we don't
+            // own. Neither is a new child to record, and overwriting here would
+            // drop a live handle and leave `shutdown` nothing to stop.
+            Ok(None) => Ok(()),
+            Ok(Some(child)) => {
+                *self.charon.lock().unwrap() = Some(child);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Keep retrying `try_start_charon` in the background until it succeeds or
+    /// the service stops. Exits on the first success — nothing here watches a
+    /// charon that dies later; the GUI's `CharonStart` covers that.
+    fn spawn_charon_retry(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut delay = CHARON_RETRY_FIRST;
+            loop {
+                let mut left = delay;
+                while !left.is_zero() {
+                    if me.stopping.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let slice = left.min(CHARON_RETRY_TICK);
+                    std::thread::sleep(slice);
+                    left -= slice;
+                }
+                if me.stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                match me.try_start_charon() {
+                    Ok(()) => {
+                        log(&format!("charon started on retry (after {delay:?} backoff)"));
+                        return;
+                    }
+                    Err(e) => log(&format!("charon retry failed: {e}")),
+                }
+                delay = (delay * 2).min(CHARON_RETRY_MAX);
+            }
+        });
     }
 
     fn handle(&self, req: Request) -> Response {
@@ -221,11 +305,19 @@ impl Broker {
                     Response::ok(serde_json::Value::Array(up).to_string())
                 }
             }
-            // macOS-only. This service supervises charon-svc.exe as part of its
-            // own lifecycle, so there is nothing for a client to start or stop
-            // here — the request is answered rather than ignored so a client
-            // that sends it gets a reason instead of silence.
-            Request::CharonStart | Request::CharonStop => Response::err(
+            // A manual retry for a charon that never came up (or died since).
+            // The service still owns charon's lifecycle — this only ever starts
+            // one, never swaps or reconfigures it, and is idempotent when one
+            // is already listening — so it gives the GUI a working retry button
+            // without handing an unprivileged caller anything else.
+            Request::CharonStart => match self.try_start_charon() {
+                Ok(()) => Response::ok("charon is running"),
+                Err(e) => Response::err(e),
+            },
+            // Stopping stays the service's own business: charon is shared by
+            // every connection, so one client must not be able to pull the
+            // datapath out from under the others.
+            Request::CharonStop => Response::err(
                 "charon's lifecycle is managed by this service, not by request",
             ),
         }
@@ -262,6 +354,9 @@ impl Broker {
     /// Revert any DNS we applied, tear down every SSL tunnel, and stop charon
     /// (by image name, since it detaches — see `charon::stop`).
     pub fn shutdown(&self) {
+        // Before anything else, so the retry thread doesn't start a fresh
+        // charon in the gap between us killing one and the process exiting.
+        self.stopping.store(true, Ordering::Relaxed);
         nrpt::revert_all();
         let doomed = std::mem::take(&mut self.ssl.lock().unwrap().tunnels);
         for entry in doomed {
