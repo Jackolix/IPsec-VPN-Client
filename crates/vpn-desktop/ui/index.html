@@ -14,8 +14,33 @@
     --mono: "Cascadia Code","Cascadia Mono",ui-monospace,"SF Mono","JetBrains Mono",Consolas,"Liberation Mono",monospace;
     --sans: ui-sans-serif,system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     --fs-xs: 10.5px; --fs-sm: 12px; --fs-base: 13px; --fs-md: 14.5px; --fs-lg: 18px; --fs-xl: 24px; --r: 10px;
+    --scroll: rgba(134,149,171,.22); --scroll-hover: rgba(134,149,171,.45);
   }
   * { box-sizing: border-box; }
+
+  /* Scrollbars. Left alone, WebView2 draws the Windows default — a wide pale
+     trough with an arrow button at each end, which sits on this palette like a
+     patch cut from another program and claims a permanent gutter beside the
+     profile list and every panel.
+     Drawn instead as an overlay: no track, no buttons, and a thumb inset by a
+     transparent border so the 10px the engine reserves reads as a 6px bar
+     floating over the content. It stays visible rather than appearing on
+     hover — in a list of profiles, "there is more below" is worth saying
+     without being asked.
+     Deliberately NOT also setting `scrollbar-width`/`scrollbar-color`: giving
+     either a non-default value makes the engine ignore every ::-webkit- rule
+     below and fall back to its own thin bar, so the two cannot be combined as
+     progressive enhancement. The webkit pseudo-elements are the ones that
+     apply in both webviews this app ships on — WebView2 and WKWebView. */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+  ::-webkit-scrollbar-button { display: none; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scroll); border: 2px solid transparent; background-clip: padding-box;
+    border-radius: 5px;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--scroll-hover); background-clip: padding-box; }
+
   html, body { height: 100%; }
   body {
     margin: 0; background:
