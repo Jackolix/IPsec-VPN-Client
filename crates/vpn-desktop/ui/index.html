@@ -2054,9 +2054,14 @@
   // never flagged (which is also why SSL tunnels, whose counters are always
   // zero, cannot trip this). It takes sustained unanswered outbound traffic,
   // because a few seconds of it is just a slow gateway.
+  // Watched per CHILD SA, not per tunnel. A profile carries one child per
+  // remote network, each with its own SA and its own route, and they fail
+  // independently — one subnet going dark while the others carry megabytes is
+  // a real report. Summing the three hid exactly that: the healthy children's
+  // traffic kept the total climbing, so the dead one never showed.
   var STALL_POLLS = 12;   // ~20s at the busy poll interval (a stall needs an SA,
                           // and an SA means the poll is running at POLL_BUSY)
-  var traffic = {};       // SA name -> { in, out, silent }
+  var traffic = {};       // "SA|remote nets" -> { in, out, silent }
 
   function detectStalls(sas) {
     var byName = {};
@@ -2064,32 +2069,57 @@
     var seen = {}, changed = false;
 
     sas.forEach(function (sa) {
-      seen[sa.name] = true;
-      var bin = 0, bout = 0;
-      (sa.children || []).forEach(function (c) { bin += c.bytes_in; bout += c.bytes_out; });
-      var prev = traffic[sa.name];
-      var silent = prev ? prev.silent : 0;
-      if (prev) {
-        if (bin > prev.in) { silent = 0; }              // something answered
-        else if (bout > prev.out) { silent += 1; }      // we spoke into the void
-        // Neither moved: idle, which tells us nothing either way — hold.
-      }
-      traffic[sa.name] = { in: bin, out: bout, silent: silent };
+      var dead = [];
+      (sa.children || []).forEach(function (c) {
+        // Keyed by the remote networks rather than the child's name: charon
+        // puts the SA's unique id in that name, so it changes at every rekey,
+        // and the subnet is what a person would name anyway.
+        var nets = (c.remote_ts || []).join(", ") || c.name;
+        var key = sa.name + "|" + nets;
+        seen[key] = true;
+        var prev = traffic[key];
+        // A rekey starts the new SA's counters at zero. Both would then read
+        // as "not growing" against the old generation's totals for as long as
+        // it takes to catch up, which is a long blindfold every 48 minutes —
+        // so treat a counter going backwards as the fresh start it is.
+        if (prev && (c.bytes_in < prev.in || c.bytes_out < prev.out)) { prev = null; }
+        var silent = prev ? prev.silent : 0;
+        if (prev) {
+          if (c.bytes_in > prev.in) { silent = 0; }           // something answered
+          else if (c.bytes_out > prev.out) { silent += 1; }   // we spoke into the void
+          // Neither moved: idle, which tells us nothing either way — hold.
+        }
+        traffic[key] = { in: c.bytes_in, out: c.bytes_out, silent: silent };
+        if (silent >= STALL_POLLS) { dead.push(nets); }
+      });
+
+      // An SA that has lost its address is dead now, not in twenty seconds.
+      // charon drops a virtual IP from the SA when installing it fails, and
+      // without the address there is no adapter, no route, and so nothing that
+      // could ever move the counters above — silence here is not idleness. It
+      // is how a make-before-break IKE_SA rekey ends when the new SA cannot
+      // take an address the old one still holds. Traffic selectors are the
+      // proof the SA is meant to carry something (an SSL tunnel that never got
+      // an IP has none, and is left to the counters).
+      var carries = (sa.children || []).some(function (c) { return (c.local_ts || []).length; });
+      var addressGone = carries && !(sa.virtual_ips || []).length;
 
       var p = byName[sa.name];
       if (!p) { return; }
-      var now = silent >= STALL_POLLS;
+      var now = addressGone || dead.length > 0;
       if (now === !!stalled[p.id]) { return; }
       stalled[p.id] = now;
       changed = true;
-      if (now) {
-        log("NET", p.name + ": sending with nothing coming back — the SA is up but the data path is dead", "bad");
+      if (now && addressGone) {
+        log("NET", p.name + ": the SA is up but has no virtual IP — its adapter and routes are gone, reconnect to restore them", "bad");
+      } else if (now) {
+        log("NET", p.name + ": sending to " + dead.join(" and ") + " with nothing coming back — that network's data path is dead", "bad");
       } else {
         log("NET", p.name + ": traffic is flowing again");
       }
     });
 
-    // Forget SAs that are gone, so a reconnect starts from a clean slate
+    // Forget children that are gone, so a reconnect starts from a clean slate
     // rather than inheriting the dead tunnel's silence.
     Object.keys(traffic).forEach(function (n) { if (!seen[n]) { delete traffic[n]; } });
     Object.keys(stalled).forEach(function (id) {
