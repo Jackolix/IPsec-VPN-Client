@@ -3,6 +3,7 @@
 //!
 //!   vpn-agent connect --profile p.ini [--gateway-override HOST]
 //!   vpn-agent status
+//!   vpn-agent rekey --name NAME
 //!   vpn-agent disconnect --name NAME
 //!
 //! The connection flows live in the shared `vpn-control` crate. The PSK is
@@ -55,6 +56,19 @@ enum Command {
     },
     /// List active IKE/CHILD SAs.
     Status,
+    /// Rekey the named SA now, rather than waiting out the gateway's lifetime.
+    ///
+    /// Rekeying the IKE SA is make-before-break: the replacement is established,
+    /// and asks for a virtual IP, while the SA it replaces still holds one. That
+    /// is where the Windows data path has failed silently, so this is how to
+    /// exercise it without waiting hours for the scheduled rekey.
+    Rekey {
+        #[arg(long)]
+        name: String,
+        /// Rekey the CHILD SA of that name instead of the IKE SA.
+        #[arg(long)]
+        child: bool,
+    },
     /// Terminate the named IKE SA.
     Disconnect {
         #[arg(long)]
@@ -158,6 +172,13 @@ fn main() -> Result<()> {
         Command::Status => {
             let sas = vpn_control::status(&transport)?;
             print!("{}", render_text(&sas));
+        }
+        Command::Rekey { name, child } => {
+            vpn_control::rekey(&transport, &name, child)?;
+            println!(
+                "{} SA '{name}' rekeyed.",
+                if child { "CHILD" } else { "IKE" }
+            );
         }
         Command::Disconnect { name } => {
             vpn_control::disconnect(&transport, &name)?;

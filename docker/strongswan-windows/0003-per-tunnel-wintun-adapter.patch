@@ -41,9 +41,28 @@ the address to appear in the interface list before returning: that list is fed
 by NotifyIpInterfaceChange() and is asynchronous, so without the wait the
 first CHILD_SA of a connection installs its route before charon can see the
 address it belongs to -- and lands on the default device again.
+
+One virtual IP, one device -- but not one holder. An IKE_SA rekey is make
+before break: charon establishes the new SA, asks the gateway for a virtual IP
+on it, and only then deletes the old one, which still holds the address it was
+given. A device per *SA* therefore collides with itself, and Windows says so:
+CreateUnicastIpAddressEntry() returns 0x1392 (ERROR_OBJECT_ALREADY_EXISTS) for
+the second adapter. add_virtual_ip() drops an address it could not install, so
+the new SA came up with no address, no adapter and no route -- while charon,
+which needs none of those to answer DPD, kept calling it ESTABLISHED. Seconds
+later the peer deleted the old SA and its adapter went with it, taking the
+tunnel's whole data path down without changing its state. Observed against the
+Sophos gateway 13842s (the IKE_SA lifetime it hands out) into a connection: the
+tunnel stopped carrying traffic to the second, and only a reconnect fixed it.
+
+So devices are keyed by address and reference counted. A second install of an
+address we already have hands back the device that holds it -- same address,
+same tunnel, and the routes on that adapter are the ones the inherited
+CHILD_SAs are using -- and the adapter is torn down when the last holder
+releases it, not the first.
 diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c
---- orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-08-26 16:06:25.772121200 +0200
-+++ work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-08-26 16:28:09.350593600 +0200
+--- orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-09-03 08:30:02.885592000 +0200
++++ work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-09-03 08:30:10.500075600 +0200
 @@ -28,6 +28,7 @@
  #include <daemon.h>
  #include <threading/mutex.h>
@@ -56,7 +75,7 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
  	linked_list_t *ifaces;
  
  	/**
-+	 * TUN devices created for virtual IPs, as tun_device_t. One per virtual IP,
++	 * TUN devices created for virtual IPs, as vip_tun_t. One per virtual IP,
 +	 * so each tunnel gets an adapter of its own -- see add_ip().
 +	 */
 +	linked_list_t *tuns;
@@ -65,29 +84,51 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
  	 * Earliest time of the next roam event
  	 */
  	timeval_t roam_next;
-@@ -451,6 +458,34 @@
+@@ -451,6 +458,67 @@
  }
  
  /**
-+ * Is this one of the addresses we installed as a virtual IP?
++ * A virtual IP and the TUN device -- and so the adapter -- that carries it.
 + *
-+ * The TUN device list is the record of that: add_ip() creates exactly one
-+ * device per virtual IP, holding that address. Caller must hold the mutex.
++ * Reference counted, because charon installs the same virtual IP twice: an
++ * IKE_SA rekey is make before break, so the new SA asks for its address while
++ * the old one, which the peer has not deleted yet, still holds it. Giving the
++ * new SA the device the old one is using is exactly right -- same address,
++ * same tunnel -- and the adapter then survives the old SA's del_ip() instead
++ * of being pulled out from under the SA that replaced it.
 + */
-+static bool is_virtual_ip(private_kernel_iph_net_t *this, host_t *ip)
++typedef struct {
++	/** the device, and the adapter behind it */
++	tun_device_t *tun;
++	/** how many IKE_SAs have this address installed */
++	int refs;
++} vip_tun_t;
++
++/**
++ * Destroy an entry, taking its adapter down with it
++ */
++static void vip_tun_destroy(vip_tun_t *entry)
++{
++	entry->tun->destroy(entry->tun);
++	free(entry);
++}
++
++/**
++ * Find the entry holding an address, or NULL. Caller must hold the mutex.
++ */
++static vip_tun_t *find_vip_tun(private_kernel_iph_net_t *this, host_t *ip)
 +{
 +	enumerator_t *enumerator;
-+	tun_device_t *tun;
++	vip_tun_t *entry, *found = NULL;
 +	host_t *addr;
-+	bool found = FALSE;
 +
 +	enumerator = this->tuns->create_enumerator(this->tuns);
-+	while (enumerator->enumerate(enumerator, &tun))
++	while (enumerator->enumerate(enumerator, &entry))
 +	{
-+		addr = tun->get_address(tun, NULL);
++		addr = entry->tun->get_address(entry->tun, NULL);
 +		if (addr && addr->ip_equals(addr, ip))
 +		{
-+			found = TRUE;
++			found = entry;
 +			break;
 +		}
 +	}
@@ -97,10 +138,21 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
 +}
 +
 +/**
++ * Is this one of the addresses we installed as a virtual IP?
++ *
++ * The TUN device list is the record of that: add_ip() creates exactly one
++ * device per virtual IP, holding that address. Caller must hold the mutex.
++ */
++static bool is_virtual_ip(private_kernel_iph_net_t *this, host_t *ip)
++{
++	return find_vip_tun(this, ip) != NULL;
++}
++
++/**
   * Address enumerator
   */
  typedef struct {
-@@ -462,6 +497,8 @@
+@@ -462,6 +530,8 @@
  	enumerator_t *ifaces;
  	/** current enumerator over addresses, or NULL */
  	enumerator_t *addrs;
@@ -109,7 +161,7 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
  	/** mutex to unlock on destruction */
  	mutex_t *mutex;
  } addr_enumerator_t;
-@@ -471,6 +508,7 @@
+@@ -471,6 +541,7 @@
  {
  	iface_t *entry;
  	host_t **host;
@@ -117,7 +169,7 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
  
  	VA_ARGS_VGET(args, host);
  
-@@ -496,6 +534,18 @@
+@@ -496,6 +567,18 @@
  		}
  		if (this->addrs->enumerate(this->addrs, host))
  		{
@@ -136,7 +188,7 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
  			return TRUE;
  		}
  		this->addrs->destroy(this->addrs);
-@@ -517,9 +567,8 @@
+@@ -517,9 +600,8 @@
  {
  	addr_enumerator_t *enumerator;
  
@@ -147,7 +199,7 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
  		return enumerator_create_empty();
  	}
  
-@@ -533,6 +582,7 @@
+@@ -533,6 +615,7 @@
  		},
  		.which = which,
  		.ifaces = this->ifaces->create_enumerator(this->ifaces),
@@ -155,7 +207,7 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
  		.mutex = this->mutex,
  	);
  	return &enumerator->public;
-@@ -610,28 +660,79 @@
+@@ -610,28 +693,79 @@
  }
  
  /**
@@ -239,21 +291,22 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
 +/**
 + * Unregister and destroy a TUN device add_ip() could not finish setting up
 + */
-+static void drop_tun(private_kernel_iph_net_t *this, tun_device_t *tun)
++static void drop_tun(private_kernel_iph_net_t *this, vip_tun_t *entry)
 +{
 +	this->mutex->lock(this->mutex);
-+	this->tuns->remove(this->tuns, tun, NULL);
-+	charon->kernel->tun(charon->kernel, tun, FALSE);
++	this->tuns->remove(this->tuns, entry, NULL);
++	charon->kernel->tun(charon->kernel, entry->tun, FALSE);
 +	this->mutex->unlock(this->mutex);
-+	tun->destroy(tun);
++	vip_tun_destroy(entry);
  }
  
  METHOD(kernel_net_t, add_ip, status_t,
-@@ -639,42 +740,65 @@
+@@ -639,42 +773,87 @@
  	char *iface_name)
  {
  	MIB_UNICASTIPADDRESS_ROW row;
 -	DWORD ifindex;
++	vip_tun_t *entry;
 +	tun_device_t *tun;
 +	NET_LUID luid;
  	ULONG ret;
@@ -278,6 +331,12 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
 -			 iface, virtual_ip, iface_name);
 -		iface = iface_name;
 -		ifindex = find_ifindex(this, iface);
+-	}
+-	if (!ifindex)
+-	{
+-		DBG1(DBG_KNL, "interface '%s' not found, unable to install %H",
+-			 iface, virtual_ip);
+-		return NOT_FOUND;
 +	/* Give every virtual IP a TUN device -- and so an adapter -- of its own.
 +	 *
 +	 * charon hands us the interface its *outer* address sits on, which is what
@@ -293,29 +352,39 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
 +	 * matching device's name to install_route(), so registering the device
 +	 * below is what puts this tunnel's routes on this tunnel's adapter. Same
 +	 * shape as kernel_pfroute_net.c, which does this on macOS. */
-+	if (prefix == -1)
-+	{
-+		prefix = (virtual_ip->get_family(virtual_ip) == AF_INET) ? 32 : 128;
++	this->mutex->lock(this->mutex);
++	entry = find_vip_tun(this, virtual_ip);
++	if (entry)
++	{	/* already ours: an IKE_SA rekey installing the address the SA it
++		 * replaces still holds. A second adapter cannot have it -- Windows
++		 * refuses the duplicate, and the new SA would come up addressless,
++		 * with no adapter and no routes, while charon still calls it
++		 * established. So hand over the device we have, and count the holder. */
++		entry->refs++;
++		this->mutex->unlock(this->mutex);
++		DBG2(DBG_KNL, "virtual IP %H is already on '%s', now held %d times",
++			 virtual_ip, entry->tun->get_name(entry->tun), entry->refs);
++		return SUCCESS;
  	}
--	if (!ifindex)
++	this->mutex->unlock(this->mutex);
++
+ 	if (prefix == -1)
+ 	{
+ 		prefix = (virtual_ip->get_family(virtual_ip) == AF_INET) ? 32 : 128;
+ 	}
 +	tun = lib->tun->create(lib->tun, NULL);
 +	if (!tun)
- 	{
--		DBG1(DBG_KNL, "interface '%s' not found, unable to install %H",
--			 iface, virtual_ip);
--		return NOT_FOUND;
++	{
 +		DBG1(DBG_KNL, "creating a TUN device for %H failed", virtual_ip);
 +		return FAILED;
- 	}
--	if (prefix == -1)
++	}
 +	/* the MTU kernel-libipsec uses for its own device: ESP goes out UDP
 +	 * encapsulated, so the plaintext side has to leave room for the overhead */
 +	mtu = lib->settings->get_int(lib->settings, "%s.plugins.kernel-iph.tun_mtu",
 +								 1400, lib->ns);
 +	if (!tun->up(tun) || !tun->set_address(tun, virtual_ip, prefix) ||
 +		!tun->set_mtu(tun, mtu))
- 	{
--		prefix = (virtual_ip->get_family(virtual_ip) == AF_INET) ? 32 : 128;
++	{
 +		DBG1(DBG_KNL, "configuring the TUN device for %H failed", virtual_ip);
 +		tun->destroy(tun);
 +		return FAILED;
@@ -326,47 +395,52 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
 +			 tun->get_name(tun), virtual_ip);
 +		tun->destroy(tun);
 +		return FAILED;
- 	}
- 
++	}
++
++	INIT(entry,
++		.tun = tun,
++		.refs = 1,
++	);
++
 +	/* register before installing the address: the device list is what marks an
 +	 * address as virtual (see is_virtual_ip()), and that has to be true by the
 +	 * time the address becomes visible, not after */
 +	this->mutex->lock(this->mutex);
-+	this->tuns->insert_last(this->tuns, tun);
++	this->tuns->insert_last(this->tuns, entry);
 +	charon->kernel->tun(charon->kernel, tun, TRUE);
 +	this->mutex->unlock(this->mutex);
-+
+ 
  	InitializeUnicastIpAddressEntry(&row);
 -	row.InterfaceIndex = ifindex;
 +	row.InterfaceLuid = luid;
  	memcpy(&row.Address, virtual_ip->get_sockaddr(virtual_ip),
  		   *virtual_ip->get_sockaddr_len(virtual_ip));
  	row.OnLinkPrefixLength = prefix;
-@@ -689,11 +813,20 @@
+@@ -689,11 +868,20 @@
  	if (ret != NO_ERROR)
  	{
  		DBG1(DBG_KNL, "adding virtual IP %H on '%s' failed: 0x%08lx",
 -			 virtual_ip, iface, ret);
 +			 virtual_ip, tun->get_name(tun), ret);
-+		drop_tun(this, tun);
- 		return FAILED;
- 	}
--	DBG2(DBG_KNL, "installed virtual IP %H/%d on '%s' (interface %lu)",
--		 virtual_ip, prefix, iface, ifindex);
++		drop_tun(this, entry);
++		return FAILED;
++	}
 +	if (!wait_for_addr(this, virtual_ip))
 +	{
 +		DBG1(DBG_KNL, "virtual IP %H did not appear on '%s'",
 +			 virtual_ip, tun->get_name(tun));
-+		drop_tun(this, tun);
-+		return FAILED;
-+	}
++		drop_tun(this, entry);
+ 		return FAILED;
+ 	}
+-	DBG2(DBG_KNL, "installed virtual IP %H/%d on '%s' (interface %lu)",
+-		 virtual_ip, prefix, iface, ifindex);
 +
 +	DBG2(DBG_KNL, "installed virtual IP %H/%d on '%s'",
 +		 virtual_ip, prefix, tun->get_name(tun));
  	return SUCCESS;
  }
  
-@@ -701,53 +834,41 @@
+@@ -701,53 +889,45 @@
  	private_kernel_iph_net_t *this, host_t *virtual_ip, int prefix,
  	bool wait)
  {
@@ -375,9 +449,8 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
 -	status_t status = NOT_FOUND;
 -	host_t *host;
 -	ULONG ret, i;
-+	enumerator_t *enumerator;
-+	tun_device_t *tun, *found = NULL;
-+	host_t *addr;
++	vip_tun_t *entry, *last = NULL;
++	int refs = -1;
  
 -	/* del_ip gets no interface name, so find the address in the table */
 -	ret = GetUnicastIpAddressTable(AF_UNSPEC, &table);
@@ -389,19 +462,22 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
 -	for (i = 0; i < table->NumEntries; i++)
 +	/* del_ip gets no interface name, so find the device by its address */
 +	this->mutex->lock(this->mutex);
-+	enumerator = this->tuns->create_enumerator(this->tuns);
-+	while (enumerator->enumerate(enumerator, &tun))
++	entry = find_vip_tun(this, virtual_ip);
++	if (entry)
  	{
 -		row = &table->Table[i];
 -		host = host_create_from_sockaddr((struct sockaddr*)&row->Address);
 -		if (!host)
--		{
--			continue;
--		}
--		if (host->ip_equals(host, virtual_ip))
-+		addr = tun->get_address(tun, NULL);
-+		if (addr && addr->ip_equals(addr, virtual_ip))
++		refs = --entry->refs;
++		if (!refs)
  		{
+-			continue;
++			this->tuns->remove(this->tuns, entry, NULL);
++			charon->kernel->tun(charon->kernel, entry->tun, FALSE);
++			last = entry;
+ 		}
+-		if (host->ip_equals(host, virtual_ip))
+-		{
 -			ret = DeleteUnicastIpAddressEntry(row);
 -			if (ret != NO_ERROR)
 -			{
@@ -415,46 +491,49 @@ diff -ruN orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcha
 -				status = SUCCESS;
 -			}
 -			host->destroy(host);
-+			this->tuns->remove_at(this->tuns, enumerator);
-+			charon->kernel->tun(charon->kernel, tun, FALSE);
-+			found = tun;
- 			break;
- 		}
+-			break;
+-		}
 -		host->destroy(host);
  	}
 -	FreeMibTable(table);
-+	enumerator->destroy(enumerator);
 +	this->mutex->unlock(this->mutex);
  
 -	if (status == NOT_FOUND)
-+	if (found)
-+	{	/* outside the lock: removing an adapter takes a moment, and this mutex
-+		 * also serialises the interface-change callbacks. Destroying it takes
-+		 * the adapter down with the address and any route left on it, and
-+		 * frees the adapter slot for the next tunnel. */
-+		found->destroy(found);
-+	}
-+	else
++	if (refs < 0)
  	{
  		DBG1(DBG_KNL, "virtual IP %H not found, nothing to remove", virtual_ip);
 +		return NOT_FOUND;
  	}
 -	return status;
++	if (refs)
++	{	/* the SA that took this address over during a rekey still has it.
++		 * Tearing the adapter down now would leave that one established with
++		 * nothing to send on, so leave it to whoever releases it last. */
++		DBG2(DBG_KNL, "virtual IP %H is still held %d times, keeping it",
++			 virtual_ip, refs);
++		return SUCCESS;
++	}
++	/* outside the lock: removing an adapter takes a moment, and this mutex
++	 * also serialises the interface-change callbacks. Destroying it takes the
++	 * adapter down with the address and any route left on it, and frees the
++	 * adapter slot for the next tunnel. */
++	vip_tun_destroy(last);
++
 +	DBG2(DBG_KNL, "removed virtual IP %H", virtual_ip);
 +	return SUCCESS;
  }
  
  /**
-@@ -865,6 +986,8 @@
+@@ -865,6 +1045,8 @@
  	CloseHandle(this->router.hEvent);
  	this->mutex->destroy(this->mutex);
  	this->ifaces->destroy_function(this->ifaces, (void*)iface_destroy);
 +	/* takes the adapters down with them, so none is left behind on shutdown */
-+	this->tuns->destroy_offset(this->tuns, offsetof(tun_device_t, destroy));
++	this->tuns->destroy_function(this->tuns, (void*)vip_tun_destroy);
  	free(this);
  }
  
-@@ -895,6 +1018,7 @@
+@@ -895,6 +1077,7 @@
  		},
  		.mutex = mutex_create(MUTEX_TYPE_DEFAULT),
  		.ifaces = linked_list_create(),

@@ -451,6 +451,24 @@ fn peer_ids(gateway: &str) -> Vec<String> {
 }
 
 /// Terminate the named IKE SA and drop the credentials it was loaded with.
+/// Rekey a live SA now, instead of waiting out the lifetime the gateway handed
+/// out.
+///
+/// An IKE_SA rekey is make-before-break — charon establishes the replacement
+/// and asks for a virtual IP on it while the SA being replaced still holds one
+/// — which is the hardest thing the Windows data path does, and where it used
+/// to lose the address (and with it the adapter and every route) while still
+/// reporting ESTABLISHED. Gateways schedule that hours apart, so this is how it
+/// gets tested in a minute rather than an afternoon.
+pub fn rekey(transport: &Transport, name: &str, child: bool) -> Result<()> {
+    let mut client = open(transport)?;
+    let key = if child { "child" } else { "ike" };
+    check(
+        client.request("rekey", Message::new().str(key, name))?,
+        "rekey",
+    )
+}
+
 pub fn disconnect(transport: &Transport, name: &str) -> Result<()> {
     let mut client = open(transport)?;
     let terminated = check(
