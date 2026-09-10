@@ -1555,7 +1555,45 @@ pub fn disconnect(state: &AppState, name: String) -> std::result::Result<(), Str
     if let Err(e) = crate::dns::revert(&name) {
         eprintln!("dns revert for {name} failed: {e}");
     }
-    vpn_control::disconnect(&state.transport, &name).map_err(|e| e.to_string())
+    let terminated = vpn_control::disconnect(&state.transport, &name).map_err(|e| e.to_string());
+    // Called even when the terminate failed — what decides is the status check
+    // inside, and a tunnel that did not go down is still listed there.
+    #[cfg(target_os = "macos")]
+    release_daemon_when_idle(state);
+    terminated
+}
+
+/// Stop charon once the last IPsec tunnel is down, so the machine's IKE ports
+/// are not held by an app that is only sitting in the tray. macOS only.
+///
+/// Nothing else ever stops it: closing the window hides to the tray, and there
+/// is no quit path that goes through here. Ephemeral IKE ports (`port = 0` in
+/// `macos/strongswan.conf`) already keep us from squatting 500/4500, but a
+/// resident root daemon holding a utun and a vici socket for no live tunnel is
+/// still not something to leave behind — and on a machine with another IPsec
+/// client the smaller our idle footprint, the fewer ways the two can collide.
+///
+/// Gated on the helper being installed, because that is the only path that can
+/// bring charon back without an authorization prompt. Without it, stopping here
+/// would trade a resident daemon for a password dialog on every connect.
+///
+/// SSL tunnels are deliberately not consulted: OpenVPN needs no charon, so one
+/// being up is no reason to keep it running.
+#[cfg(target_os = "macos")]
+fn release_daemon_when_idle(state: &AppState) {
+    if !vpn_broker::unix_client::available() {
+        return;
+    }
+    // Anything other than "charon answered and has nothing left" leaves it
+    // alone: a status call we could not make is not evidence of an idle daemon.
+    match vpn_control::status(&state.transport) {
+        Ok(sas) if sas.is_empty() => {
+            if let Err(e) = crate::daemon::stop(&vici_addr(state)) {
+                eprintln!("stopping the idle daemon failed: {e}");
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Live connections across both datapaths: charon's IKE SAs plus each of the

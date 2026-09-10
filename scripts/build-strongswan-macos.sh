@@ -14,7 +14,8 @@
 #   kernel-libipsec  ESP in userland; the macOS IPsec engine is not involved.
 #   tun_device       utun, built into libstrongswan on Darwin (not a plugin).
 #   kernel-pfroute   the networking backend (addresses + routes) via PF_ROUTE.
-#   socket-default   IKE UDP on the standard ports.
+#   socket-default   IKE UDP. On ephemeral ports, not 500/4500 — see the port
+#                    comment in macos/strongswan.conf.
 #
 # Crypto comes from OpenSSL, built from source and pinned here rather than taken
 # from Homebrew: the dylibs ship inside the app bundle, so they must not depend
