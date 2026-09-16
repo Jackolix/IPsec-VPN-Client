@@ -1,0 +1,70 @@
+Take a reference on the reqid quick mode reuses, instead of just reading it.
+
+This is the fault 0004 was added to find, and the instrumentation caught it on
+the first try. An IKEv1 CHILD_SA rekey nets *zero* references on the reqid the
+new SA inherits:
+
+    20:11:57 reqid 1: referenced       (refs 2, remote 10.100.1.220/32)
+    20:11:57 CHILD_SA ITM-Office-1{7} CREATED => INSTALLING
+    20:11:58 reqid 1: reused by reqid  (refs 3, remote 10.100.1.220/32)
+    20:11:58 reqid 1: released         (refs 2, remote 10.100.1.220/32)
+    20:11:58 CHILD_SA ITM-Office-1{7} INSTALLING => INSTALLED
+    20:11:58 reqid 1: released         (refs 1, remote 10.100.1.220/32)  <- extra
+
+1 -> 2 -> 3 -> 2 -> 1. The new child ends up holding the reqid with no reference
+of its own, so when the gateway deletes the *old* child ten minutes later the
+entry drops to zero, is destroyed, and its number goes onto the recycle pool
+while the new child is still installed and using it:
+
+    20:21:48 reqid 1: released to zero, recycling (refs 0, remote 10.100.1.220/32)
+
+`alloc_reqid` then hands that number to the next child that cannot inherit its
+own, and two CHILD_SAs with different traffic selectors share one reqid:
+
+    20:59:31 reqid 3: ref found no entry
+    20:59:31 reqid 1: RECYCLED from the released pool (refs 1, remote 10.238.96.0/24)
+
+From there `ipsec_processor.c` resolves an outbound SA with
+`checkout_by_reqid(policy->get_reqid(policy))` -- `find_first` over a list built
+with `insert_first` -- so both selectors get whichever SA was installed last and
+the loser's packets are dropped by the gateway on a selector mismatch. Its
+inbound direction keeps working, which is what makes the fault look impossible
+from the client. Measured: 10.100.1.220 dead while 10.238.96.94 and
+192.168.1.56 answered, both children on reqid 1.
+
+The extra release is the quick mode task's own destroy():
+
+    if (this->child.reqid)
+    {
+        charon->kernel->release_reqid(charon->kernel, this->child.reqid);
+    }
+
+`check_for_rekeyed_child()` fills that field with `get_reqid()`, a plain getter
+that takes no reference, so the release is unmatched. That it is an oversight
+rather than intent is settled by `use_reqid()` a few lines below, which sets the
+same field and *does* ref first, releasing the previous value only once the new
+one is held.
+
+`get_reqid_ref()` exists for exactly this and returns 0 when it cannot take the
+reference -- leaving child.reqid at 0, so destroy() then correctly releases
+nothing and the new SA falls back to allocating by traffic selector.
+
+Upstream bug, present in 5.9.14; IKEv1 only, since quick mode is the IKEv1
+rekey path.
+
+--- orig/src/libcharon/sa/ikev1/tasks/quick_mode.c	2026-09-16 21:04:57.419194900 +0200
++++ work/src/libcharon/sa/ikev1/tasks/quick_mode.c	2026-09-16 21:04:57.598604600 +0200
+@@ -1033,7 +1033,12 @@
+ 						this->proposal->equals(this->proposal, proposal))
+ 					{
+ 						this->rekey = child_sa->get_spi(child_sa, TRUE);
+-						this->child.reqid = child_sa->get_reqid(child_sa);
++						/* take a reference, don't just read the number: this
++						 * task's destroy() releases child.reqid unconditionally,
++						 * so storing an unreferenced reqid here is one release
++						 * too many per rekey. use_reqid() below already refs
++						 * before it stores, for the same reason. */
++						this->child.reqid = child_sa->get_reqid_ref(child_sa);
+ 						this->child.mark_in = child_sa->get_mark(child_sa,
+ 																 TRUE).value;
+ 						this->child.mark_out = child_sa->get_mark(child_sa,
