@@ -169,6 +169,10 @@
   .status-pill.established { color: var(--ok); border-color: rgba(70,194,102,.42); background: var(--ok-soft); }
   .status-pill.connecting { color: var(--warn); border-color: rgba(217,165,49,.42); background: var(--warn-soft); }
   .status-pill.stalled { color: var(--crit); border-color: rgba(240,96,58,.42); background: var(--crit-soft); }
+  /* Carrying traffic, just not on every network it was asked to — amber, not
+     red: something still works, and the red pill is reserved for the tunnel
+     that carries nothing. */
+  .status-pill.degraded { color: var(--warn); border-color: rgba(217,165,49,.42); background: var(--warn-soft); }
   .btn { font-family: var(--mono); font-size: var(--fs-base); font-weight: 600; letter-spacing: .02em; cursor: pointer; border-radius: 9px; padding: 10px 20px; border: 1px solid transparent; white-space: nowrap; transition: background .13s, border-color .13s, opacity .13s; }
   .btn-primary { background: var(--accent); color: #06121f; }
   .btn-primary:hover { background: #62adff; }
@@ -263,6 +267,16 @@
   .notice.ok { background: var(--ok-soft); border-color: rgba(70,194,102,.4); color: #a9e2ba; }
   .notice.bad { background: var(--crit-soft); border-color: rgba(240,96,58,.4); color: #f0a996; }
   .notice b { font-family: var(--mono); }
+  /* The banner is an interruption, not a record — the log below keeps every
+     line it ever showed. So it carries its own dismiss, and it takes itself
+     away on a timer (see NOTICE_MS): messages that sat there until the next
+     one replaced them were still on screen hours after they stopped being
+     true. */
+  .notice .hint { margin-top: 6px; font-size: var(--fs-xs); opacity: .82; line-height: 1.45; }
+  .notice-x { margin-left: auto; flex: none; align-self: flex-start; background: none; border: 0;
+              color: inherit; opacity: .55; cursor: pointer; font-size: 16px; line-height: 1;
+              padding: 2px 2px 4px; border-radius: 5px; }
+  .notice-x:hover { opacity: 1; background: rgba(255,255,255,.08); }
 
   .overlay { position: fixed; inset: 0; background: rgba(6,10,16,.72); display: none; align-items: center; justify-content: center; padding: 24px; z-index: 50; }
   .overlay.show { display: flex; }
@@ -487,6 +501,7 @@
           <div class="spacer"></div>
           <div style="display:flex; align-items:center; gap:12px;">
             <span id="pill" class="status-pill"><span id="pill-led" class="led"></span><span id="pill-text">disconnected</span></span>
+            <button id="repair-btn" class="btn btn-ghost" style="display:none">Repair</button>
             <button id="edit-btn" class="btn btn-ghost">Edit</button>
             <button id="action" class="btn btn-primary">Connect</button>
           </div>
@@ -825,6 +840,8 @@
   var pendingDelete = null;
   var PROFILE_DIR = null;  // filled from the backend once known
   var pollTimer = null, upTimer = null, connectAt = 0, prevTotal = 0;
+  var broken = {};         // id -> the remote networks this tunnel is not carrying
+  var brokenWhy = {};      // id -> "dead" | "missing" | "address", for the wording
   var samples = [];
   var seqTimers = [];
 
@@ -898,7 +915,7 @@
       b.className = "profile" + (current && p.id === current.id ? " active" : "");
       b.setAttribute("aria-pressed", current && p.id === current.id ? "true" : "false");
       var st = uiState(p.id);
-      var led = st === "stalled" ? "led crit" : st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
+      var led = stateLed(st);
       b.innerHTML = '<div class="profile-top"><span class="' + led + '"></span>' +
         '<span class="profile-name"></span>' +
         (p.kind === "ssl" ? '<span class="profile-kind ssl">SSL</span>'
@@ -1109,25 +1126,45 @@
   function setPill() {
     var st = uiState(current.id);
     $("pill").className = "status-pill" + (st === "disconnected" ? "" : " " + st);
-    $("pill-led").className = "led" +
-      (st === "stalled" ? " crit" : st === "established" ? " ok" : st === "connecting" ? " warn pulse" : "");
-    $("pill-text").textContent = st === "stalled" ? "no traffic" : st;
+    $("pill-led").className = stateLed(st);
+    $("pill-text").textContent = stateText(st);
+    // The global indicator speaks for every profile at once, worst first.
     var all = profiles.map(function (p) { return uiState(p.id); });
-    var anyDead = all.indexOf("stalled") >= 0;
-    var anyUp = all.indexOf("established") >= 0;
-    var anyConn = all.indexOf("connecting") >= 0;
-    $("glob-led").className = "led" +
-      (anyDead ? " crit" : anyUp ? " ok" : anyConn ? " warn pulse" : "");
-    $("glob-text").textContent = anyDead ? "no traffic" : anyUp ? "tunnel up" : anyConn ? "negotiating" : "disconnected";
+    var worst = ["stalled", "degraded", "established", "connecting"].filter(function (st2) {
+      return all.indexOf(st2) >= 0;
+    })[0] || "disconnected";
+    $("glob-led").className = stateLed(worst);
+    $("glob-text").textContent = worst === "established" ? "tunnel up"
+      : worst === "connecting" ? "negotiating" : stateText(worst);
     renderCompactStatus();
     updateTray();
   }
 
-  // The one state name that covers both maps, in the vocabulary the tray
-  // speaks: a stalled tunnel is established plus a dead data path.
+  // The state names that cover both maps, in the vocabulary the tray speaks.
+  // A stalled tunnel is established plus a dead data path; a degraded one is
+  // established and carrying traffic, just not on every network it was asked
+  // to — one CHILD_SA of several is missing.
+  //
+  // The two are separate states rather than one "unhealthy" because they read
+  // differently to a person and because only one of them is an emergency:
+  // telling someone "no traffic" while their download runs over the same
+  // tunnel is how an indicator stops being believed. Ranked stalled-first
+  // everywhere, since nothing working outranks something working.
   function uiState(id) {
     var st = state[id] || "disconnected";
-    return (st === "established" && stalled[id]) ? "stalled" : st;
+    if (st !== "established" || !stalled[id]) { return st; }
+    return brokenWhy[id] === "missing" ? "degraded" : "stalled";
+  }
+
+  // What each unhealthy state is called on screen. Everything else is named by
+  // the state itself.
+  var STATE_TEXT = { stalled: "no traffic", degraded: "partly up" };
+  function stateText(st) { return STATE_TEXT[st] || st; }
+
+  // The LED beside a state, in the one place that decides it.
+  function stateLed(st) {
+    return "led" + (st === "stalled" ? " crit" : st === "degraded" ? " warn"
+      : st === "established" ? " ok" : st === "connecting" ? " warn pulse" : "");
   }
 
   /* ---------- most-recently-used profiles ---------- */
@@ -1177,23 +1214,23 @@
   }
 
   // Badge the taskbar/tray icon and refill its menu. Aggregated over every
-  // profile, because the tray has no notion of which one is selected: a stalled
-  // tunnel outranks a healthy one (it is the one worth acting on), which
-  // outranks a handshake in flight, which outranks nothing at all. The tooltip
-  // names the tunnels, so hovering answers "which one?" without opening the
-  // window.
+  // profile, because the tray has no notion of which one is selected: a dead
+  // data path outranks a tunnel missing one network, which outranks a healthy
+  // one, which outranks a handshake in flight, which outranks nothing at all —
+  // worst first, because the whole point of the badge is the condition worth
+  // acting on. The tooltip names the tunnels, so hovering answers "which one?"
+  // without opening the window.
   var trayLast = "";
+  var TRAY_RANK = ["stalled", "degraded", "established", "connecting"];
   function updateTray() {
     if (!TAURI) { return; }
-    var up = [], negotiating = [], dead = [];
+    var byState = {};
     profiles.forEach(function (p) {
       var st = uiState(p.id);
-      if (st === "stalled") { dead.push(p.name); }
-      else if (st === "established") { up.push(p.name); }
-      else if (st === "connecting") { negotiating.push(p.name); }
+      (byState[st] = byState[st] || []).push(p.name);
     });
-    var status = dead.length ? "stalled" : up.length ? "established" : negotiating.length ? "connecting" : "disconnected";
-    var detail = (dead.length ? dead : up.length ? up : negotiating).join(", ");
+    var status = TRAY_RANK.filter(function (st) { return byState[st]; })[0] || "disconnected";
+    var detail = (byState[status] || []).join(", ");
     var items = trayProfiles();
     // The status poll runs every 1.6s whether or not anything moved; only an
     // actual change is worth an IPC round trip, an icon repaint and a menu
@@ -1213,6 +1250,7 @@
     else if (st === "connecting") { btn.className = "btn btn-ghost"; btn.textContent = "Cancel"; }
     else { btn.className = "btn btn-ghost"; btn.textContent = "Disconnect"; }
     renderEditBtn();
+    renderRepairBtn();
     renderCompactStatus();
   }
 
@@ -1268,7 +1306,7 @@
       b.setAttribute("role", "option");
       b.setAttribute("aria-selected", current && p.id === current.id ? "true" : "false");
       var st = uiState(p.id);
-      var led = st === "stalled" ? "led crit" : st === "established" ? "led ok" : st === "connecting" ? "led warn pulse" : "led";
+      var led = stateLed(st);
       b.innerHTML = '<span class="' + led + '"></span><span class="copt-name"></span><span class="copt-gw"></span>';
       b.querySelector(".copt-name").textContent = p.name;
       b.querySelector(".copt-gw").textContent = p.gateway;
@@ -1328,9 +1366,8 @@
     var st = state[current.id], vs = uiState(current.id);
     $("c-name").textContent = current.name;
     $("c-gw").textContent = current.gateway;
-    $("c-led").className = "led" +
-      (vs === "stalled" ? " crit" : vs === "established" ? " ok" : vs === "connecting" ? " warn pulse" : "");
-    $("c-status").textContent = vs === "stalled" ? "no traffic" : vs;
+    $("c-led").className = stateLed(vs);
+    $("c-status").textContent = stateText(vs);
     b.disabled = false;
     if (st === "disconnected") { b.className = "btn btn-primary cbig"; b.textContent = "Connect"; }
     else if (st === "connecting") { b.className = "btn btn-ghost cbig"; b.textContent = "Cancel"; }
@@ -1910,14 +1947,50 @@
   }
 
   /* ---------- notice (mirrored into the compact panel) ---------- */
+  // How long each kind stays before it withdraws. A banner used to sit there
+  // until something else replaced it, which meant an error from this morning
+  // was still the first thing on screen this afternoon, describing a tunnel
+  // that had since come up. Nothing is lost by letting it go: every one of
+  // these is also a line in the log, which *is* the record.
+  //
+  // An error gets the longest slot because it is the one worth reading twice
+  // and pasting into a ticket; an acknowledgement ("imported X") goes soonest,
+  // since the thing it acknowledges is already visible in the list.
+  var NOTICE_MS = { bad: 30000, warn: 15000, ok: 6000, "": 8000 };
+  var noticeTimer = null;
+
   function showNotice(html, kind) {
     var cls = "notice show" + (kind ? " " + kind : "");
-    var n = $("notice"); n.className = cls; n.innerHTML = html;
-    var c = $("c-msg"); if (c) { c.className = cls; c.innerHTML = html; }
+    var body = html + '<button type="button" class="notice-x" aria-label="Dismiss this message" title="Dismiss">\u00d7</button>';
+    [$("notice"), $("c-msg")].forEach(function (el) {
+      if (!el) { return; }
+      el.className = cls;
+      el.innerHTML = body;
+      var x = el.querySelector(".notice-x");
+      if (x) { x.addEventListener("click", hideNotice); }
+      // Reading takes as long as it takes: while the pointer is on the banner
+      // the countdown is off, and it starts over when the pointer leaves.
+      el.onmouseenter = function () { clearTimeout(noticeTimer); noticeTimer = null; };
+      el.onmouseleave = function () { armNotice(kind); };
+    });
+    armNotice(kind);
   }
+
+  function armNotice(kind) {
+    clearTimeout(noticeTimer);
+    var ms = NOTICE_MS[kind || ""] || NOTICE_MS[""];
+    noticeTimer = setTimeout(hideNotice, ms);
+  }
+
   function hideNotice() {
-    $("notice").className = "notice";
-    var c = $("c-msg"); if (c) { c.className = "notice"; c.innerHTML = ""; }
+    clearTimeout(noticeTimer); noticeTimer = null;
+    [$("notice"), $("c-msg")].forEach(function (el) {
+      if (!el) { return; }
+      el.className = "notice";
+      el.innerHTML = "";
+      el.onmouseenter = null;
+      el.onmouseleave = null;
+    });
   }
 
   /* ---------- log ---------- */
@@ -1965,6 +2038,45 @@
     if (/fail|error|unable|no matching|invalid|giving up|retransmit|no config|deleting|not found|refused/i.test(msg)) { return "bad"; }
     return null;
   }
+  // The reason says what went wrong; this says what to do about it.
+  //
+  // They are separate because only the first can be read out of charon's
+  // transcript, and because the advice used to be given regardless of the
+  // cause: every failed connect suggested replacing the saved sign-in, so a
+  // gateway that was merely unreachable sent people to re-enter a password it
+  // had never even asked for. The kinds come from the backend's classifier
+  // (`FailureKind`), which is where the transcript is actually read.
+  function failureHint(kind, p) {
+    var hint = "";
+    if (kind === "user-credentials") {
+      hint = p.userStored
+        ? "The saved sign-in is the one being refused: choose <b>Forget</b> beside it and connect " +
+          "again to be asked for a new password."
+        : "Connect again and retype it \u2014 but not indefinitely, as many gateways lock an " +
+          "account after a few bad attempts.";
+    } else if (kind === "preshared-key") {
+      hint = "That key belongs to the profile rather than to you, so retyping your password will " +
+        "not help. Re-import the profile, or set its key under <b>Edit</b>.";
+    } else if (kind === "gateway-unreachable") {
+      hint = "No credential was tested, so nothing about this profile is wrong. Check that this " +
+        "network reaches the internet and does not block IPsec (UDP 500 and 4500) \u2014 " +
+        "hotel and guest Wi-Fi often do.";
+    } else if (kind === "no-proposal") {
+      hint = "Both IKE versions were tried. What is left is the encryption and integrity " +
+        "algorithms, under <b>Edit</b> \u2014 they have to match a policy on the gateway.";
+    } else if (kind === "traffic-selectors") {
+      hint = "Your credentials were accepted. Remove the network the gateway will not carry " +
+        "under <b>Edit</b>, or have it added to your VPN policy there.";
+    } else if (kind === "no-virtual-ip") {
+      hint = "Your credentials were accepted, and nothing on this machine can change this one " +
+        "\u2014 it is the gateway's address pool. Try again shortly.";
+    } else if (kind === "child-sa") {
+      hint = "Authentication succeeded, so no password or key is at fault. The log below carries " +
+        "the gateway's own words for the rest.";
+    }
+    return hint ? '<div class="hint">' + hint + "</div>" : "";
+  }
+
   function renderHandshake(lines) {
     (lines || []).forEach(function (l) {
       var sys = (l.group || "IKE").toUpperCase();
@@ -2012,17 +2124,15 @@
       var reason = (out && out.error) || "the handshake did not complete";
       state[p.id] = "disconnected"; setPill(); setAction(); renderList();
       log("IKE", reason, "bad");
-      var extra = "";
-      // A saved login the gateway won't accept can only be fixed by replacing
-      // it, and nothing else in the UI says where that is done.
-      if (p.userAuth && p.userStored) {
-        extra = '<div class="hint" style="margin-top:6px">If your password changed, choose ' +
-          '<b>Forget</b> beside the saved sign-in and connect again to be asked for it.</div>';
-      }
-      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(reason) + extra + "</div>", "bad");
+      showNotice(
+        '<span class="led warn" style="box-shadow:none"></span><div>' + esc(reason) +
+          failureHint(out && out.kind, p) + "</div>",
+        "bad"
+      );
       return;
     }
     state[p.id] = "established"; connectAt = Date.now(); prevTotal = 0; samples = [];
+    delete broken[p.id]; delete brokenWhy[p.id]; delete repairs[p.id];
     setPill(); setAction(); renderList();
     startPolling();
     // One sweep now that there is a data path, then only when asked. Nothing
@@ -2068,6 +2178,154 @@
     updateTray();
   }
 
+  /* ---------- per-network repair ---------- */
+  // A tunnel is not all-or-nothing, so the cure should not be either. Under
+  // IKEv1 every remote network is its own CHILD_SA with its own route, and
+  // they fail independently: one subnet goes dark (or never comes up) while
+  // the others carry megabytes. The IKE_SA stays ESTABLISHED throughout, so
+  // `dpd_action = restart` never fires — DPD rides the IKE_SA and the gateway
+  // is answering it perfectly well.
+  //
+  // Until now the only cure was a full reconnect, which is a bad trade: it
+  // drops the networks that *were* working, and it spends another login
+  // against a gateway that locks the account after a few bad ones. So
+  // re-initiate just the children that are missing or silent and leave the
+  // rest untouched.
+  //
+  // Automatic, but on a short leash, and bounded twice over. `tries` is per
+  // episode — it resets once the tunnel has been seen carrying everything
+  // again — so a week-old tunnel that loses a subnet on Thursday still gets
+  // its three attempts. `total` is the whole connection's, and it is what
+  // stops a tunnel that flaps: a repair charon calls a success can still be a
+  // dead data path, and without this cap that pair would take turns forever.
+  // Past the cap the button still works; we simply stop doing it unasked.
+  //
+  // A network the gateway narrowed away is dropped from the budget entirely.
+  // No amount of asking changes a policy that does not cover it, and hammering
+  // a gateway is its own kind of fault.
+  var REPAIR_COOLDOWN = 45000;
+  var REPAIR_TRIES = 3;
+  var REPAIR_MAX = 9;
+  var repairs = {};   // id -> { at, tries, total, hopeless: {net: true}, busy }
+
+  function repairMemo(id) {
+    if (!repairs[id]) { repairs[id] = { at: 0, tries: 0, total: 0, hopeless: {}, busy: false }; }
+    return repairs[id];
+  }
+
+  // Networks worth another attempt: what is broken now, minus the ones we
+  // already know cannot be fixed this way. Reads the bookkeeping rather than
+  // creating it, because every render calls this.
+  function repairable(id) {
+    var hopeless = (repairs[id] && repairs[id].hopeless) || {};
+    return (broken[id] || []).filter(function (n) { return !hopeless[n]; });
+  }
+
+  function maybeRepair(p, hurt) {
+    if (!TAURI || p.kind === "ssl") { return; }
+    if (!repairable(p.id).length) { return; }
+    var m = repairMemo(p.id);
+    if (m.busy || m.tries >= REPAIR_TRIES) { return; }
+    if (Date.now() - m.at < REPAIR_COOLDOWN) { return; }
+    if (m.total >= REPAIR_MAX) {
+      if (!m.gaveUp) {
+        m.gaveUp = true;
+        log("NET", p.name + ": " + REPAIR_MAX + " repairs on this connection have not made it " +
+          "stick — leaving it alone now. Disconnect and connect again, or use Repair.", "bad");
+      }
+      return;
+    }
+    runRepair(p, true);
+  }
+
+  async function runRepair(p, automatic) {
+    var m = repairMemo(p.id);
+    if (m.busy) { return; }
+    var nets = repairable(p.id);
+    if (!nets.length) { return; }
+    m.busy = true; m.at = Date.now(); m.tries += 1; m.total += 1;
+    renderRepairBtn();
+    log("NET", p.name + ": re-establishing " + nets.join(", ") +
+      " without touching the rest of the tunnel" +
+      (automatic ? " (attempt " + m.tries + " of " + REPAIR_TRIES + ")" : " (asked)"));
+
+    var out;
+    try {
+      out = await TAURI.invoke("repair", { id: p.id, dead: nets });
+    } catch (e) {
+      m.busy = false; renderRepairBtn();
+      log("NET", p.name + ": repair could not run: " + String(e), "bad");
+      if (!automatic) {
+        showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+      }
+      return;
+    }
+    m.busy = false;
+
+    // The transcript goes to the console only for the profile on screen — the
+    // log is one stream, and dumping a background tunnel's handshake into it
+    // would bury whatever the user is actually looking at. The verdict below
+    // is logged either way, with the profile named.
+    if (current && current.id === p.id) { renderHandshake(out && out.log); }
+
+    var restored = (out && out.restored) || [];
+    var failed = (out && out.failed) || [];
+    var narrowed = (out && out.narrowed) || [];
+    // A network the gateway narrowed away is off the budget for good: its
+    // policy does not cover it, and that is not something a retry can move.
+    narrowed.forEach(function (n) { m.hopeless[n] = true; });
+
+    if (restored.length) {
+      log("NET", p.name + ": " + restored.join(", ") + " is carrying traffic again", "good");
+      // The counters of the SA we just replaced are gone with it, so the stall
+      // detector has to start counting silence from scratch rather than
+      // inherit the dead generation's.
+      Object.keys(traffic).forEach(function (k) {
+        if (k.indexOf(sanitize(p.name) + "|") === 0) { delete traffic[k]; }
+      });
+      showNotice('<span class="led ok" style="box-shadow:none"></span><div>Re-established <b>' +
+        esc(restored.join(", ")) + "</b> on " + esc(p.name) + " — the rest of the tunnel stayed up.</div>", "ok");
+    }
+    if (narrowed.length) {
+      log("NET", p.name + ": " + narrowed.join(", ") + " is not covered by the gateway's policy for this tunnel — not retrying it", "bad");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(p.name) +
+        " does not carry <b>" + esc(narrowed.join(", ")) + "</b>: the gateway narrowed the networks it " +
+        'accepted, so its policy does not cover it.<div class="hint">Remove it under <b>Edit</b>, or ' +
+        "have it added to your VPN policy on the gateway. Retrying cannot change it.</div></div>", "bad");
+    }
+    if (failed.length) {
+      failed.forEach(function (f) { log("NET", p.name + ": " + f.net + " did not come back — " + f.reason, "bad"); });
+      var spent = m.tries >= REPAIR_TRIES;
+      var names = failed.map(function (f) { return f.net; }).join(", ");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div><b>' + esc(names) +
+        "</b> could not be re-established: " + esc(failed[0].reason) +
+        '<div class="hint">' + (spent
+          ? "Tried " + REPAIR_TRIES + " times. Disconnect and connect again to rebuild the whole tunnel."
+          : "Trying again shortly; <b>Repair</b> beside Connect retries it now.") +
+        "</div></div>", "bad");
+    }
+    renderRepairBtn();
+    pollSoon();
+  }
+
+  // Offered only when there is something to repair, so it never invites a
+  // person to poke at a healthy tunnel.
+  function renderRepairBtn() {
+    var btn = $("repair-btn");
+    if (!btn) { return; }
+    var p = current;
+    var nets = p ? repairable(p.id) : [];
+    var show = !!p && p.kind !== "ssl" && state[p.id] === "established" && nets.length > 0;
+    btn.style.display = show ? "" : "none";
+    if (!show) { return; }
+    var busy = repairMemo(p.id).busy;
+    btn.disabled = busy;
+    btn.textContent = busy ? "Repairing…" : "Repair";
+    btn.title = busy
+      ? "Re-establishing " + nets.join(", ")
+      : "Re-establish " + nets.join(", ") + " without dropping the rest of the tunnel";
+  }
+
   /* ---------- data-path stall detection ---------- */
   // charon can call an SA ESTABLISHED long after its data path has died: DPD
   // rides the IKE SA, so a gateway that keeps answering liveness probes proves
@@ -2087,6 +2345,29 @@
   var STALL_POLLS = 12;   // ~20s at the busy poll interval (a stall needs an SA,
                           // and an SA means the poll is running at POLL_BUSY)
   var traffic = {};       // "SA|remote nets" -> { in, out, silent }
+
+  // Which of a profile's remote networks this tunnel is not carrying at all.
+  //
+  // The counters cannot see this one: a network whose CHILD_SA never came up
+  // (or quietly went away) has no SA to *have* counters, so it never moves and
+  // never goes silent — the tunnel reads as perfectly healthy while one subnet
+  // is simply not routed. Under IKEv1 that is one missing child out of
+  // several, which is exactly the "one subnet is unreachable again" report:
+  // charon says ESTABLISHED, two networks work, and the third was never there.
+  function missingNets(p, sa) {
+    if (p.kind === "ssl" || !p.remote || p.remote === "\u2014") { return []; }
+    var carried = {};
+    (sa.children || []).forEach(function (c) {
+      if (c.state !== "INSTALLED") { return; }
+      (c.remote_ts || []).forEach(function (ts) { carried[ts] = true; });
+    });
+    // A full tunnel carries every address there is, so nothing can be missing
+    // from it — and its selector never matches a profile subnet literally.
+    if (carried["0.0.0.0/0"]) { return []; }
+    return p.remote.split(",").map(function (n) { return n.trim(); }).filter(function (n) {
+      return n && !carried[n];
+    });
+  }
 
   function detectStalls(sas) {
     var byName = {};
@@ -2115,7 +2396,12 @@
           // Neither moved: idle, which tells us nothing either way — hold.
         }
         traffic[key] = { in: c.bytes_in, out: c.bytes_out, silent: silent };
-        if (silent >= STALL_POLLS) { dead.push(nets); }
+        if (silent >= STALL_POLLS) {
+          // One entry per network, not the joined label: the repair pass
+          // matches these against a CHILD_SA's traffic selectors one at a
+          // time, and an IKEv2 child carries all of them at once.
+          dead = dead.concat((c.remote_ts || []).length ? c.remote_ts : [nets]);
+        }
       });
 
       // An SA that has lost its address is dead now, not in twenty seconds.
@@ -2131,14 +2417,33 @@
 
       var p = byName[sa.name];
       if (!p) { return; }
-      var now = addressGone || dead.length > 0;
+      var missing = missingNets(p, sa);
+      var now = addressGone || dead.length > 0 || missing.length > 0;
+
+      // Remembered even when the verdict has not changed, because it is what
+      // the repair pass acts on and which network is down can change from one
+      // poll to the next while the tunnel stays broken.
+      var hurt = dead.concat(missing.filter(function (n) { return dead.indexOf(n) < 0; }));
+      broken[p.id] = hurt;
+      brokenWhy[p.id] = addressGone ? "address" : dead.length ? "dead" : missing.length ? "missing" : null;
+      if (now && !addressGone && hurt.length) { maybeRepair(p, hurt); }
+
+      // Whole again: the next episode starts with a full budget of attempts.
+      // Keyed on what the poll actually observed rather than on the repair
+      // having returned success, which is the weaker claim of the two.
+      if (!now && repairs[p.id]) { repairs[p.id].tries = 0; }
+
       if (now === !!stalled[p.id]) { return; }
       stalled[p.id] = now;
       changed = true;
       if (now && addressGone) {
         log("NET", p.name + ": the SA is up but has no virtual IP — its adapter and routes are gone, reconnect to restore them", "bad");
-      } else if (now) {
+      } else if (now && dead.length) {
         log("NET", p.name + ": sending to " + dead.join(" and ") + " with nothing coming back — that network's data path is dead", "bad");
+      } else if (now) {
+        log("NET", p.name + ": " + missing.join(" and ") + (missing.length > 1 ? " have" : " has") +
+          " no CHILD_SA on this tunnel, so " + (missing.length > 1 ? "they are" : "it is") +
+          " not routed over the VPN at all", "bad");
       } else {
         log("NET", p.name + ": traffic is flowing again");
       }
@@ -2150,6 +2455,13 @@
     Object.keys(stalled).forEach(function (id) {
       if (stalled[id] && state[id] !== "established") { delete stalled[id]; changed = true; }
     });
+    // A tunnel that is no longer up takes its repair history with it: the next
+    // connect starts with a full budget of attempts, and nothing it inherits
+    // should stop it from trying.
+    Object.keys(broken).forEach(function (id) {
+      if (state[id] !== "established") { delete broken[id]; delete brokenWhy[id]; delete repairs[id]; }
+    });
+    renderRepairBtn();
 
     if (!changed) { return; }
     if (current) { setPill(); renderTiles(); }
@@ -2219,6 +2531,7 @@
     stopPolling();
     state[p.id] = "disconnected";
     delete stalled[p.id];
+    delete broken[p.id]; delete brokenWhy[p.id]; delete repairs[p.id];
     setPill(); setAction(); renderList(); renderTiles();
     log("NET", "virtual IP released, CHILD_SA removed");
   }
@@ -2709,6 +3022,9 @@
   $("clear-log").addEventListener("click", clearLog);
   $("import-btn").addEventListener("click", onImport);
   $("edit-btn").addEventListener("click", openEdit);
+  $("repair-btn").addEventListener("click", function () {
+    if (current) { runRepair(current, false); }
+  });
   $("hosts-check").addEventListener("click", function () { checkHosts(true); });
   $("hosts-add").addEventListener("click", function () {
     var box = $("e-hosts"), row = hostRow(null);

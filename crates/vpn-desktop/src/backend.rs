@@ -1082,18 +1082,14 @@ pub fn connect(
     // so adopt the live SA instead of initiating over it. This happens whenever
     // a tunnel outlives the app — the SA belongs to charon, not to us.
     if let Some(existing) = established_sa(state, &name) {
-        let mut outcome = vpn_control::ConnectOutcome {
-            connected: true,
-            error: None,
-            log: vec![note_line(
-                &name,
-                2,
-                format!(
-                    "{name} is already established ({} → {}); adopting the existing SA",
-                    existing.local_host, existing.remote_host
-                ),
-            )],
-        };
+        let mut outcome = vpn_control::ConnectOutcome::ok(vec![note_line(
+            &name,
+            2,
+            format!(
+                "{name} is already established ({} → {}); adopting the existing SA",
+                existing.local_host, existing.remote_host
+            ),
+        )]);
         if imported.config.request_virtual_ip {
             wait_for_virtual_ip(state, &name, &mut outcome);
         }
@@ -1138,6 +1134,31 @@ pub fn connect(
         }
     }
     Ok(outcome)
+}
+
+/// Bring back the remote networks of a live tunnel that are not carrying
+/// traffic, leaving the ones that are strictly alone.
+///
+/// The alternative the app had was a full reconnect, which is a bad trade when
+/// only one of three networks is down: it drops the two that work, and it
+/// spends another login against a gateway that locks accounts after a few bad
+/// ones. `dead` names the networks the UI's stall detector found silent (in the
+/// CIDR form the profile and charon both print); a network that is simply
+/// missing an SA needs no such evidence and is initiated either way.
+pub fn repair(
+    state: &AppState,
+    id: String,
+    dead: Vec<String>,
+) -> std::result::Result<vpn_control::RepairOutcome, String> {
+    if is_ssl_profile(state, &id) {
+        return Err("an SSL VPN gateway pushes its own routes as one set, so there are no \
+                    per-network SAs to repair — reconnect this profile instead"
+            .to_string());
+    }
+    let (imported, _, _) = load(state, &id)?;
+    let name = vpn_core::swanctl::sanitize_name(&imported.config.name);
+    vpn_control::repair(&state.transport, &imported.config, &name, &dead)
+        .map_err(|e| e.to_string())
 }
 
 /// A profile's protected subnets as CIDR text, for the DNS fallback: a
@@ -1232,11 +1253,7 @@ fn ssl_connect(
             } else {
                 format!("SSL VPN connected; assigned IP {ip}. Routes and DNS applied from the gateway push.")
             };
-            Ok(vpn_control::ConnectOutcome {
-                connected: true,
-                error: None,
-                log: vec![note_line(&name, 2, msg)],
-            })
+            Ok(vpn_control::ConnectOutcome::ok(vec![note_line(&name, 2, msg)]))
         }
         Err(e) => {
             // The broker's full-tunnel refusal is generic — it doesn't know
@@ -1257,13 +1274,29 @@ fn ssl_connect(
                     log.push(ovpn_log_line(&name, line));
                 }
             }
-            Ok(vpn_control::ConnectOutcome {
-                connected: false,
-                error: Some(reason),
-                log,
-            })
+            // openvpn's exit reason is more specific than charon's, but it has
+            // the same blind spot: the banner said "connect failed" whether
+            // the password was wrong or the gateway was unreachable. It does
+            // name a rejected login, so at least separate that one out.
+            let kind = if ovpn_rejected_the_login(&reason, &e.log) {
+                vpn_control::FailureKind::UserCredentials
+            } else {
+                vpn_control::FailureKind::Unknown
+            };
+            Ok(vpn_control::ConnectOutcome::failed(kind, reason, log))
         }
     }
+}
+
+/// Did the SSL gateway reject the username and password, rather than fail for
+/// some other reason? openvpn says so in one line and then exits, so the
+/// wording is worth matching: it is the difference between "fix your password"
+/// and "look at the network".
+fn ovpn_rejected_the_login(reason: &str, log: &str) -> bool {
+    let hay = format!("{reason}\n{log}").to_ascii_uppercase();
+    hay.contains("AUTH_FAILED")
+        || hay.contains("AUTH-FAILURE")
+        || hay.contains("AUTHENTICATION FAILED")
 }
 
 /// One openvpn output line as a log entry for the panel. Tagged `OVP` so it
@@ -1665,6 +1698,12 @@ fn synth_ssl_sa(s: &crate::ssl::SslStatus) -> IkeSa {
         virtual_ips: if s.ip.is_empty() { Vec::new() } else { vec![s.ip.clone()] },
         children: vec![vpn_control::ChildSa {
             name: s.name.clone(),
+            // There is no CHILD_SA behind this, so there is no id charon would
+            // accept for one and no kernel policy of charon's to collide over —
+            // and nothing that takes a per-child action (the repair pass, the
+            // reqid check) applies to an SSL tunnel anyway.
+            unique_id: None,
+            reqid: None,
             state: "INSTALLED".to_string(),
             bytes_in: 0,
             bytes_out: 0,

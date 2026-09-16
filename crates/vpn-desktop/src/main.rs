@@ -21,7 +21,7 @@ mod ssl;
 mod update;
 
 use backend::{AppState, ProfileEdit, ProfileSummary};
-use vpn_control::{ConnectOutcome, IkeSa};
+use vpn_control::{ConnectOutcome, IkeSa, RepairOutcome};
 
 #[tauri::command]
 async fn list_profiles(state: tauri::State<'_, AppState>) -> Result<Vec<ProfileSummary>, String> {
@@ -198,6 +198,22 @@ async fn connect(
 ) -> Result<ConnectOutcome, String> {
     let s = state.inner().clone();
     match tauri::async_runtime::spawn_blocking(move || backend::connect(&s, id, login)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Re-establish only the remote networks of a live tunnel that are not
+/// carrying traffic. `dead` names the ones the UI found silent; networks with
+/// no CHILD_SA at all are found here and need no naming.
+#[tauri::command]
+async fn repair(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    dead: Vec<String>,
+) -> Result<RepairOutcome, String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::repair(&s, id, dead)).await {
         Ok(result) => result,
         Err(e) => Err(e.to_string()),
     }
@@ -792,6 +808,7 @@ fn main() {
             import_from_portal,
             delete_profile,
             connect,
+            repair,
             disconnect,
             status,
             set_tray_status,
@@ -934,6 +951,12 @@ mod tray {
         /// The SA is up and charon still calls it established, but the data
         /// path is one-way dead — see the stall detector in `ui/index.html`.
         Stalled,
+        /// Up and carrying traffic, but not on every network it was asked to:
+        /// one remote subnet has no CHILD_SA (under IKEv1 each subnet is its
+        /// own, and they fail independently). Ranked below `Stalled` because
+        /// something still works, and kept apart from it because "no traffic"
+        /// would be plainly false on a tunnel that is moving megabytes.
+        Degraded,
     }
 
     impl Status {
@@ -945,6 +968,7 @@ mod tray {
                 "established" | "connected" => Status::Connected,
                 "connecting" => Status::Connecting,
                 "stalled" => Status::Stalled,
+                "degraded" => Status::Degraded,
                 _ => Status::Disconnected,
             }
         }
@@ -957,6 +981,7 @@ mod tray {
                 Status::Connected => [0x46, 0xc2, 0x66],
                 Status::Connecting => [0xd9, 0xa5, 0x31],
                 Status::Stalled => [0xf0, 0x60, 0x3a],
+                Status::Degraded => [0xd9, 0xa5, 0x31],
                 Status::Disconnected => [0x86, 0x95, 0xab],
             }
         }
@@ -966,6 +991,7 @@ mod tray {
                 Status::Connected => "connected",
                 Status::Connecting => "connecting",
                 Status::Stalled => "connected, no traffic",
+                Status::Degraded => "connected, one network missing",
                 Status::Disconnected => "disconnected",
             }
         }
@@ -973,7 +999,7 @@ mod tray {
         /// Does this state mean there is a tunnel to tear down? Drives the
         /// checkmark beside a menu entry, and with it what clicking does.
         fn is_up(self) -> bool {
-            matches!(self, Status::Connected | Status::Stalled)
+            matches!(self, Status::Connected | Status::Stalled | Status::Degraded)
         }
     }
 
@@ -1061,6 +1087,7 @@ mod tray {
         match Status::parse(&profile.state) {
             Status::Connecting => format!("{} — connecting…", profile.name),
             Status::Stalled => format!("{} — no traffic", profile.name),
+            Status::Degraded => format!("{} — one network missing", profile.name),
             _ => profile.name.clone(),
         }
     }
