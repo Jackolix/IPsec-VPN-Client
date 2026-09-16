@@ -78,11 +78,16 @@ RUN wget -q "https://download.strongswan.org/strongswan-${STRONGSWAN_VER}.tar.bz
 #       so every tunnel sharing one adapter gets the first one's address.
 COPY docker/strongswan-windows/0001-kernel-iph-install-virtual-ips.patch /src/
 COPY docker/strongswan-windows/0002-wintun-tun-device-plugin.patch /src/
+# 0004: log every reqid allocation/reference/release. Instrumentation only,
+#       chasing a one-way dead subnet caused by two CHILD_SAs sharing a reqid;
+#       drop it once the refcount imbalance behind that is found.
 COPY docker/strongswan-windows/0003-per-tunnel-wintun-adapter.patch /src/
+COPY docker/strongswan-windows/0004-reqid-accounting-log.patch /src/
 RUN cd "strongswan-${STRONGSWAN_VER}" \
     && patch -p1 --fuzz=0 < /src/0001-kernel-iph-install-virtual-ips.patch \
     && patch -p1 --fuzz=0 < /src/0002-wintun-tun-device-plugin.patch \
-    && patch -p1 --fuzz=0 < /src/0003-per-tunnel-wintun-adapter.patch
+    && patch -p1 --fuzz=0 < /src/0003-per-tunnel-wintun-adapter.patch \
+    && patch -p1 --fuzz=0 < /src/0004-reqid-accounting-log.patch
 
 # The wintun patch touches configure.ac/Makefile.am, so regenerate the build
 # system (the release tarball ships pre-generated ones).

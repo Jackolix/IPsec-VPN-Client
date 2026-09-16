@@ -1,0 +1,149 @@
+Log every reqid allocation, reference and release.
+
+One subnet of a multi-subnet IKEv1 tunnel goes one-way dead while the others
+carry traffic, the IKE_SA stays ESTABLISHED, every CHILD_SA stays INSTALLED and
+every route stays in the table. Caught live 2026-09-16: two installed CHILD_SAs
+with different traffic selectors were sharing one reqid --
+
+    ITM-Office-3  uniq=37  reqid=2  10.238.96.0/24   out=6    in=47
+    ITM-Office-1  uniq=38  reqid=2  10.100.1.220/32  out=118  in=0
+
+-- and `ipsec_processor.c` resolves an outbound SA with
+`checkout_by_reqid(policy->get_reqid(policy))`, which is `find_first` over a
+list built with `insert_first`. So both selectors resolve to whichever SA was
+installed last, the other network's packets ride it, and the gateway drops them
+on a selector mismatch. The losing network still *receives*, which is what makes
+the fault look impossible from the client.
+
+`alloc_reqid` recycles freed numbers (`released_reqids`), so a reqid released
+while a live SA still holds it is handed to the next child that finds no
+selector match. `child_sa.c` already reports the tail of that with
+"releasing reqid %u failed" -- ten in one day, the same number twice in a single
+teardown -- which means releases are arriving after refs already hit zero. But
+the refcount arithmetic through create/install/destroy balances on a static
+reading, so what causes the over-release is not visible without watching it.
+
+Hence this: DBG1 on every transition, with the entry's remote selector, so the
+log shows the reqid crossing from one network to another rather than only its
+consequences. The line to grep for is "RECYCLED from the released pool" -- a
+reqid handed out that another SA may still hold -- and "OVER-RELEASE", a release
+for an entry that is already gone. Volume is a handful of lines per rekey.
+
+Instrumentation only: no behaviour changes, so this can be dropped once the
+imbalance is found.
+
+--- orig/src/libcharon/kernel/kernel_interface.c	2026-09-16 19:03:01.516558400 +0200
++++ work/src/libcharon/kernel/kernel_interface.c	2026-09-16 19:03:01.740998100 +0200
+@@ -367,6 +367,28 @@
+ 	return array;
+ }
+ 
++/**
++ * Log one reqid accounting transition.
++ *
++ * A reqid on its own does not say which selectors it was handed to, and that
++ * is exactly what a collision turns on: two CHILD_SAs with different traffic
++ * selectors ending up on one reqid, after which libipsec resolves the outbound
++ * policy of both to whichever SA was installed last. Printing the remote
++ * selector with every refcount change makes the moment a reqid crosses from one
++ * network to another visible in the log, instead of only its consequences.
++ */
++static void log_reqid(const char *what, reqid_entry_t *entry)
++{
++	traffic_selector_t *ts = NULL;
++
++	if (entry->remote)
++	{
++		array_get(entry->remote, 0, &ts);
++	}
++	DBG1(DBG_KNL, "reqid %u: %s (refs %d, remote %R)", entry->reqid, what,
++		 entry->refs, ts);
++}
++
+ METHOD(kernel_interface_t, alloc_reqid, status_t,
+ 	private_kernel_interface_t *this,
+ 	linked_list_t *local_ts, linked_list_t *remote_ts,
+@@ -374,6 +396,7 @@
+ 	sec_label_t *label, uint32_t *reqid)
+ {
+ 	reqid_entry_t *entry = NULL, *tmpl;
++	const char *how;
+ 
+ 	INIT(tmpl,
+ 		.local = array_from_ts_list(local_ts),
+@@ -399,6 +422,7 @@
+ 		 * got narrowed during negotiation, but we don't want to reuse the
+ 		 * reqid if the additional selectors (e.g. marks) are different */
+ 		reqid_entry_destroy(tmpl);
++		how = "reused by reqid";
+ 	}
+ 	else
+ 	{
+@@ -407,6 +431,7 @@
+ 		if (entry)
+ 		{
+ 			reqid_entry_destroy(tmpl);
++			how = "reused by selectors";
+ 		}
+ 		else
+ 		{
+@@ -421,6 +446,13 @@
+ 					return OUT_OF_RES;
+ 				}
+ 				entry->reqid = this->next_reqid++;
++				how = "allocated fresh";
++			}
++			else
++			{
++				/* handed a number some other SA may still be using: this is
++				 * the line that precedes a collision */
++				how = "RECYCLED from the released pool";
+ 			}
+ 			this->reqids_by_ts->put(this->reqids_by_ts, entry, entry);
+ 			this->reqids->put(this->reqids, entry, entry);
+@@ -428,6 +460,7 @@
+ 		*reqid = entry->reqid;
+ 	}
+ 	entry->refs++;
++	log_reqid(how, entry);
+ 	this->mutex->unlock(this->mutex);
+ 
+ 	return SUCCESS;
+@@ -445,6 +478,13 @@
+ 	if (entry)
+ 	{
+ 		entry->refs++;
++		log_reqid("referenced", entry);
++	}
++	else
++	{
++		/* the caller keeps the number but gets no reference, so it will fall
++		 * through to alloc_reqid and may be given a recycled one instead */
++		DBG1(DBG_KNL, "reqid %u: ref found no entry", reqid);
+ 	}
+ 	this->mutex->unlock(this->mutex);
+ 	return entry ? SUCCESS : NOT_FOUND;
+@@ -461,12 +501,23 @@
+ 	entry = this->reqids->get(this->reqids, &tmpl);
+ 	if (entry && --entry->refs == 0)
+ 	{
++		log_reqid("released to zero, recycling", entry);
+ 		array_insert_create_value(&this->released_reqids, sizeof(uint32_t),
+ 								  ARRAY_TAIL, &entry->reqid);
+ 		this->reqids->remove(this->reqids, entry);
+ 		this->reqids_by_ts->remove(this->reqids_by_ts, entry);
+ 		reqid_entry_destroy(entry);
+ 	}
++	else if (entry)
++	{
++		log_reqid("released", entry);
++	}
++	else
++	{
++		/* an over-release: refs already reached zero and the entry is gone,
++		 * so its number is in the recycle pool while a live SA still uses it */
++		DBG1(DBG_KNL, "reqid %u: release found no entry (OVER-RELEASE)", reqid);
++	}
+ 	this->mutex->unlock(this->mutex);
+ 	return entry ? SUCCESS : NOT_FOUND;
+ }
