@@ -1692,6 +1692,9 @@ pub fn status(state: &AppState) -> std::result::Result<Vec<IkeSa>, String> {
 fn synth_ssl_sa(s: &crate::ssl::SslStatus) -> IkeSa {
     IkeSa {
         name: s.name.clone(),
+        // No IKE negotiation happened here at all, so there is no version to
+        // report — and nothing that reads one applies to an SSL tunnel.
+        version: None,
         state: "ESTABLISHED".to_string(),
         local_host: String::new(),
         remote_host: String::new(),

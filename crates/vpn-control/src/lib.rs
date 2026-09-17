@@ -803,10 +803,11 @@ impl RepairStep {
 fn plan_repair(
     config: &ConnectionConfig,
     name: &str,
+    negotiated: Option<IkeVersion>,
     live: &[&ChildSa],
     dead: &[String],
 ) -> Vec<RepairStep> {
-    let version = live_version(config, live);
+    let version = live_version(config, negotiated, live);
     bridge::child_selectors_for(config, name, version)
         .into_iter()
         .map(|(child, nets)| {
@@ -949,7 +950,7 @@ pub fn repair(
 
     // Decide everything first, then act. The decision is the part that can be
     // quietly wrong, so it is a pure function with tests of its own.
-    for step in plan_repair(config, name, &live, &dead) {
+    for step in plan_repair(config, name, negotiated_version(&sas, name), &live, &dead) {
         if let Some(finding) = step.finding() {
             out.log.push(note(name, finding));
         }
@@ -1036,15 +1037,42 @@ fn reinitiate(
     Ok(())
 }
 
+/// The IKE version charon reports for this connection's live IKE_SA.
+///
+/// This is the only *stated* answer available; everything else is inference.
+/// It matters because the profile is routinely wrong: a Sophos `.scx` carries
+/// no IKE version at all, so the importer has to assume IKEv2, while an SFOS
+/// gateway may well answer IKEv1 -- and the connect flow then retries and
+/// succeeds, leaving a running tunnel whose version the profile misnames.
+fn negotiated_version(sas: &[IkeSa], name: &str) -> Option<IkeVersion> {
+    sas.iter()
+        .filter(|sa| sa.name == name)
+        .find_map(|sa| match sa.version.as_deref()?.trim() {
+            "1" | "IKEv1" => Some(IkeVersion::V1),
+            "2" | "IKEv2" => Some(IkeVersion::V2),
+            _ => None,
+        })
+}
+
 /// Is this connection running as one CHILD_SA carrying every network (IKEv2),
 /// or one per network (IKEv1 quick mode)?
 ///
-/// Read off the live SAs rather than taken from the profile, because the
-/// profile's version can be wrong: the connect flow retries the other version
-/// when the gateway rejects the one the profile names, so what is running is
-/// not necessarily what is configured. The profile is only the tiebreaker for a
-/// tunnel too small to tell them apart.
-fn live_version(config: &ConnectionConfig, live: &[&ChildSa]) -> IkeVersion {
+/// `negotiated` is charon's own report and outranks everything else. Without it
+/// the layout is inferred from the live SAs, and only as a last resort from the
+/// profile -- which can be wrong, because the connect flow retries the other
+/// version when the gateway rejects the one the profile names.
+///
+/// Getting this wrong is not cosmetic: the child *names* follow from it, so a
+/// wrong answer makes the repair pass initiate a child that does not exist and
+/// report every network as unrecoverable.
+fn live_version(
+    config: &ConnectionConfig,
+    negotiated: Option<IkeVersion>,
+    live: &[&ChildSa],
+) -> IkeVersion {
+    if let Some(version) = negotiated {
+        return version;
+    }
     let installed: Vec<&&ChildSa> = live.iter().filter(|c| c.state == "INSTALLED").collect();
     // One SA carrying two of the profile's networks can only be IKEv2: quick
     // mode cannot put two selector pairs in one SA.
@@ -1401,7 +1429,7 @@ mod tests {
             named_child("INSTALLED", "c-1", "1", &["10.1.0.0/24"]),
             named_child("INSTALLED", "c-3", "3", &["10.3.0.0/24"]),
         ];
-        let plan = plan_repair(&config, "c", &live.iter().collect::<Vec<_>>(), &[]);
+        let plan = plan_repair(&config, "c", None, &live.iter().collect::<Vec<_>>(), &[]);
 
         assert_eq!(plan.len(), 3, "one step per subnet under IKEv1");
         assert_eq!(plan[1].child, "c-2", "the child name follows the subnet's index");
@@ -1439,6 +1467,7 @@ mod tests {
         let plan = plan_repair(
             &config,
             "c",
+            None,
             &live.iter().collect::<Vec<_>>(),
             &["10.2.0.0/24".to_string()],
         );
@@ -1474,7 +1503,7 @@ mod tests {
         // One child for everything (IKEv2), but the gateway accepted two of the
         // three networks.
         let live = [named_child("INSTALLED", "c-4", "4", &["10.1.0.0/24", "10.3.0.0/24"])];
-        let plan = plan_repair(&config, "c", &live.iter().collect::<Vec<_>>(), &[]);
+        let plan = plan_repair(&config, "c", None, &live.iter().collect::<Vec<_>>(), &[]);
 
         assert_eq!(plan.len(), 1, "IKEv2 carries every selector in one child");
         match &plan[0].action {
@@ -1500,6 +1529,7 @@ mod tests {
         let plan = plan_repair(
             &config,
             "c",
+            None,
             &live.iter().collect::<Vec<_>>(),
             &["10.2.0.0/24".to_string()],
         );
@@ -1527,6 +1557,7 @@ mod tests {
         let plan = plan_repair(
             &config,
             "c",
+            None,
             &live.iter().collect::<Vec<_>>(),
             &["10.2.0.0/24".to_string()],
         );
@@ -1542,7 +1573,7 @@ mod tests {
     #[test]
     fn a_tunnel_with_no_children_initiates_every_network() {
         let config = split_config();
-        let plan = plan_repair(&config, "c", &[], &[]);
+        let plan = plan_repair(&config, "c", None, &[], &[]);
         assert_eq!(plan.len(), 3);
         assert!(plan.iter().all(|s| s.action == RepairAction::Initiate));
         assert_eq!(
@@ -1556,7 +1587,7 @@ mod tests {
     #[test]
     fn one_subnet_keeps_the_plain_child_name() {
         let config = bridge::tests::sample();
-        let plan = plan_repair(&config, "c", &[], &[]);
+        let plan = plan_repair(&config, "c", None, &[], &[]);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].child, "c");
     }
@@ -1589,7 +1620,10 @@ mod tests {
         // quick mode cannot put two selector pairs in one SA.
         config.ike_version = IkeVersion::V1;
         let one = [child("INSTALLED", &["10.1.0.0/24", "10.2.0.0/24"])];
-        assert_eq!(live_version(&config, &one.iter().collect::<Vec<_>>()), IkeVersion::V2);
+        assert_eq!(
+            live_version(&config, None, &one.iter().collect::<Vec<_>>()),
+            IkeVersion::V2
+        );
 
         // Several SAs of one network each is the IKEv1 split, whatever the
         // profile claims.
@@ -1598,7 +1632,10 @@ mod tests {
             child("INSTALLED", &["10.1.0.0/24"]),
             child("INSTALLED", &["10.2.0.0/24"]),
         ];
-        assert_eq!(live_version(&config, &split.iter().collect::<Vec<_>>()), IkeVersion::V1);
+        assert_eq!(
+            live_version(&config, None, &split.iter().collect::<Vec<_>>()),
+            IkeVersion::V1
+        );
 
         // Too little evidence — one lone child — falls back to the profile,
         // which is the best guess available. A half-installed IKEv1 tunnel is
@@ -1606,7 +1643,10 @@ mod tests {
         // about it whenever the version fallback did not fire.
         config.ike_version = IkeVersion::V1;
         let lone = [child("INSTALLED", &["10.2.0.0/24"])];
-        assert_eq!(live_version(&config, &lone.iter().collect::<Vec<_>>()), IkeVersion::V1);
+        assert_eq!(
+            live_version(&config, None, &lone.iter().collect::<Vec<_>>()),
+            IkeVersion::V1
+        );
 
         // A child that is not INSTALLED proves nothing about the layout and
         // must not be counted as one of the split's SAs.
@@ -1615,7 +1655,76 @@ mod tests {
             child("REKEYED", &["10.2.0.0/24"]),
         ];
         config.ike_version = IkeVersion::V2;
-        assert_eq!(live_version(&config, &half.iter().collect::<Vec<_>>()), IkeVersion::V2);
+        assert_eq!(
+            live_version(&config, None, &half.iter().collect::<Vec<_>>()),
+            IkeVersion::V2
+        );
+    }
+
+    fn ike(name: &str, version: Option<&str>) -> IkeSa {
+        IkeSa {
+            name: name.to_string(),
+            version: version.map(|v| v.to_string()),
+            state: "ESTABLISHED".to_string(),
+            local_host: "192.168.178.118".to_string(),
+            remote_host: "37.156.94.75".to_string(),
+            virtual_ips: vec![],
+            children: vec![],
+        }
+    }
+
+    /// The version charon reports outranks both the shape of the live SAs and
+    /// the profile. This is the case that bit during a connect: a Sophos .scx
+    /// states no IKE version so it always imports as IKEv2, the gateway
+    /// answered IKEv1, and a repair pass running before enough SAs existed to
+    /// infer from fell back to the profile and asked charon to initiate a child
+    /// name that only exists under IKEv2.
+    #[test]
+    fn what_charon_negotiated_outranks_every_guess() {
+        let mut config = bridge::tests::sample();
+        config.ike_version = IkeVersion::V2;
+        let lone = [child("INSTALLED", &["10.1.0.0/24"])];
+        let live: Vec<&ChildSa> = lone.iter().collect();
+
+        // Too little evidence: without charon's answer this falls back to the
+        // profile, which is exactly the wrong guess for an .scx on IKEv1.
+        assert_eq!(live_version(&config, None, &live), IkeVersion::V2);
+        assert_eq!(
+            live_version(&config, Some(IkeVersion::V1), &live),
+            IkeVersion::V1
+        );
+
+        // It also outranks an inference that would otherwise be confident.
+        let split = [
+            child("INSTALLED", &["10.1.0.0/24"]),
+            child("INSTALLED", &["10.2.0.0/24"]),
+        ];
+        let split: Vec<&ChildSa> = split.iter().collect();
+        assert_eq!(live_version(&config, None, &split), IkeVersion::V1);
+        assert_eq!(
+            live_version(&config, Some(IkeVersion::V2), &split),
+            IkeVersion::V2
+        );
+    }
+
+    #[test]
+    fn the_negotiated_version_comes_from_the_named_connection() {
+        let sas = vec![ike("other", Some("2")), ike("ITM-Office", Some("1"))];
+        assert_eq!(negotiated_version(&sas, "ITM-Office"), Some(IkeVersion::V1));
+        assert_eq!(negotiated_version(&sas, "other"), Some(IkeVersion::V2));
+
+        // No live SA under that name, a version charon did not report, and one
+        // it reported in a form we do not know: all leave the caller to infer
+        // rather than guessing a version out of them.
+        assert_eq!(negotiated_version(&sas, "missing"), None);
+        assert_eq!(negotiated_version(&[ike("x", None)], "x"), None);
+        assert_eq!(negotiated_version(&[ike("x", Some("?"))], "x"), None);
+
+        // charon has spelled it both ways across versions.
+        assert_eq!(
+            negotiated_version(&[ike("x", Some("IKEv1"))], "x"),
+            Some(IkeVersion::V1)
+        );
     }
 
     #[test]

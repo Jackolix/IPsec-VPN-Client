@@ -257,10 +257,18 @@ pub fn import(input: &str) -> Result<ImportedProfile, ImportError> {
         }
     }
 
-    // Nothing in the file states the IKE version. Sophos Connect speaks IKEv2
-    // to an SFOS firewall, and it is the only version the daemon we ship is
-    // built with, so that is what we import — the .tgb path is where IKEv1
-    // shows up explicitly.
+    // Nothing in the file states the IKE version, so this is an assumption:
+    // Sophos Connect speaks IKEv2 to an SFOS firewall, and the .tgb path is
+    // where IKEv1 shows up explicitly.
+    //
+    // It is regularly wrong. Real SFOS gateways answer IKEv1 + XAuth to these
+    // very profiles, and the connect flow then retries and succeeds — so a
+    // tunnel imported from an .scx is often *running* IKEv1 while its config
+    // still says IKEv2. Nothing downstream may treat this field as fact: ask
+    // charon what it negotiated (`negotiated_version` in vpn-control) instead.
+    // The daemon has shipped with ikev1 enabled since 9b3e135, so the old
+    // reason for this default — that IKEv2 was all it could do — no longer
+    // holds; it is now only a starting guess for the first attempt.
     let config = ConnectionConfig {
         name,
         gateway,

@@ -32,6 +32,11 @@ pub struct ChildSa {
 #[derive(Debug, Clone, Serialize)]
 pub struct IkeSa {
     pub name: String,
+    /// The IKE version charon actually negotiated, as it reports it ("1"/"2").
+    /// Authoritative in a way the profile is not: the connect flow retries the
+    /// other version when a gateway rejects the configured one, so a profile
+    /// saying IKEv2 can be running IKEv1.
+    pub version: Option<String>,
     pub state: String,
     pub local_host: String,
     pub remote_host: String,
@@ -68,6 +73,7 @@ fn parse_ike(name: &str, ike: &Message) -> IkeSa {
         .unwrap_or_default();
     IkeSa {
         name: name.to_string(),
+        version: ike.get_str("version"),
         state: ike.get_str("state").unwrap_or_default(),
         local_host: ike.get_str("local-host").unwrap_or_default(),
         remote_host: ike.get_str("remote-host").unwrap_or_default(),
@@ -261,6 +267,7 @@ mod tests {
     fn ike(children: Vec<ChildSa>) -> IkeSa {
         IkeSa {
             name: "ITM-Office".to_string(),
+            version: Some("1".to_string()),
             state: "ESTABLISHED".to_string(),
             local_host: "192.168.178.118".to_string(),
             remote_host: "37.156.94.75".to_string(),
