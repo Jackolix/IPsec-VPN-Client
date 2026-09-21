@@ -1668,6 +1668,23 @@ pub fn probe_hosts(
     Ok(crate::reach::probe_all(&hosts, &ctx, manual))
 }
 
+/// Open the platform's RDP client against one of a profile's hosts.
+///
+/// The row index comes from the web view; the address does not. It is looked up
+/// in the profile's own normalized host list, so the only strings that can
+/// reach a command line are ones the host validator already accepted.
+pub fn open_host_rdp(
+    state: &AppState,
+    id: String,
+    index: usize,
+) -> std::result::Result<String, String> {
+    let (_, hosts, _) = load(state, &id)?;
+    let host = hosts
+        .get(index)
+        .ok_or_else(|| format!("no host {index} in profile {id}"))?;
+    crate::rdp::launch(host)
+}
+
 pub fn status(state: &AppState) -> std::result::Result<Vec<IkeSa>, String> {
     let ssl = crate::ssl::status().unwrap_or_default();
     let mut sas = match vpn_control::status(&state.transport) {

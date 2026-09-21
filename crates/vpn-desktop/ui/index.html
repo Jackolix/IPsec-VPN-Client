@@ -216,6 +216,15 @@
   .haddr:hover { border-color: var(--accent-line); color: var(--accent); }
   .haddr.copied { border-color: rgba(70,194,102,.42); color: var(--ok); }
   .haddr:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* Only drawn for a host on port 3389, so it costs a row nothing until it
+     applies. Shaped like the address chip beside it, accented because it acts
+     rather than copies. */
+  .hrdp { font-size: var(--fs-xs); font-weight: 500; letter-spacing: .04em; color: var(--accent);
+    background: rgba(0,0,0,.22); border: 1px solid var(--accent-line); border-radius: 7px;
+    padding: 4px 8px; cursor: pointer; flex: 0 0 auto; }
+  .hrdp:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .hrdp:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .hrdp:disabled { opacity: .55; cursor: default; }
   .hrtt { font-family: var(--mono); font-size: var(--fs-xs); color: var(--faint); min-width: 54px; text-align: right; flex: 0 0 auto; }
   .hosts-empty { padding: 14px 15px; color: var(--faint); font-size: var(--fs-sm); line-height: 1.5; }
   .hosts-empty code { color: var(--muted); }
@@ -763,7 +772,9 @@
             <span class="hint">The equipment you open this tunnel to reach. Each one can be copied and
               reachability-checked from the connection view. Leave the port empty to check with a ping;
               give it one to check the service with a TCP connect instead — which is what you want for a
-              device that serves a web UI but drops pings. An administrator can ship these instead, in a
+              device that serves a web UI but drops pings. Port <code>3389</code> also gets an
+              <b>RDP</b> button on the connection view, which opens Remote Desktop straight to that
+              address. An administrator can ship these instead, in a
               <code>&lt;profile&gt;.hosts.json</code> beside the profile file.</span>
           </div>
         </div>
@@ -1084,6 +1095,17 @@
       rtt.textContent = s && s.rtt_ms != null ? s.rtt_ms.toFixed(1) + " ms" : (s ? s.probe : "");
       row.appendChild(rtt);
 
+      if (h.port === RDP_PORT) {
+        var rdp = document.createElement("button");
+        rdp.type = "button";
+        rdp.className = "hrdp";
+        rdp.textContent = "RDP";
+        rdp.title = "Open Remote Desktop to " + h.name;
+        rdp.setAttribute("aria-label", "Open Remote Desktop to " + h.name);
+        rdp.addEventListener("click", function () { openRdp(i, h, rdp); });
+        row.appendChild(rdp);
+      }
+
       var shown = h.port ? h.addr + ":" + h.port : h.addr;
       var addr = document.createElement("button");
       addr.type = "button";
@@ -1095,6 +1117,25 @@
 
       el.appendChild(row);
     });
+  }
+
+  // A host on this port is an RDP host; see the `rdp` module for why the port
+  // alone decides it.
+  var RDP_PORT = 3389;
+
+  // The address is deliberately not sent: the backend looks the row up in the
+  // profile's own host list.
+  async function openRdp(index, h, btn) {
+    if (!current || !TAURI) { return; }
+    btn.disabled = true;
+    try {
+      var target = await TAURI.invoke("open_host_rdp", { id: current.id, index: index });
+      log("NET", "Remote Desktop → " + h.name + " (" + target + ")", "good");
+    } catch (e) {
+      log("NET", "Remote Desktop to " + h.name + " failed: " + String(e), "bad");
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   // `manual` is the user pressing Check all, which also permits probing hosts

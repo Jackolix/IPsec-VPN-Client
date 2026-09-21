@@ -16,6 +16,7 @@ mod helper;
 mod hosts;
 mod overrides;
 mod portal;
+mod rdp;
 mod reach;
 mod ssl;
 mod update;
@@ -173,6 +174,22 @@ async fn probe_hosts(
 ) -> Result<Vec<reach::HostStatus>, String> {
     let s = state.inner().clone();
     match tauri::async_runtime::spawn_blocking(move || backend::probe_hosts(&s, id, manual)).await {
+        Ok(result) => result,
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Open the platform's RDP client against the host at `index` in a profile's
+/// list. Spawning the client is quick and never blocks on the far end, but it
+/// touches the filesystem, so it goes to the blocking pool like its neighbours.
+#[tauri::command]
+async fn open_host_rdp(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    index: usize,
+) -> Result<String, String> {
+    let s = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || backend::open_host_rdp(&s, id, index)).await {
         Ok(result) => result,
         Err(e) => Err(e.to_string()),
     }
@@ -831,6 +848,7 @@ fn main() {
             save_profile_edit,
             reset_profile_edit,
             probe_hosts,
+            open_host_rdp,
             set_helper_menu,
             take_link_request,
             confirm_link_import,
