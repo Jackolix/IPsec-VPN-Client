@@ -1,0 +1,318 @@
+Keep a Wintun adapter after its tunnel goes down, and reuse it.
+
+Measured on two connects with 0006 in place (charon.log, 2026-10-19):
+
+    19:55:39 installing new virtual IP 172.16.17.11
+    19:55:41 created Wintun device: {...3385}            ITM-Office, 2s
+    19:56:06 installing new virtual IP 10.0.15.169
+    19:56:10 created Wintun device: {...3385}            IKEv2 gw,   4s
+
+Creating a Wintun adapter is a PnP device install, and 0003 did one on every
+connect -- one adapter per virtual IP, destroyed with the last holder. That
+made it the largest single step of a Windows connect, larger than the whole
+IKEv1 + XAuth handshake before it, and one macOS does not have at all: a utun
+costs nothing.
+
+Wintun deletes an adapter when its handle is closed, so the cost cannot be
+cached anywhere but in the open handle. So:
+
+  del_ip()   when the last holder releases an address, the device is
+             unregistered from charon as before, then cleared -- its address
+             deleted, and any static route still on it -- and kept, up to
+             SPARE_TUNS of them. Past that the old teardown applies.
+  add_ip()   takes a kept device before creating one. set_address(),
+             set_mtu() and the address install run exactly as they do on a
+             fresh device, so nothing downstream can tell the difference.
+  create     queues a job that creates one device ahead of the first tunnel,
+             so the first connect after the service starts finds one kept
+             too. A job, not inline: charon does not answer vici until its
+             plugins have loaded, and nothing is waiting on this one.
+  destroy    takes the kept devices down with the rest, so shutdown still
+             leaves no adapter behind. (Shutdown cancels jobs before it
+             unloads plugins, so the warm-up cannot outlive the backend.)
+
+A kept device is not in `tuns`, so it is never mistaken for a holder of a
+virtual IP, and it is unregistered before its address changes: the libipsec
+router keys its devices by address. Packets Windows sends to an idle adapter
+queue in its socketpair and are read, and dropped by libipsec for want of a
+policy, once the device carries a tunnel again.
+
+What made reuse safe to ship is the refresh in wait_for_addr(). charon's
+interface list only learns addresses from NotifyIpInterfaceChange(), and an
+address added to an adapter that is already up changes no interface -- a new
+adapter got away with it because its state flips as its address goes on. The
+first build of this patch had no refresh and failed exactly that way, twice
+in a row (2026-10-19, 20:16 and 20:19):
+
+    reusing adapter '{...3385}'
+    virtual IP 172.16.17.11 did not appear on '{...3385}'      4s later
+    installing virtual IP 172.16.17.11 failed
+    installing route: 10.100.1.220/32 src 192.0.2.10 dev {...3384}
+
+-- the address was on the adapter; charon just never heard of it, dropped the
+adapter, and routed the tunnel from the physical address. So the wait re-reads
+the adapter list itself between polls, and park_tun() does the same after
+clearing an adapter, so its old address leaves charon's view straight away.
+
+diff -ru orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c
+--- orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-10-19 18:22:57.783940462 +0000
++++ work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-10-19 18:22:57.810913477 +0000
+@@ -74,6 +74,12 @@
+ 	linked_list_t *tuns;
+ 
+ 	/**
++	 * Idle TUN devices (tun_device_t), each with its adapter, kept for the
++	 * next virtual IP instead of being torn down -- see park_tun().
++	 */
++	linked_list_t *spares;
++
++	/**
+ 	 * Earliest time of the next roam event
+ 	 */
+ 	timeval_t roam_next;
+@@ -472,9 +478,27 @@
+ 	tun_device_t *tun;
+ 	/** how many IKE_SAs have this address installed */
+ 	int refs;
++	/** the adapter, to clear it before it is kept for the next tunnel */
++	NET_LUID luid;
+ } vip_tun_t;
+ 
+ /**
++ * How many idle adapters to keep for the next tunnel.
++ *
++ * Creating a Wintun adapter is a PnP device install: two seconds on a quiet
++ * machine, four and more on a busy one, measured in the middle of every
++ * connect between "installing new virtual IP" and "created Wintun device".
++ * It was the largest single step of a Windows connect, and one macOS does not
++ * have (a utun costs nothing). Wintun removes an adapter when its handle is
++ * closed, so the only way to not pay it again is to not close it: an adapter
++ * whose tunnel went down is cleared and kept, and the next tunnel takes it.
++ *
++ * Kept bounded, because each one is a visible (if addressless and idle)
++ * network adapter; beyond this many the old teardown applies.
++ */
++#define SPARE_TUNS 2
++
++/**
+  * Destroy an entry, taking its adapter down with it
+  */
+ static void vip_tun_destroy(vip_tun_t *entry)
+@@ -724,6 +748,23 @@
+ 	return ConvertInterfaceGuidToLuid(&guid, luid) == NO_ERROR;
+ }
+ 
++/**
++ * Re-read every adapter's addresses now, rather than wait to be told.
++ *
++ * The interface list is fed by NotifyIpInterfaceChange(), which reports
++ * changes to an *interface*: one appearing, or its state flipping. A freshly
++ * created adapter does both while its first address goes on, so the address
++ * always arrived with them. An address added to an adapter that is already up
++ * -- a kept one, see park_tun() -- changes no interface, nothing is reported,
++ * and charon never learns the address is there: add_ip() gave up on it as
++ * "did not appear", tore the adapter down, and the tunnel came up with no
++ * virtual IP and routes sourced from the physical address. Not under the mutex.
++ */
++static void refresh_ifaces(private_kernel_iph_net_t *this)
++{
++	change_interface(this, NULL, MibParameterNotification);
++}
++
+ /** how long to wait for an installed address to show up, and how often to look */
+ #define ADDR_WAIT_MS 2000
+ #define ADDR_POLL_MS 20
+@@ -751,12 +792,131 @@
+ 			return TRUE;
+ 		}
+ 		this->mutex->unlock(this->mutex);
++		refresh_ifaces(this);
+ 		Sleep(ADDR_POLL_MS);
+ 	}
+ 	return FALSE;
+ }
+ 
+ /**
++ * Remove what a tunnel left on an adapter we are about to keep: its address,
++ * and any route still pointing at it. The route should already be gone --
++ * kernel-libipsec removes each with the last CHILD_SA using it -- but an
++ * adapter waiting for its next tunnel must not carry traffic for its last one,
++ * so anything static that survived goes too.
++ */
++static void clear_tun(NET_LUID luid, host_t *ip)
++{
++	MIB_UNICASTIPADDRESS_ROW addr;
++	MIB_IPFORWARD_TABLE2 *table;
++	ULONG i;
++
++	InitializeUnicastIpAddressEntry(&addr);
++	addr.InterfaceLuid = luid;
++	memcpy(&addr.Address, ip->get_sockaddr(ip), *ip->get_sockaddr_len(ip));
++	DeleteUnicastIpAddressEntry(&addr);
++
++	if (GetIpForwardTable2(AF_UNSPEC, &table) == NO_ERROR)
++	{
++		for (i = 0; i < table->NumEntries; i++)
++		{
++			if (table->Table[i].InterfaceLuid.Value == luid.Value &&
++				table->Table[i].Protocol == MIB_IPPROTO_NETMGMT)
++			{
++				DeleteIpForwardEntry2(&table->Table[i]);
++			}
++		}
++		FreeMibTable(table);
++	}
++}
++
++/**
++ * Release a device whose last holder is gone: keep it for the next tunnel if
++ * there is room, tear it down otherwise. It must already be unregistered from
++ * charon, so nothing routes into it while it is cleared. Not under the mutex.
++ */
++static void park_tun(private_kernel_iph_net_t *this, vip_tun_t *entry,
++					 host_t *ip)
++{
++	bool keep;
++
++	clear_tun(entry->luid, ip);
++	/* and drop it from our view now: a next tunnel given the same address
++	 * would otherwise find it "already there" before it is installed again */
++	refresh_ifaces(this);
++
++	this->mutex->lock(this->mutex);
++	keep = this->spares->get_count(this->spares) < SPARE_TUNS;
++	if (keep)
++	{
++		this->spares->insert_last(this->spares, entry->tun);
++	}
++	this->mutex->unlock(this->mutex);
++
++	if (keep)
++	{
++		DBG2(DBG_KNL, "keeping adapter '%s' for the next tunnel",
++			 entry->tun->get_name(entry->tun));
++		free(entry);
++		return;
++	}
++	vip_tun_destroy(entry);
++}
++
++/**
++ * A kept adapter for a new virtual IP, or a new one when none is kept.
++ */
++static tun_device_t *take_tun(private_kernel_iph_net_t *this)
++{
++	tun_device_t *tun = NULL;
++
++	this->mutex->lock(this->mutex);
++	this->spares->remove_first(this->spares, (void**)&tun);
++	this->mutex->unlock(this->mutex);
++
++	if (tun)
++	{
++		DBG2(DBG_KNL, "reusing adapter '%s'", tun->get_name(tun));
++		return tun;
++	}
++	return lib->tun->create(lib->tun, NULL);
++}
++
++/**
++ * Create one adapter ahead of the first tunnel, so that tunnel finds it kept
++ * rather than waiting for a device install. Runs as a job: charon is not yet
++ * answering vici while plugins load, and nobody is waiting on this.
++ */
++static job_requeue_t warm_spare(private_kernel_iph_net_t *this)
++{
++	tun_device_t *tun;
++	bool keep;
++
++	tun = lib->tun->create(lib->tun, NULL);
++	if (!tun)
++	{
++		return JOB_REQUEUE_NONE;
++	}
++	this->mutex->lock(this->mutex);
++	keep = this->spares->get_count(this->spares) < SPARE_TUNS;
++	if (keep)
++	{
++		this->spares->insert_last(this->spares, tun);
++	}
++	this->mutex->unlock(this->mutex);
++	if (keep)
++	{
++		DBG2(DBG_KNL, "adapter '%s' ready for the first tunnel",
++			 tun->get_name(tun));
++	}
++	else
++	{
++		tun->destroy(tun);
++	}
++	return JOB_REQUEUE_NONE;
++}
++
++/**
+  * Unregister and destroy a TUN device add_ip() could not finish setting up
+  */
+ static void drop_tun(private_kernel_iph_net_t *this, vip_tun_t *entry)
+@@ -814,7 +974,7 @@
+ 	{
+ 		prefix = (virtual_ip->get_family(virtual_ip) == AF_INET) ? 32 : 128;
+ 	}
+-	tun = lib->tun->create(lib->tun, NULL);
++	tun = take_tun(this);
+ 	if (!tun)
+ 	{
+ 		DBG1(DBG_KNL, "creating a TUN device for %H failed", virtual_ip);
+@@ -842,6 +1002,7 @@
+ 	INIT(entry,
+ 		.tun = tun,
+ 		.refs = 1,
++		.luid = luid,
+ 	);
+ 
+ 	/* register before installing the address: the device list is what marks an
+@@ -928,11 +1089,11 @@
+ 			 virtual_ip, refs);
+ 		return SUCCESS;
+ 	}
+-	/* outside the lock: removing an adapter takes a moment, and this mutex
+-	 * also serialises the interface-change callbacks. Destroying it takes the
+-	 * adapter down with the address and any route left on it, and frees the
+-	 * adapter slot for the next tunnel. */
+-	vip_tun_destroy(last);
++	/* outside the lock: clearing or removing an adapter takes a moment, and
++	 * this mutex also serialises the interface-change callbacks. The adapter
++	 * is cleared and kept for the next tunnel, or torn down -- with the address
++	 * and any route left on it -- when enough are kept already. */
++	park_tun(this, last, virtual_ip);
+ 
+ 	DBG2(DBG_KNL, "removed virtual IP %H", virtual_ip);
+ 	return SUCCESS;
+@@ -1055,6 +1216,7 @@
+ 	this->ifaces->destroy_function(this->ifaces, (void*)iface_destroy);
+ 	/* takes the adapters down with them, so none is left behind on shutdown */
+ 	this->tuns->destroy_function(this->tuns, (void*)vip_tun_destroy);
++	this->spares->destroy_offset(this->spares, offsetof(tun_device_t, destroy));
+ 	free(this);
+ }
+ 
+@@ -1086,6 +1248,7 @@
+ 		.mutex = mutex_create(MUTEX_TYPE_DEFAULT),
+ 		.ifaces = linked_list_create(),
+ 		.tuns = linked_list_create(),
++		.spares = linked_list_create(),
+ 	);
+ 	/* PIPINTERFACE_CHANGE_CALLBACK is not using WINAPI in MinGW, which seems
+ 	 * to be wrong. Force a cast to our WINAPI call */
+@@ -1098,6 +1261,11 @@
+ 		destroy(this);
+ 		return NULL;
+ 	}
++	/* shutdown cancels jobs before it unloads plugins, so this cannot outlive
++	 * the backend it fills */
++	lib->processor->queue_job(lib->processor,
++		(job_t*)callback_job_create((callback_job_cb_t)warm_spare, this,
++									NULL, NULL));
+ 
+ 	return &this->public;
+ }

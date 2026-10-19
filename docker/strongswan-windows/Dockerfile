@@ -92,13 +92,18 @@ COPY docker/strongswan-windows/0005-quick-mode-reqid-refcount.patch /src/
 #       virtual IP can be bound to the moment it is installed instead of
 #       seconds later.
 COPY docker/strongswan-windows/0006-skip-dad-on-the-tunnel-address.patch /src/
+# 0007: keep an adapter after its tunnel goes down and hand it to the next
+#       one, plus one made ahead at startup -- a Wintun adapter install is
+#       2-4s, and 0003 paid it on every connect.
+COPY docker/strongswan-windows/0007-keep-and-reuse-wintun-adapters.patch /src/
 RUN cd "strongswan-${STRONGSWAN_VER}" \
     && patch -p1 --fuzz=0 < /src/0001-kernel-iph-install-virtual-ips.patch \
     && patch -p1 --fuzz=0 < /src/0002-wintun-tun-device-plugin.patch \
     && patch -p1 --fuzz=0 < /src/0003-per-tunnel-wintun-adapter.patch \
     && patch -p1 --fuzz=0 < /src/0004-reqid-accounting-log.patch \
     && patch -p1 --fuzz=0 < /src/0005-quick-mode-reqid-refcount.patch \
-    && patch -p1 --fuzz=0 < /src/0006-skip-dad-on-the-tunnel-address.patch
+    && patch -p1 --fuzz=0 < /src/0006-skip-dad-on-the-tunnel-address.patch \
+    && patch -p1 --fuzz=0 < /src/0007-keep-and-reuse-wintun-adapters.patch
 
 # The wintun patch touches configure.ac/Makefile.am, so regenerate the build
 # system (the release tarball ships pre-generated ones).
