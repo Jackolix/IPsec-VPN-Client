@@ -73,6 +73,12 @@ pub struct ConnectOutcome {
     /// subnet has no policy — and those need different advice.
     pub kind: Option<FailureKind>,
     pub log: Vec<LogLine>,
+    /// The IKE version the tunnel came up at, when [`connect_logged`] brought
+    /// it up. It differs from the profile's when the version fallback is what
+    /// got through — and the caller can then start there next time, rather
+    /// than spend a round trip on a version the gateway is known to refuse.
+    #[serde(skip)]
+    pub ike_version: Option<IkeVersion>,
 }
 
 impl ConnectOutcome {
@@ -83,6 +89,7 @@ impl ConnectOutcome {
             error: None,
             kind: None,
             log,
+            ike_version: None,
         }
     }
 
@@ -93,6 +100,7 @@ impl ConnectOutcome {
             error: Some(error),
             kind: Some(kind),
             log,
+            ike_version: None,
         }
     }
 }
@@ -490,7 +498,9 @@ pub fn connect_logged(
             log.truncate(MAX_LOG_LINES);
         }
         if retry.connected {
-            return Ok(ConnectOutcome::ok(log));
+            let mut ok = ConnectOutcome::ok(log);
+            ok.ike_version = Some(alternate);
+            return Ok(ok);
         }
         // On a double failure, report whichever attempt learned something. The
         // first one is preferred — it ran at the version the user configured —
@@ -508,9 +518,13 @@ pub fn connect_logged(
             error,
             kind,
             log,
+            ike_version: None,
         });
     }
 
+    if outcome.connected {
+        outcome.ike_version = Some(primary);
+    }
     Ok(outcome)
 }
 

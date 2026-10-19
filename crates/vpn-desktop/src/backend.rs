@@ -1022,6 +1022,7 @@ pub fn delete_profile(state: &AppState, id: String) -> std::result::Result<(), S
         Err(e) => return Err(format!("cannot delete {}: {e}", path.display())),
     }
     crate::overrides::clear(&state.profile_dir, &id)?;
+    let _ = std::fs::remove_file(learned_version_path(state, &id));
     crate::creds::delete(&id)?;
     // The XAuth/EAP login is a second keychain entry and would otherwise be
     // inherited by the next profile imported under the same name.
@@ -1049,7 +1050,18 @@ pub fn connect(
     if is_ssl_profile(state, &id) {
         return ssl_connect(state, &id, login);
     }
-    let (mut imported, _, _) = load(state, &id)?;
+    let (mut imported, _, edited) = load(state, &id)?;
+    // Start at the IKE version this gateway last came up at, unless the user
+    // chose one by hand. The fallback in `connect_logged` still covers a
+    // gateway that has changed since; this only skips the attempt it already
+    // knows will be refused.
+    let profile_version = imported.config.ike_version;
+    let hand_set = edited.iter().any(|f| f == "ike_version");
+    if !hand_set {
+        if let Some(v) = learned_version(state, &id) {
+            imported.config.ike_version = v;
+        }
+    }
     // Prefer a PSK saved in the OS keychain over the one parsed from the
     // (plaintext-on-disk) profile file, so saved credentials are what actually
     // authenticate the tunnel.
@@ -1104,6 +1116,10 @@ pub fn connect(
     )
     .map_err(|e| e.to_string())?;
 
+    if let (Some(v), false) = (outcome.ike_version, hand_set) {
+        remember_version(state, &id, v, profile_version);
+    }
+
     // An established CHILD_SA does not mean the tunnel carries traffic yet: the
     // assigned virtual IP still has to land on an OS interface first.
     if outcome.connected && imported.config.request_virtual_ip {
@@ -1134,6 +1150,38 @@ pub fn connect(
         }
     }
     Ok(outcome)
+}
+
+/// Where the IKE version a profile's gateway actually answers is kept.
+///
+/// A Sophos `.scx` states no IKE version, so it imports as IKEv2, and an SFOS
+/// 18.5 gateway refuses that with NO_PROPOSAL_CHOSEN on every connect before
+/// the IKEv1 retry gets through — a wasted round trip and a log line, each
+/// time. Kept beside the profile rather than in its override sidecar, which
+/// is the user's own edits and is shown to them as such.
+fn learned_version_path(state: &AppState, id: &str) -> PathBuf {
+    state.profile_dir.join(format!("{id}.ikever"))
+}
+
+fn learned_version(state: &AppState, id: &str) -> Option<vpn_core::IkeVersion> {
+    let text = std::fs::read_to_string(learned_version_path(state, id)).ok()?;
+    vpn_core::IkeVersion::from_name(text.trim())
+}
+
+/// Record the version a connect came up at, or forget it again once it is
+/// the profile's own. Best-effort: losing it costs one round trip next time.
+fn remember_version(
+    state: &AppState,
+    id: &str,
+    negotiated: vpn_core::IkeVersion,
+    profile: vpn_core::IkeVersion,
+) {
+    let path = learned_version_path(state, id);
+    if negotiated == profile {
+        let _ = std::fs::remove_file(path);
+    } else {
+        let _ = std::fs::write(path, negotiated.name());
+    }
 }
 
 /// Bring back the remote networks of a live tunnel that are not carrying
@@ -1833,6 +1881,20 @@ mod tests {
         });
         assert!(save_profile_edit(&s, "p".to_string(), edit).is_err());
         assert!(crate::overrides::load(&s.profile_dir, "p").hosts.is_none());
+    }
+
+    #[test]
+    fn a_fallback_version_is_remembered_until_it_matches_the_profile() {
+        use vpn_core::IkeVersion::{V1, V2};
+        let s = scratch_state("ikever");
+        assert_eq!(learned_version(&s, "p"), None);
+        // The .scx said IKEv2, the gateway only took IKEv1: start there next time.
+        remember_version(&s, "p", V1, V2);
+        assert_eq!(learned_version(&s, "p"), Some(V1));
+        // The gateway was upgraded and the profile's own version works again.
+        remember_version(&s, "p", V2, V2);
+        assert_eq!(learned_version(&s, "p"), None);
+        assert!(!learned_version_path(&s, "p").exists());
     }
 
     /// A throwaway state whose profile directory is empty and per-test.
