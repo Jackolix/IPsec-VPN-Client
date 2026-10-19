@@ -2461,6 +2461,13 @@
       var missing = missingNets(p, sa);
       var now = addressGone || dead.length > 0 || missing.length > 0;
 
+      // Only a tunnel the connect has finished building is judged. Under IKEv1
+      // the children come up one at a time, so mid-connect the SA is listed
+      // with only some of them — which read as "missing", started a repair
+      // that initiated every network a second time (duplicate SAs), and then
+      // announced it had "re-established" a tunnel that had only just been
+      // asked for. Mid-disconnect it is being taken apart on purpose.
+      if (state[p.id] !== "established") { return; }
       // Remembered even when the verdict has not changed, because it is what
       // the repair pass acts on and which network is down can change from one
       // poll to the next while the tunnel stays broken.
