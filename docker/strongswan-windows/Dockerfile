@@ -48,10 +48,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 
 # ---- OpenSSL (MinGW cross build) ----
+# With its assembly (the mingw64 target emits GNU as, so the MinGW toolchain
+# builds it as is). It used to be built no-asm, which left every bignum, AES
+# and SHA operation in portable C: measured on the dev box, RSA-2048 409 -> 3818
+# signs/s, AES-256-CBC 224 -> 1455 MB/s, SHA-256 236 -> 1649 MB/s. That mattered
+# twice over -- strongSwan's MODP_2048 Diffie-Hellman (full-length exponent)
+# took 80-180ms per exchange, once for main mode and once per IKEv1 subnet, and
+# ESP itself runs in userland through this library, so it capped the tunnel.
 RUN wget -q "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz" \
     && tar xf "openssl-${OPENSSL_VER}.tar.gz"
 RUN cd "openssl-${OPENSSL_VER}" \
-    && ./Configure mingw64 shared no-asm no-tests \
+    && ./Configure mingw64 shared no-tests \
         --prefix="${PREFIX}" --libdir=lib --cross-compile-prefix="${MINGW}-" \
     && make -j"$(nproc)" \
     && make install_sw
