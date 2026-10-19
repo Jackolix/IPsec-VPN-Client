@@ -40,4 +40,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
     "Win32_System_Threading",
+    # NRPT rules are registry keys the DNS Client service watches — see `nrpt`.
+    "Win32_System_Registry",
 ] }

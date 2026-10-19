@@ -51,8 +51,8 @@ fn namespace(domain: Option<&str>) -> String {
 /// own servers, and nobody else's names are touched.
 ///
 /// The octets are re-parsed as numbers rather than passed through as text: this
-/// string ends up inside a single-quoted PowerShell argument, so it must not be
-/// possible to smuggle anything through a malformed subnet.
+/// string becomes a namespace in the system's DNS policy, so nothing but a
+/// well-formed reverse zone may reach it through a malformed subnet.
 fn reverse_zone(cidr: &str) -> Option<String> {
     let (addr, prefix) = cidr.split_once('/')?;
     let prefix: u8 = prefix.trim().parse().ok()?;
@@ -87,22 +87,245 @@ fn holder_of(ns: &str) -> Option<String> {
     None
 }
 
-/// Run a PowerShell snippet as the current (SYSTEM) user and surface failures.
-fn run_ps(body: &str) -> Result<(), String> {
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", body])
-        .output()
-        .map_err(|e| format!("failed to run powershell: {e}"))?;
-    if out.status.success() {
-        return Ok(());
+/// The local NRPT, as the DNS Client service reads it.
+///
+/// This used to go through `Add-DnsClientNrptRule` and friends, and that cost
+/// more than the whole IKE handshake: every call started a PowerShell, loaded
+/// the DnsClient CIM module and only then touched the table — 2 to 4.5 s
+/// measured, once on connect and again on disconnect, which is most of why a
+/// tunnel took ten seconds here and one on macOS. The cmdlets are a front end
+/// for this registry key: a rule is one subkey, and the DNS Client service
+/// watches the key and re-reads the table when it changes. So write it
+/// directly, the way other VPN clients do, and flush the resolver cache so
+/// names already cached against the old table are looked up again.
+///
+/// Same scope as before: these are *local* rules. A machine that receives NRPT
+/// rules from Group Policy ignores the local table entirely, with or without
+/// PowerShell.
+mod table {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteTreeW, RegEnumKeyExW, RegOpenKeyExW,
+        RegQueryValueExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE,
+        REG_DWORD, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+
+    const BASE: &str = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig";
+
+    /// `ConfigOptions` bit for "send these names to GenericDNSServers" — what
+    /// `Add-DnsClientNrptRule -NameServers` sets, and all a split-DNS rule is.
+    const GENERIC_DNS_SERVERS: u32 = 0x8;
+    /// The rule format `Add-DnsClientNrptRule` writes on every supported Windows.
+    const RULE_VERSION: u32 = 2;
+
+    #[link(name = "dnsapi")]
+    extern "system" {
+        /// Exported by dnsapi.dll and what `Clear-DnsClientCache` and
+        /// `ipconfig /flushdns` call; absent from the SDK headers, hence here.
+        fn DnsFlushResolverCache() -> i32;
     }
-    let err = String::from_utf8_lossy(&out.stderr);
-    let msg = err.trim();
-    Err(if msg.is_empty() {
-        format!("powershell exited with {}", out.status)
-    } else {
-        msg.to_string()
-    })
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// An open registry key, closed on drop.
+    struct Key(HKEY);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            unsafe { RegCloseKey(self.0) };
+        }
+    }
+
+    fn open(path: &str, access: u32) -> Result<Option<Key>, String> {
+        let mut h: HKEY = null_mut();
+        let rc = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, wide(path).as_ptr(), 0, access, &mut h) };
+        match rc {
+            ERROR_SUCCESS => Ok(Some(Key(h))),
+            ERROR_FILE_NOT_FOUND => Ok(None),
+            rc => Err(format!("cannot open HKLM\\{path}: error {rc}")),
+        }
+    }
+
+    fn create(path: &str) -> Result<Key, String> {
+        let mut h: HKEY = null_mut();
+        let rc = unsafe {
+            RegCreateKeyExW(
+                HKEY_LOCAL_MACHINE,
+                wide(path).as_ptr(),
+                0,
+                std::ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_WRITE,
+                std::ptr::null(),
+                &mut h,
+                null_mut(),
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(format!("cannot create HKLM\\{path}: error {rc}"));
+        }
+        Ok(Key(h))
+    }
+
+    fn set(key: &Key, name: &str, kind: u32, data: &[u8]) -> Result<(), String> {
+        let rc = unsafe {
+            RegSetValueExW(key.0, wide(name).as_ptr(), 0, kind, data.as_ptr(), data.len() as u32)
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(format!("cannot write NRPT value {name}: error {rc}"));
+        }
+        Ok(())
+    }
+
+    fn set_dword(key: &Key, name: &str, v: u32) -> Result<(), String> {
+        set(key, name, REG_DWORD, &v.to_le_bytes())
+    }
+
+    /// REG_SZ and REG_MULTI_SZ both travel as UTF-16LE bytes; a multi-string
+    /// is each entry NUL-terminated plus one more NUL to end the list.
+    fn utf16_bytes(units: &[u16]) -> Vec<u8> {
+        units.iter().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    fn set_sz(key: &Key, name: &str, v: &str) -> Result<(), String> {
+        set(key, name, REG_SZ, &utf16_bytes(&wide(v)))
+    }
+
+    fn set_multi_sz(key: &Key, name: &str, items: &[&str]) -> Result<(), String> {
+        let mut units: Vec<u16> = Vec::new();
+        for item in items {
+            units.extend(wide(item));
+        }
+        units.push(0);
+        set(key, name, REG_MULTI_SZ, &utf16_bytes(&units))
+    }
+
+    /// The namespaces a rule subkey covers (its `Name` multi-string).
+    fn rule_names(sub: &str) -> Vec<String> {
+        let Ok(Some(rule)) = open(&format!("{BASE}\\{sub}"), KEY_READ) else {
+            return Vec::new();
+        };
+        let name = wide("Name");
+        let mut len: u32 = 0;
+        let rc = unsafe {
+            RegQueryValueExW(rule.0, name.as_ptr(), null_mut(), null_mut(), null_mut(), &mut len)
+        };
+        if rc != ERROR_SUCCESS || len == 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u16; (len as usize).div_ceil(2)];
+        let rc = unsafe {
+            RegQueryValueExW(
+                rule.0,
+                name.as_ptr(),
+                null_mut(),
+                null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Vec::new();
+        }
+        buf.split(|&u| u == 0)
+            .filter(|s| !s.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect()
+    }
+
+    /// Every rule subkey's name.
+    fn subkeys(base: &Key) -> Vec<String> {
+        let mut out = Vec::new();
+        for index in 0.. {
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            let rc = unsafe {
+                RegEnumKeyExW(
+                    base.0,
+                    index,
+                    buf.as_mut_ptr(),
+                    &mut len,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                )
+            };
+            if rc == ERROR_NO_MORE_ITEMS || rc != ERROR_SUCCESS {
+                break;
+            }
+            out.push(String::from_utf16_lossy(&buf[..len as usize]));
+        }
+        out
+    }
+
+    /// Delete every rule covering `ns` — ours, or one something else left
+    /// behind — exactly as the `Where-Object` pipeline it replaces did.
+    pub fn remove(ns: &str) -> Result<(), String> {
+        let Some(base) = open(BASE, KEY_READ)? else {
+            return Ok(());
+        };
+        // Collected first: deleting while enumerating shifts the indices.
+        let doomed: Vec<String> = subkeys(&base)
+            .into_iter()
+            .filter(|sub| rule_names(sub).iter().any(|n| n.eq_ignore_ascii_case(ns)))
+            .collect();
+        drop(base);
+        for sub in doomed {
+            let path = wide(&format!("{BASE}\\{sub}"));
+            // A rule has no subkeys, but nothing stops one being given some;
+            // the tree delete clears them, the key delete takes the rule.
+            let rc = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, path.as_ptr()) };
+            if rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND {
+                return Err(format!("cannot remove the NRPT rule for {ns}: error {rc}"));
+            }
+            let rc = unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, path.as_ptr()) };
+            if rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND {
+                return Err(format!("cannot remove the NRPT rule for {ns}: error {rc}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Add the rule `ns` -> `servers`, under a subkey named for it.
+    pub fn add(ns: &str, servers: &[String]) -> Result<(), String> {
+        let rule = create(&format!("{BASE}\\{}", super::rule_key(ns)))?;
+        set_dword(&rule, "Version", RULE_VERSION)?;
+        set_multi_sz(&rule, "Name", &[ns])?;
+        set_sz(&rule, "GenericDNSServers", &servers.join("; "))?;
+        set_dword(&rule, "ConfigOptions", GENERIC_DNS_SERVERS)?;
+        set_sz(&rule, "IPSECCARestriction", "")?;
+        set_sz(&rule, "Comment", "")?;
+        set_sz(&rule, "DisplayName", "")?;
+        Ok(())
+    }
+
+    pub fn flush() {
+        unsafe { DnsFlushResolverCache() };
+    }
+}
+
+/// The registry subkey a namespace's rule lives under: a GUID, as every NRPT
+/// rule's is, but derived from the namespace so a reconnect rewrites the same
+/// rule rather than adding a twin. FNV-1a, twice with different offsets, for
+/// 128 bits — this needs to be stable and distinct, not secret.
+fn rule_key(ns: &str) -> String {
+    fn fnv(seed: u64, s: &str) -> u64 {
+        s.bytes().fold(seed, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+    }
+    let ns = ns.to_ascii_lowercase();
+    let a = fnv(0xcbf2_9ce4_8422_2325, &ns);
+    let b = fnv(0x8422_2325_cbf2_9ce4, &format!("ipsec-vpn:{ns}"));
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:04X}-{:012X}}}",
+        a >> 32,
+        (a >> 16) & 0xffff,
+        a & 0xffff,
+        b >> 48,
+        b & 0xffff_ffff_ffff
+    )
 }
 
 /// Route DNS for this connection over the tunnel via NRPT rules. Returns a short
@@ -162,18 +385,14 @@ pub fn apply(
         });
     }
 
-    let list = servers.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(",");
+    let list: Vec<String> = servers.iter().map(|s| s.to_string()).collect();
     for ns in &mine {
         // Replace any stale rule for this namespace (ours, or one left behind by
         // something that crashed), then add ours.
-        let body = format!(
-            "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -contains '{ns}' }} | \
-             Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue;\
-             Add-DnsClientNrptRule -Namespace '{ns}' -NameServers @({list});\
-             Clear-DnsClientCache -ErrorAction SilentlyContinue"
-        );
-        run_ps(&body)?;
+        table::remove(ns)?;
+        table::add(ns, &list)?;
     }
+    table::flush();
 
     // Record the namespaces so a revert removes exactly the rules we added.
     let _ = std::fs::create_dir_all(record_dir());
@@ -246,12 +465,9 @@ fn remove_namespace(ns: &str) -> Result<(), String> {
     if ns.is_empty() {
         return Ok(());
     }
-    let body = format!(
-        "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -contains '{ns}' }} | \
-         Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue;\
-         Clear-DnsClientCache -ErrorAction SilentlyContinue"
-    );
-    run_ps(&body)
+    table::remove(ns)?;
+    table::flush();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -280,11 +496,23 @@ mod tests {
 
     #[test]
     fn reverse_zone_rejects_anything_not_a_subnet() {
-        // The result is interpolated into PowerShell, so a non-numeric octet has
+        // The result becomes a system DNS namespace, so a non-numeric octet has
         // to be refused rather than passed through.
         assert_eq!(reverse_zone("10.98.x.0/24"), None);
         assert_eq!(reverse_zone("10.0.0.0/8'; Stop-Service #"), None);
         assert_eq!(reverse_zone("evil"), None);
         assert_eq!(reverse_zone("10.0.0.0/99"), None);
+    }
+
+    #[test]
+    fn a_namespace_always_maps_to_the_same_guid_shaped_key() {
+        let key = rule_key(".corp.example");
+        assert_eq!(key.len(), 38, "{key}");
+        assert!(key.starts_with('{') && key.ends_with('}'));
+        assert_eq!(key.matches('-').count(), 4);
+        // Stable, and case-blind like DNS — a reconnect must land on the same rule.
+        assert_eq!(key, rule_key(".CORP.example"));
+        assert_ne!(key, rule_key(".other.local"));
+        assert_ne!(rule_key("."), rule_key(".43.98.10.in-addr.arpa"));
     }
 }

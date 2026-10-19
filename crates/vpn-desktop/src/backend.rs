@@ -1022,6 +1022,7 @@ pub fn delete_profile(state: &AppState, id: String) -> std::result::Result<(), S
         Err(e) => return Err(format!("cannot delete {}: {e}", path.display())),
     }
     crate::overrides::clear(&state.profile_dir, &id)?;
+    let _ = std::fs::remove_file(learned_version_path(state, &id));
     crate::creds::delete(&id)?;
     // The XAuth/EAP login is a second keychain entry and would otherwise be
     // inherited by the next profile imported under the same name.
@@ -1049,7 +1050,21 @@ pub fn connect(
     if is_ssl_profile(state, &id) {
         return ssl_connect(state, &id, login);
     }
-    let (mut imported, _, _) = load(state, &id)?;
+    // Stage timings, reported in the transcript: "it took ten seconds" is
+    // only actionable once it says which of these took them.
+    let started = std::time::Instant::now();
+    let (mut imported, _, edited) = load(state, &id)?;
+    // Start at the IKE version this gateway last came up at, unless the user
+    // chose one by hand. The fallback in `connect_logged` still covers a
+    // gateway that has changed since; this only skips the attempt it already
+    // knows will be refused.
+    let profile_version = imported.config.ike_version;
+    let hand_set = edited.iter().any(|f| f == "ike_version");
+    if !hand_set {
+        if let Some(v) = learned_version(state, &id) {
+            imported.config.ike_version = v;
+        }
+    }
     // Prefer a PSK saved in the OS keychain over the one parsed from the
     // (plaintext-on-disk) profile file, so saved credentials are what actually
     // authenticate the tunnel.
@@ -1096,6 +1111,7 @@ pub fn connect(
         return Ok(outcome);
     }
 
+    let prepared = started.elapsed();
     let mut outcome = vpn_control::connect_logged(
         &state.transport,
         &imported.config,
@@ -1103,12 +1119,18 @@ pub fn connect(
         user_password.as_ref(),
     )
     .map_err(|e| e.to_string())?;
+    let handshake = started.elapsed() - prepared;
+
+    if let (Some(v), false) = (outcome.ike_version, hand_set) {
+        remember_version(state, &id, v, profile_version);
+    }
 
     // An established CHILD_SA does not mean the tunnel carries traffic yet: the
     // assigned virtual IP still has to land on an OS interface first.
     if outcome.connected && imported.config.request_virtual_ip {
         wait_for_virtual_ip(state, &name, &mut outcome);
     }
+    let addressed = started.elapsed() - prepared - handshake;
 
     // With the tunnel up, apply DNS so names on the remote network resolve over
     // the VPN. Two sources, merged: the profile's own servers, and any the
@@ -1132,8 +1154,80 @@ pub fn connect(
         if !dns.servers.is_empty() {
             apply_dns(state, &name, &dns, &remote_subnets(&imported.config), &mut outcome);
         }
+        let total = started.elapsed();
+        let dns = total - prepared - handshake - addressed;
+        note(
+            &mut outcome,
+            &name,
+            2,
+            format!(
+                "connected in {:.1}s — preparing {:.1}s, handshake {:.1}s, virtual IP {:.1}s, DNS {:.1}s",
+                total.as_secs_f32(),
+                prepared.as_secs_f32(),
+                handshake.as_secs_f32(),
+                addressed.as_secs_f32(),
+                dns.as_secs_f32()
+            ),
+        );
     }
     Ok(outcome)
+}
+
+/// Where the IKE version a profile's gateway actually answers is kept.
+///
+/// A Sophos `.scx` states no IKE version, so it imports as IKEv2, and an SFOS
+/// 18.5 gateway refuses that with NO_PROPOSAL_CHOSEN on every connect before
+/// the IKEv1 retry gets through — a wasted round trip and a log line, each
+/// time. Kept beside the profile rather than in its override sidecar, which
+/// is the user's own edits and is shown to them as such.
+fn learned_version_path(state: &AppState, id: &str) -> PathBuf {
+    state.profile_dir.join(format!("{id}.ikever"))
+}
+
+/// How long a learned version is trusted before the profile's own is tried
+/// again.
+///
+/// The NO_PROPOSAL_CHOSEN that teaches it arrives before any key exchange, so
+/// it is unauthenticated: anyone on the path can forge one. The fallback has
+/// always let that downgrade a single connect to IKEv1; remembered for good,
+/// it would downgrade every connect after it against a gateway that speaks
+/// both. Counted from when the version was learned, not last used (see
+/// [`remember_version`]), so even a profile connected every day goes back to
+/// its own version at least once a day — and a forged answer has to be
+/// forged again.
+const LEARNED_VERSION_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+fn learned_version(state: &AppState, id: &str) -> Option<vpn_core::IkeVersion> {
+    let path = learned_version_path(state, id);
+    let learned = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+    // A clock that went backwards reads as expired, never as fresh forever.
+    let age = learned.elapsed().unwrap_or(LEARNED_VERSION_TTL);
+    if age >= LEARNED_VERSION_TTL {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    vpn_core::IkeVersion::from_name(text.trim())
+}
+
+/// Record the version a connect came up at, or forget it again once it is
+/// the profile's own. Best-effort: losing it costs one round trip next time.
+fn remember_version(
+    state: &AppState,
+    id: &str,
+    negotiated: vpn_core::IkeVersion,
+    profile: vpn_core::IkeVersion,
+) {
+    let path = learned_version_path(state, id);
+    if negotiated == profile {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    // Written only when it changes: the file's age is how long ago the version
+    // was learned, which is what LEARNED_VERSION_TTL measures.
+    if learned_version(state, id) != Some(negotiated) {
+        let _ = std::fs::write(path, negotiated.name());
+    }
 }
 
 /// Bring back the remote networks of a live tunnel that are not carrying
@@ -1446,7 +1540,7 @@ const VIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// Of that budget, how long to wait for charon to even report an assigned
 /// address. It arrives with the IKE_SA, so this is generous.
 const VIP_ASSIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const VIP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+const VIP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Block until the gateway-assigned virtual IP is actually usable as a source
 /// address, so "established" means the tunnel really carries traffic.
@@ -1833,6 +1927,46 @@ mod tests {
         });
         assert!(save_profile_edit(&s, "p".to_string(), edit).is_err());
         assert!(crate::overrides::load(&s.profile_dir, "p").hosts.is_none());
+    }
+
+    #[test]
+    fn a_fallback_version_is_remembered_until_it_matches_the_profile() {
+        use vpn_core::IkeVersion::{V1, V2};
+        let s = scratch_state("ikever");
+        assert_eq!(learned_version(&s, "p"), None);
+        // The .scx said IKEv2, the gateway only took IKEv1: start there next time.
+        remember_version(&s, "p", V1, V2);
+        assert_eq!(learned_version(&s, "p"), Some(V1));
+        // The gateway was upgraded and the profile's own version works again.
+        remember_version(&s, "p", V2, V2);
+        assert_eq!(learned_version(&s, "p"), None);
+        assert!(!learned_version_path(&s, "p").exists());
+    }
+
+    #[test]
+    fn a_learned_version_expires_a_day_after_it_was_learned() {
+        use vpn_core::IkeVersion::{V1, V2};
+        let s = scratch_state("ikever_ttl");
+        let path = learned_version_path(&s, "p");
+        let age = |secs: u64| {
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(when))
+                .expect("set mtime");
+        };
+
+        remember_version(&s, "p", V1, V2);
+        age(23 * 3600);
+        assert_eq!(learned_version(&s, "p"), Some(V1));
+        // Using it again must not make it young: the clock runs from learning.
+        remember_version(&s, "p", V1, V2);
+        let learned = std::fs::metadata(&path).and_then(|m| m.modified()).expect("mtime");
+        assert!(learned.elapsed().expect("past") >= std::time::Duration::from_secs(22 * 3600));
+        age(25 * 3600);
+        assert_eq!(learned_version(&s, "p"), None, "a day old: the profile's own version first");
+        assert!(!path.exists());
     }
 
     /// A throwaway state whose profile directory is empty and per-test.

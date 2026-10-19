@@ -167,7 +167,7 @@
   .detail-head .spacer { flex: 1; }
   .status-pill { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 6px 13px; background: rgba(0,0,0,.2); white-space: nowrap; }
   .status-pill.established { color: var(--ok); border-color: rgba(70,194,102,.42); background: var(--ok-soft); }
-  .status-pill.connecting { color: var(--warn); border-color: rgba(217,165,49,.42); background: var(--warn-soft); }
+  .status-pill.connecting, .status-pill.disconnecting { color: var(--warn); border-color: rgba(217,165,49,.42); background: var(--warn-soft); }
   .status-pill.stalled { color: var(--crit); border-color: rgba(240,96,58,.42); background: var(--crit-soft); }
   /* Carrying traffic, just not on every network it was asked to — amber, not
      red: something still works, and the red pill is reserved for the tunnel
@@ -1171,7 +1171,7 @@
     $("pill-text").textContent = stateText(st);
     // The global indicator speaks for every profile at once, worst first.
     var all = profiles.map(function (p) { return uiState(p.id); });
-    var worst = ["stalled", "degraded", "established", "connecting"].filter(function (st2) {
+    var worst = ["stalled", "degraded", "established", "connecting", "disconnecting"].filter(function (st2) {
       return all.indexOf(st2) >= 0;
     })[0] || "disconnected";
     $("glob-led").className = stateLed(worst);
@@ -1199,13 +1199,13 @@
 
   // What each unhealthy state is called on screen. Everything else is named by
   // the state itself.
-  var STATE_TEXT = { stalled: "no traffic", degraded: "partly up" };
+  var STATE_TEXT = { stalled: "no traffic", degraded: "partly up", disconnecting: "disconnecting…" };
   function stateText(st) { return STATE_TEXT[st] || st; }
 
   // The LED beside a state, in the one place that decides it.
   function stateLed(st) {
     return "led" + (st === "stalled" ? " crit" : st === "degraded" ? " warn"
-      : st === "established" ? " ok" : st === "connecting" ? " warn pulse" : "");
+      : st === "established" ? " ok" : (st === "connecting" || st === "disconnecting") ? " warn pulse" : "");
   }
 
   /* ---------- most-recently-used profiles ---------- */
@@ -1262,7 +1262,7 @@
   // acting on. The tooltip names the tunnels, so hovering answers "which one?"
   // without opening the window.
   var trayLast = "";
-  var TRAY_RANK = ["stalled", "degraded", "established", "connecting"];
+  var TRAY_RANK = ["stalled", "degraded", "established", "connecting", "disconnecting"];
   function updateTray() {
     if (!TAURI) { return; }
     var byState = {};
@@ -1286,9 +1286,10 @@
 
   function setAction() {
     var st = state[current.id], btn = $("action");
-    btn.disabled = false;
+    btn.disabled = st === "disconnecting";
     if (st === "disconnected") { btn.className = "btn btn-primary"; btn.textContent = "Connect"; }
     else if (st === "connecting") { btn.className = "btn btn-ghost"; btn.textContent = "Cancel"; }
+    else if (st === "disconnecting") { btn.className = "btn btn-ghost"; btn.textContent = "Disconnecting…"; }
     else { btn.className = "btn btn-ghost"; btn.textContent = "Disconnect"; }
     renderEditBtn();
     renderRepairBtn();
@@ -1409,9 +1410,10 @@
     $("c-gw").textContent = current.gateway;
     $("c-led").className = stateLed(vs);
     $("c-status").textContent = stateText(vs);
-    b.disabled = false;
+    b.disabled = st === "disconnecting";
     if (st === "disconnected") { b.className = "btn btn-primary cbig"; b.textContent = "Connect"; }
     else if (st === "connecting") { b.className = "btn btn-ghost cbig"; b.textContent = "Cancel"; }
+    else if (st === "disconnecting") { b.className = "btn btn-ghost cbig"; b.textContent = "Disconnecting…"; }
     else { b.className = "btn btn-ghost cbig"; b.textContent = "Disconnect"; }
     var bits = [];
     if (st === "established") {
@@ -2196,14 +2198,15 @@
   // report. The state map is otherwise only ever written by this session's own
   // connects, so a tunnel that outlived the app, or one that dropped while
   // another profile was selected, would keep showing a green LED. "connecting"
-  // is left alone: a handshake in flight has no SA to be found yet.
+  // and "disconnecting" are left alone: a handshake in flight has no SA to be
+  // found yet, and one being torn down is still listed until it is gone.
   function reconcile(sas) {
     var live = {};
     sas.forEach(function (s) { live[s.name] = true; });
     var changed = false;
     profiles.forEach(function (p) {
       var st = state[p.id] || "disconnected";
-      if (st === "connecting") { return; }
+      if (st === "connecting" || st === "disconnecting") { return; }
       var want = live[sanitize(p.name)] ? "established" : "disconnected";
       if (want !== st) {
         state[p.id] = want;
@@ -2458,6 +2461,13 @@
 
       var p = byName[sa.name];
       if (!p) { return; }
+      // Only a tunnel the connect has finished building is judged. Under IKEv1
+      // the children come up one at a time, so mid-connect the SA is listed
+      // with only some of them — which read as "missing", started a repair
+      // that initiated every network a second time (duplicate SAs), and then
+      // announced it had "re-established" a tunnel that had only just been
+      // asked for. Mid-disconnect it is being taken apart on purpose.
+      if (state[p.id] !== "established") { return; }
       var missing = missingNets(p, sa);
       var now = addressGone || dead.length > 0 || missing.length > 0;
 
@@ -2547,7 +2557,7 @@
 
   function anyActive() {
     for (var k in state) {
-      if (state[k] === "established" || state[k] === "connecting") { return true; }
+      if (state[k] === "established" || state[k] === "connecting" || state[k] === "disconnecting") { return true; }
     }
     return false;
   }
@@ -2565,16 +2575,33 @@
   // rest of an idle interval waiting to notice.
   function pollSoon() { runPoll(120); }
 
+  // The teardown is several round trips — DNS policy, charon deleting every
+  // CHILD_SA with the gateway, the adapter going away — so it says at once
+  // that it heard the click, and keeps saying so until it is done.
   async function realDisconnect(p) {
-    log("IKE", "terminating IKE_SA " + p.name);
-    try { await TAURI.invoke("disconnect", { name: sanitize(p.name) }); }
-    catch (e) { log("IKE", String(e), "bad"); }
-    stopPolling();
-    state[p.id] = "disconnected";
+    if (state[p.id] === "disconnecting") { return; }
+    state[p.id] = "disconnecting";
     delete stalled[p.id];
+    if (current && current.id === p.id) { setAction(); }
+    setPill(); renderList();
+    log("IKE", "terminating IKE_SA " + p.name);
+    var failed = null;
+    try { await TAURI.invoke("disconnect", { name: sanitize(p.name) }); }
+    catch (e) { failed = e; log("IKE", String(e), "bad"); }
+    if (current && current.id === p.id) { stopPolling(); }
+    state[p.id] = "disconnected";
     delete broken[p.id]; delete brokenWhy[p.id]; delete repairs[p.id];
-    setPill(); setAction(); renderList(); renderTiles();
-    log("NET", "virtual IP released, CHILD_SA removed");
+    if (current) { setPill(); setAction(); renderTiles(); }
+    renderList();
+    if (failed) {
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div>Disconnecting ' + esc(p.name) +
+        " did not finish cleanly: " + esc(String(failed)) + "</div>", "bad");
+    } else {
+      log("NET", "virtual IP released, CHILD_SA removed", "good");
+    }
+    // Ask charon what is really left rather than trust the click: a teardown
+    // that failed leaves the SA listed, and reconcile puts the LED back.
+    pollSoon();
   }
 
   /* ---------- native backend lifecycle ---------- */
@@ -2794,6 +2821,7 @@
   /* ---------- action button ---------- */
   function onAction() {
     var st = state[current.id];
+    if (st === "disconnecting") { return; }
     if (st === "disconnected") {
       // Recorded on the attempt, not on success: a profile you just tried and
       // that failed is exactly the one you want back at the top of the tray.
@@ -2859,7 +2887,8 @@
     var m = $("ctxmenu");
     m.innerHTML = "";
     var items = [
-      [st === "disconnected" ? "Connect" : st === "connecting" ? "Cancel connecting" : "Disconnect", onAction, ""],
+      [st === "disconnected" ? "Connect" : st === "connecting" ? "Cancel connecting"
+        : st === "disconnecting" ? "Disconnecting…" : "Disconnect", onAction, ""],
       ["Edit parameters…", openEdit, ""]
     ];
     if (TAURI) {

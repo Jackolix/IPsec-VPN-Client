@@ -1,11 +1,11 @@
 //! The broker's actual work: bring charon up, serve IPC, and clean up on stop.
 //!
 //! Security note: requests arrive from an interactive (but possibly non-admin)
-//! user, and some fields are interpolated into a PowerShell command that runs
-//! as SYSTEM (the NRPT rule). Those fields are therefore validated strictly
+//! user, and some fields are written as SYSTEM into the machine's DNS policy
+//! (the NRPT rule — see `nrpt`). Those fields are therefore validated strictly
 //! here — DNS servers must parse as IPv4, and a domain may only contain DNS
-//! label characters — so a request can never smuggle in a command. This is the
-//! privilege boundary; keep it airtight.
+//! label characters — so a request can only ever produce a well-formed rule
+//! for its own names. This is the privilege boundary; keep it airtight.
 
 use crate::protocol::{Request, Response};
 use crate::{charon, ipc, nrpt};
@@ -377,7 +377,7 @@ fn lowest_free_slot(occupied: &[usize]) -> Result<usize, String> {
 }
 
 /// Parse and bound the DNS server list. Anything that isn't a plain IPv4
-/// address is rejected — this is what keeps the NRPT PowerShell safe.
+/// address is rejected — this is what keeps the NRPT rule well-formed.
 fn validate_servers(servers: &[String]) -> Result<Vec<Ipv4Addr>, String> {
     if servers.len() > MAX_SERVERS {
         return Err(format!("too many DNS servers (max {MAX_SERVERS})"));
@@ -388,9 +388,9 @@ fn validate_servers(servers: &[String]) -> Result<Vec<Ipv4Addr>, String> {
         .collect()
 }
 
-/// Subnets are re-emitted as `<octet>.in-addr.arpa` namespaces inside the NRPT
-/// PowerShell, so each one must parse as a plain IPv4 CIDR before it gets
-/// anywhere near a command line. Anything that doesn't is rejected outright
+/// Subnets are re-emitted as `<octet>.in-addr.arpa` namespaces in the NRPT, so
+/// each one must parse as a plain IPv4 CIDR before it gets anywhere near the
+/// system's DNS policy. Anything that doesn't is rejected outright
 /// rather than skipped, so a malformed request is visible instead of silent.
 fn validate_subnets(subnets: &[String]) -> Result<Vec<String>, String> {
     if subnets.len() > MAX_SUBNETS {
@@ -414,8 +414,9 @@ fn validate_subnets(subnets: &[String]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// A domain, if present, may only contain DNS label characters. This blocks any
-/// attempt to break out of the single-quoted PowerShell string it lands in.
+/// A domain, if present, may only contain DNS label characters. It becomes an
+/// NRPT namespace, so anything else — a wildcard, a separator, a quote — is
+/// refused rather than written into the system's DNS policy.
 fn validate_domain(domain: Option<&str>) -> Result<Option<String>, String> {
     let Some(d) = domain.map(str::trim).filter(|d| !d.is_empty()) else {
         return Ok(None);
@@ -488,7 +489,7 @@ mod tests {
         );
         assert!(validate_subnets(&["10.98.43.0".into()]).is_err());
         assert!(validate_subnets(&["10.98.43.0/33".into()]).is_err());
-        // These end up in the NRPT PowerShell as reverse zones.
+        // These end up in the NRPT as reverse zones.
         assert!(validate_subnets(&["10.0.0.0/8'; Stop-Service #".into()]).is_err());
         let many: Vec<String> = (0..MAX_SUBNETS + 1).map(|_| "10.0.0.0/8".to_string()).collect();
         assert!(validate_subnets(&many).is_err());

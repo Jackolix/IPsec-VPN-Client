@@ -965,6 +965,9 @@ mod tray {
     pub enum Status {
         Disconnected,
         Connecting,
+        /// A teardown in flight: the user asked, and charon (plus DNS) has not
+        /// finished yet. Shown so the click visibly did something.
+        Disconnecting,
         Connected,
         /// The SA is up and charon still calls it established, but the data
         /// path is one-way dead — see the stall detector in `ui/index.html`.
@@ -985,6 +988,7 @@ mod tray {
             match s {
                 "established" | "connected" => Status::Connected,
                 "connecting" => Status::Connecting,
+                "disconnecting" => Status::Disconnecting,
                 "stalled" => Status::Stalled,
                 "degraded" => Status::Degraded,
                 _ => Status::Disconnected,
@@ -997,7 +1001,7 @@ mod tray {
         fn colour(self) -> [u8; 3] {
             match self {
                 Status::Connected => [0x46, 0xc2, 0x66],
-                Status::Connecting => [0xd9, 0xa5, 0x31],
+                Status::Connecting | Status::Disconnecting => [0xd9, 0xa5, 0x31],
                 Status::Stalled => [0xf0, 0x60, 0x3a],
                 Status::Degraded => [0xd9, 0xa5, 0x31],
                 Status::Disconnected => [0x86, 0x95, 0xab],
@@ -1008,6 +1012,7 @@ mod tray {
             match self {
                 Status::Connected => "connected",
                 Status::Connecting => "connecting",
+                Status::Disconnecting => "disconnecting",
                 Status::Stalled => "connected, no traffic",
                 Status::Degraded => "connected, one network missing",
                 Status::Disconnected => "disconnected",
@@ -1104,6 +1109,7 @@ mod tray {
     fn entry_label(profile: &MenuProfile) -> String {
         match Status::parse(&profile.state) {
             Status::Connecting => format!("{} — connecting…", profile.name),
+            Status::Disconnecting => format!("{} — disconnecting…", profile.name),
             Status::Stalled => format!("{} — no traffic", profile.name),
             Status::Degraded => format!("{} — one network missing", profile.name),
             _ => profile.name.clone(),
@@ -1291,6 +1297,7 @@ mod tray {
             // spelled the same on both sides.
             assert_eq!(Status::parse("established"), Status::Connected);
             assert_eq!(Status::parse("connecting"), Status::Connecting);
+            assert_eq!(Status::parse("disconnecting"), Status::Disconnecting);
             assert_eq!(Status::parse("stalled"), Status::Stalled);
             assert_eq!(Status::parse("disconnected"), Status::Disconnected);
             assert_eq!(Status::parse("nonsense"), Status::Disconnected);
@@ -1304,6 +1311,7 @@ mod tray {
             assert!(Status::Stalled.is_up());
             assert!(Status::Connected.is_up());
             assert!(!Status::Connecting.is_up());
+            assert!(!Status::Disconnecting.is_up());
             assert!(!Status::Disconnected.is_up());
         }
 

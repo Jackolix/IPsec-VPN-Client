@@ -48,10 +48,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 
 # ---- OpenSSL (MinGW cross build) ----
+# With its assembly (the mingw64 target emits GNU as, so the MinGW toolchain
+# builds it as is). It used to be built no-asm, which left every bignum, AES
+# and SHA operation in portable C: measured on the dev box, RSA-2048 409 -> 3818
+# signs/s, AES-256-CBC 224 -> 1455 MB/s, SHA-256 236 -> 1649 MB/s. That mattered
+# twice over -- strongSwan's MODP_2048 Diffie-Hellman (full-length exponent)
+# took 80-180ms per exchange, once for main mode and once per IKEv1 subnet, and
+# ESP itself runs in userland through this library, so it capped the tunnel.
 RUN wget -q "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz" \
     && tar xf "openssl-${OPENSSL_VER}.tar.gz"
 RUN cd "openssl-${OPENSSL_VER}" \
-    && ./Configure mingw64 shared no-asm no-tests \
+    && ./Configure mingw64 shared no-tests \
         --prefix="${PREFIX}" --libdir=lib --cross-compile-prefix="${MINGW}-" \
     && make -j"$(nproc)" \
     && make install_sw
@@ -88,12 +95,22 @@ COPY docker/strongswan-windows/0003-per-tunnel-wintun-adapter.patch /src/
 #       onto a second CHILD_SA and black-holes one subnet outbound.
 COPY docker/strongswan-windows/0004-reqid-accounting-log.patch /src/
 COPY docker/strongswan-windows/0005-quick-mode-reqid-refcount.patch /src/
+# 0006: no duplicate address detection on the tunnel's own adapter, so the
+#       virtual IP can be bound to the moment it is installed instead of
+#       seconds later.
+COPY docker/strongswan-windows/0006-skip-dad-on-the-tunnel-address.patch /src/
+# 0007: keep an adapter after its tunnel goes down and hand it to the next
+#       one, plus one made ahead at startup -- a Wintun adapter install is
+#       2-4s, and 0003 paid it on every connect.
+COPY docker/strongswan-windows/0007-keep-and-reuse-wintun-adapters.patch /src/
 RUN cd "strongswan-${STRONGSWAN_VER}" \
     && patch -p1 --fuzz=0 < /src/0001-kernel-iph-install-virtual-ips.patch \
     && patch -p1 --fuzz=0 < /src/0002-wintun-tun-device-plugin.patch \
     && patch -p1 --fuzz=0 < /src/0003-per-tunnel-wintun-adapter.patch \
     && patch -p1 --fuzz=0 < /src/0004-reqid-accounting-log.patch \
-    && patch -p1 --fuzz=0 < /src/0005-quick-mode-reqid-refcount.patch
+    && patch -p1 --fuzz=0 < /src/0005-quick-mode-reqid-refcount.patch \
+    && patch -p1 --fuzz=0 < /src/0006-skip-dad-on-the-tunnel-address.patch \
+    && patch -p1 --fuzz=0 < /src/0007-keep-and-reuse-wintun-adapters.patch
 
 # The wintun patch touches configure.ac/Makefile.am, so regenerate the build
 # system (the release tarball ships pre-generated ones).
