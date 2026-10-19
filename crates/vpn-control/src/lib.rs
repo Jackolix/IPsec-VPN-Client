@@ -26,6 +26,24 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// buffer without bound (a normal `initiate` produces well under this).
 const MAX_LOG_LINES: usize = 400;
 
+/// The vici event an `initiate` transcript is read from.
+///
+/// Not the global `log` event. That one is fed by charon's vici logger, which
+/// queues each line and raises it later from a worker job — so the reply to
+/// `initiate` can overtake the lines describing it. A handshake that fails in
+/// one round trip (NO_PROPOSAL_CHOSEN, a rejected XAuth) is exactly the case
+/// where it does: the reply arrived first, the transcript was dropped with the
+/// unregister, and the user got charon's bare "establishing CHILD_SA failed"
+/// as an "unknown failure". Worse, the IKE-version fallback reads the same
+/// transcript, so it never ran and the next click had to succeed instead.
+///
+/// `control-log` is the command's own log: charon raises it synchronously on
+/// the issuing connection while the command runs, so every line is on the
+/// wire before the reply. It is what `swanctl --initiate` reads, at the same
+/// level (1) the global logger forwards, and it carries only this IKE_SA's
+/// lines rather than every tunnel's.
+const INITIATE_LOG_EVENT: &str = "control-log";
+
 /// One line of charon's log stream, captured during a connect so the caller
 /// can show live handshake progress (and, on failure, the reason).
 #[derive(Debug, Clone, Serialize)]
@@ -536,7 +554,7 @@ fn attempt(
         let before = log.len();
         let (events, response) = client.stream_request(
             "initiate",
-            "log",
+            INITIATE_LOG_EVENT,
             Message::new().str("child", child).str("ike", name),
         )?;
         for event in events.iter() {
@@ -1005,7 +1023,7 @@ fn reinitiate(
     let before = out.log.len();
     let (events, response) = client.stream_request(
         "initiate",
-        "log",
+        INITIATE_LOG_EVENT,
         Message::new().str("child", child).str("ike", name),
     )?;
     for event in events.iter() {
