@@ -471,7 +471,8 @@ pub fn connect_logged(
     // second attempt, and a cold lookup costs about a second.
     let peers = peer_ids(&config.gateway);
     let primary = config.ike_version;
-    let mut outcome = attempt(&mut client, config, name, primary, user_password, &peers)?;
+    let mut outcome =
+        attempt(&mut client, transport, config, name, primary, user_password, &peers)?;
 
     // The IKE version is not stated in a Sophos `.scx` (and a `.mobileconfig`
     // states it, but old gateways still disagree), so the version we import can
@@ -490,7 +491,8 @@ pub fn connect_logged(
                 alternate.swanctl_value()
             ),
         ));
-        let retry = attempt(&mut client, config, name, alternate, user_password, &peers)?;
+        let retry =
+            attempt(&mut client, transport, config, name, alternate, user_password, &peers)?;
 
         let mut log = outcome.log;
         log.extend(retry.log);
@@ -533,6 +535,7 @@ pub fn connect_logged(
 /// same open client without duplicating the flow.
 fn attempt(
     client: &mut Client<ViciStream>,
+    transport: &Transport,
     config: &ConnectionConfig,
     name: &str,
     version: IkeVersion,
@@ -564,7 +567,10 @@ fn attempt(
     let mut established = 0usize;
     let mut first_error: Option<String> = None;
 
-    for child in &children {
+    let mut next = 0;
+    while next < children.len() {
+        let child = &children[next];
+        next += 1;
         let before = log.len();
         let (events, response) = client.stream_request(
             "initiate",
@@ -579,6 +585,29 @@ fn attempt(
         }
         if response.get_str("success").as_deref() == Some("yes") {
             established += 1;
+            // With one child up, the IKE_SA exists and the gateway has accepted
+            // our credentials, so nothing below can cost another login. Ask
+            // for every remaining network at once: charon queues their quick
+            // modes on the one IKE_SA and runs them back to back. One at a
+            // time, each waited on a round trip through us first — measured at
+            // 0.26s and 0.38s between ITM-Office's three subnets, against a
+            // whole IKEv1 handshake of 0.2s.
+            if next < children.len() {
+                let rest = &children[next..];
+                next = children.len();
+                for (child, result) in rest.iter().zip(initiate_together(transport, name, rest)) {
+                    match result {
+                        Ok(()) => {
+                            established += 1;
+                            log.push(note(name, format!("{child} established")));
+                        }
+                        Err(err) => {
+                            log.push(note(name, format!("{child} did not come up: {err}")));
+                            first_error.get_or_insert(err);
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -643,6 +672,46 @@ fn attempt(
     }
 
     Ok(ConnectOutcome::failed(kind, message, log))
+}
+
+/// Initiate several children of an IKE_SA that is already up, all at once,
+/// each on a vici connection of its own. Returns, per child and in order,
+/// whether it came up — or charon's reason, or ours, when it did not.
+///
+/// The transcript is deliberately not collected: charon's control log is per
+/// IKE_SA, not per child, so every one of these connections would receive the
+/// same interleaved lines, and a negotiation that succeeded needs none of them.
+/// What failed is said in the note the caller writes from the reason; the
+/// whole exchange is in charon.log either way.
+fn initiate_together(
+    transport: &Transport,
+    name: &str,
+    children: &[String],
+) -> Vec<std::result::Result<(), String>> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = children
+            .iter()
+            .map(|child| {
+                scope.spawn(move || -> std::result::Result<(), String> {
+                    let mut client = open(transport).map_err(|e| e.to_string())?;
+                    let response = client
+                        .request("initiate", Message::new().str("child", child).str("ike", name))
+                        .map_err(|e| e.to_string())?;
+                    if response.get_str("success").as_deref() == Some("yes") {
+                        Ok(())
+                    } else {
+                        Err(response
+                            .get_str("errmsg")
+                            .unwrap_or_else(|| "charon declined to initiate it".to_string()))
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err("the initiate thread panicked".to_string())))
+            .collect()
+    })
 }
 
 /// The other IKE version, for the fallback retry.
