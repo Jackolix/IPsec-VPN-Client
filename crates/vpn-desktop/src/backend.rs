@@ -1184,8 +1184,29 @@ fn learned_version_path(state: &AppState, id: &str) -> PathBuf {
     state.profile_dir.join(format!("{id}.ikever"))
 }
 
+/// How long a learned version is trusted before the profile's own is tried
+/// again.
+///
+/// The NO_PROPOSAL_CHOSEN that teaches it arrives before any key exchange, so
+/// it is unauthenticated: anyone on the path can forge one. The fallback has
+/// always let that downgrade a single connect to IKEv1; remembered for good,
+/// it would downgrade every connect after it against a gateway that speaks
+/// both. Counted from when the version was learned, not last used (see
+/// [`remember_version`]), so even a profile connected every day goes back to
+/// its own version at least once a day — and a forged answer has to be
+/// forged again.
+const LEARNED_VERSION_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 fn learned_version(state: &AppState, id: &str) -> Option<vpn_core::IkeVersion> {
-    let text = std::fs::read_to_string(learned_version_path(state, id)).ok()?;
+    let path = learned_version_path(state, id);
+    let learned = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+    // A clock that went backwards reads as expired, never as fresh forever.
+    let age = learned.elapsed().unwrap_or(LEARNED_VERSION_TTL);
+    if age >= LEARNED_VERSION_TTL {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
     vpn_core::IkeVersion::from_name(text.trim())
 }
 
@@ -1200,7 +1221,11 @@ fn remember_version(
     let path = learned_version_path(state, id);
     if negotiated == profile {
         let _ = std::fs::remove_file(path);
-    } else {
+        return;
+    }
+    // Written only when it changes: the file's age is how long ago the version
+    // was learned, which is what LEARNED_VERSION_TTL measures.
+    if learned_version(state, id) != Some(negotiated) {
         let _ = std::fs::write(path, negotiated.name());
     }
 }
@@ -1916,6 +1941,32 @@ mod tests {
         remember_version(&s, "p", V2, V2);
         assert_eq!(learned_version(&s, "p"), None);
         assert!(!learned_version_path(&s, "p").exists());
+    }
+
+    #[test]
+    fn a_learned_version_expires_a_day_after_it_was_learned() {
+        use vpn_core::IkeVersion::{V1, V2};
+        let s = scratch_state("ikever_ttl");
+        let path = learned_version_path(&s, "p");
+        let age = |secs: u64| {
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(when))
+                .expect("set mtime");
+        };
+
+        remember_version(&s, "p", V1, V2);
+        age(23 * 3600);
+        assert_eq!(learned_version(&s, "p"), Some(V1));
+        // Using it again must not make it young: the clock runs from learning.
+        remember_version(&s, "p", V1, V2);
+        let learned = std::fs::metadata(&path).and_then(|m| m.modified()).expect("mtime");
+        assert!(learned.elapsed().expect("past") >= std::time::Duration::from_secs(22 * 3600));
+        age(25 * 3600);
+        assert_eq!(learned_version(&s, "p"), None, "a day old: the profile's own version first");
+        assert!(!path.exists());
     }
 
     /// A throwaway state whose profile directory is empty and per-test.
