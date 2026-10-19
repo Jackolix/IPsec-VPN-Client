@@ -1050,6 +1050,9 @@ pub fn connect(
     if is_ssl_profile(state, &id) {
         return ssl_connect(state, &id, login);
     }
+    // Stage timings, reported in the transcript: "it took ten seconds" is
+    // only actionable once it says which of these took them.
+    let started = std::time::Instant::now();
     let (mut imported, _, edited) = load(state, &id)?;
     // Start at the IKE version this gateway last came up at, unless the user
     // chose one by hand. The fallback in `connect_logged` still covers a
@@ -1108,6 +1111,7 @@ pub fn connect(
         return Ok(outcome);
     }
 
+    let prepared = started.elapsed();
     let mut outcome = vpn_control::connect_logged(
         &state.transport,
         &imported.config,
@@ -1115,6 +1119,7 @@ pub fn connect(
         user_password.as_ref(),
     )
     .map_err(|e| e.to_string())?;
+    let handshake = started.elapsed() - prepared;
 
     if let (Some(v), false) = (outcome.ike_version, hand_set) {
         remember_version(state, &id, v, profile_version);
@@ -1125,6 +1130,7 @@ pub fn connect(
     if outcome.connected && imported.config.request_virtual_ip {
         wait_for_virtual_ip(state, &name, &mut outcome);
     }
+    let addressed = started.elapsed() - prepared - handshake;
 
     // With the tunnel up, apply DNS so names on the remote network resolve over
     // the VPN. Two sources, merged: the profile's own servers, and any the
@@ -1148,6 +1154,21 @@ pub fn connect(
         if !dns.servers.is_empty() {
             apply_dns(state, &name, &dns, &remote_subnets(&imported.config), &mut outcome);
         }
+        let total = started.elapsed();
+        let dns = total - prepared - handshake - addressed;
+        note(
+            &mut outcome,
+            &name,
+            2,
+            format!(
+                "connected in {:.1}s — preparing {:.1}s, handshake {:.1}s, virtual IP {:.1}s, DNS {:.1}s",
+                total.as_secs_f32(),
+                prepared.as_secs_f32(),
+                handshake.as_secs_f32(),
+                addressed.as_secs_f32(),
+                dns.as_secs_f32()
+            ),
+        );
     }
     Ok(outcome)
 }
@@ -1494,7 +1515,7 @@ const VIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// Of that budget, how long to wait for charon to even report an assigned
 /// address. It arrives with the IKE_SA, so this is generous.
 const VIP_ASSIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const VIP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+const VIP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Block until the gateway-assigned virtual IP is actually usable as a source
 /// address, so "established" means the tunnel really carries traffic.
