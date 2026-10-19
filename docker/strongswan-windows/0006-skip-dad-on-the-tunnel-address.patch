@@ -1,0 +1,54 @@
+Make the virtual IP usable the moment it is installed.
+
+A Windows address goes through duplicate address detection before it is
+usable. Until DAD finishes it is Tentative, and a Tentative address cannot be
+bound to: ICMP already flows from it, but every TCP connect over the tunnel
+fails. The desktop app has to wait that out after charon reports the tunnel up
+(`wait_for_virtual_ip` in vpn-desktop/src/backend.rs, which binds a socket to
+the address in a loop), and that wait was a large part of why a connect took
+ten seconds on Windows and about one on macOS, where utun addresses need no
+DAD.
+
+There is nothing to detect. The Wintun adapter is created for this tunnel and
+is point-to-point: nothing else is on its link to collide with. So:
+
+  kernel-iph add_ip()        installs the address with DadState =
+                             IpDadStatePreferred, as Wintun's own example and
+                             WireGuard for Windows do;
+  wintun set_iface_mtu()     zeroes the adapter's DadTransmits while it already
+                             writes the interface row, so no address on it is
+                             ever held back -- add_ip() calls set_mtu() on the
+                             device before it installs the address.
+
+diff -ru orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c
+--- orig/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-10-19 17:04:33.461321717 +0000
++++ work/src/libcharon/plugins/kernel_iph/kernel_iph_net.c	2026-10-19 17:04:33.494571035 +0000
+@@ -863,6 +863,14 @@
+ 	row.PreferredLifetime = INFINITE;
+ 	/* the whole point is to source tunnelled traffic from this address */
+ 	row.SkipAsSource = FALSE;
++	/* Usable at once, not after duplicate address detection. The adapter is
++	 * ours alone and point-to-point, so there is nothing to collide with --
++	 * but until DAD finishes the address is Tentative, and while it is no
++	 * socket can bind to it: the tunnel answers ping and refuses every TCP
++	 * connect, for seconds after it reported up. Wintun's own example adds
++	 * its address exactly this way (and the adapter's DadTransmits is zeroed
++	 * in the wintun plugin, for the same reason). */
++	row.DadState = IpDadStatePreferred;
+ 
+ 	ret = CreateUnicastIpAddressEntry(&row);
+ 	if (ret != NO_ERROR)
+diff -ru orig/src/libstrongswan/plugins/wintun/wintun_device.c work/src/libstrongswan/plugins/wintun/wintun_device.c
+--- orig/src/libstrongswan/plugins/wintun/wintun_device.c	2026-10-19 17:04:33.462759969 +0000
++++ work/src/libstrongswan/plugins/wintun/wintun_device.c	2026-10-19 17:04:33.494742102 +0000
+@@ -370,6 +370,10 @@
+ 			 this->if_name, waited);
+ 	}
+ 	row.NlMtu = mtu;
++	/* no duplicate address detection on this adapter: nothing else is on
++	 * its link, and a Tentative address cannot be bound to -- see add_ip()
++	 * in kernel-iph, which installs the virtual IP right after this */
++	row.DadTransmits = 0;
+ 	/* has to be cleared when writing an IPv4 row back, otherwise the call
+ 	 * fails with ERROR_INVALID_PARAMETER */
+ 	row.SitePrefixLength = 0;

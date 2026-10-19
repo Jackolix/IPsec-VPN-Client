@@ -88,12 +88,17 @@ COPY docker/strongswan-windows/0003-per-tunnel-wintun-adapter.patch /src/
 #       onto a second CHILD_SA and black-holes one subnet outbound.
 COPY docker/strongswan-windows/0004-reqid-accounting-log.patch /src/
 COPY docker/strongswan-windows/0005-quick-mode-reqid-refcount.patch /src/
+# 0006: no duplicate address detection on the tunnel's own adapter, so the
+#       virtual IP can be bound to the moment it is installed instead of
+#       seconds later.
+COPY docker/strongswan-windows/0006-skip-dad-on-the-tunnel-address.patch /src/
 RUN cd "strongswan-${STRONGSWAN_VER}" \
     && patch -p1 --fuzz=0 < /src/0001-kernel-iph-install-virtual-ips.patch \
     && patch -p1 --fuzz=0 < /src/0002-wintun-tun-device-plugin.patch \
     && patch -p1 --fuzz=0 < /src/0003-per-tunnel-wintun-adapter.patch \
     && patch -p1 --fuzz=0 < /src/0004-reqid-accounting-log.patch \
-    && patch -p1 --fuzz=0 < /src/0005-quick-mode-reqid-refcount.patch
+    && patch -p1 --fuzz=0 < /src/0005-quick-mode-reqid-refcount.patch \
+    && patch -p1 --fuzz=0 < /src/0006-skip-dad-on-the-tunnel-address.patch
 
 # The wintun patch touches configure.ac/Makefile.am, so regenerate the build
 # system (the release tarball ships pre-generated ones).
