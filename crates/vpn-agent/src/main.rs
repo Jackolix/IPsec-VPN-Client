@@ -93,7 +93,7 @@ fn main() -> Result<()> {
         } => {
             use vpn_core::swanctl::sanitize_name;
 
-            let text = std::fs::read_to_string(&profile)
+            let text = vpn_core::text::read_file(&profile)
                 .with_context(|| format!("cannot read {}", profile.display()))?;
             // Same content-based dispatch the desktop and vpn-cli use, so a
             // Sophos export can be driven from here too.

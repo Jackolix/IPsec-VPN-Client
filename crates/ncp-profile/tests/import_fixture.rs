@@ -108,3 +108,23 @@ fn hostile_gateway_is_rejected() {
     );
     assert!(import_profile(&mutated).is_err());
 }
+
+/// The LANCOM Advanced VPN Client writes its export in the Windows ANSI code
+/// page, not UTF-8: one umlaut (here in the name, the id and the PSK) used to
+/// fail the whole import with "stream did not contain valid UTF-8". Decoded
+/// through `vpn_core::text`, it imports with the characters intact.
+#[test]
+fn imports_ansi_encoded_lancom_export() {
+    let ansi: Vec<u8> = FIXTURE
+        .replacen("Name=ACME_SITE_01", "Name=ACME_M\u{fc}nchen", 1)
+        .replacen("REDACTED-PSK-PLACEHOLDER", "PSK-\u{e4}\u{f6}\u{df}\u{a7}", 1)
+        .chars()
+        .map(|c| u8::try_from(u32::from(c)).expect("fixture is Latin-1"))
+        .collect();
+    assert!(std::str::from_utf8(&ansi).is_err(), "test input must not be UTF-8");
+
+    let imported = import_profile(&vpn_core::text::decode(&ansi)).expect("ANSI export must import");
+    assert_eq!(imported.config.name, "ACME_M\u{fc}nchen");
+    let AuthMethod::PresharedKey(psk) = &imported.config.auth;
+    assert_eq!(psk.expose(), "PSK-\u{e4}\u{f6}\u{df}\u{a7}");
+}

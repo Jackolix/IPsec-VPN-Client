@@ -51,7 +51,7 @@ fn read_profile(path: &Path) -> Result<String> {
     if meta.len() > MAX_PROFILE_BYTES {
         bail!("{} is too large to be a profile export", path.display());
     }
-    fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))
+    vpn_core::text::read_file(path).with_context(|| format!("cannot read {}", path.display()))
 }
 
 /// Pick the importer by content rather than by extension: these files are
