@@ -1020,6 +1020,25 @@ pub fn repair(
         return Ok(out);
     }
 
+    // Per-network repair rides an IKE_SA that is up. When none is — DPD gave
+    // up and charon is re-establishing the tunnel itself, or the network went
+    // away mid-reauth — a quick mode has nothing to run on: initiating a child
+    // here only queues behind charon's own Main Mode and waits out every one
+    // of its retransmits, which is how a repair used to sit on "Repairing…" for
+    // minutes after the Wi-Fi dropped.
+    let mine: Vec<&IkeSa> = sas.iter().filter(|sa| sa.name == name).collect();
+    if !mine.iter().any(|sa| ike_sa_is_up(&sa.state)) {
+        out.log.push(note(
+            name,
+            format!(
+                "the IKE_SA itself is {} rather than established, so there is no tunnel to \
+                 repair networks on — charon is re-establishing it",
+                mine[0].state
+            ),
+        ));
+        return Ok(out);
+    }
+
     // The one cause of a silent subnet that can be read straight off the SA
     // list. charon keeps freed reqids in a pool and reuses them, so a reqid
     // released while a live SA still holds it ends up on a second child: the
@@ -1104,10 +1123,18 @@ fn reinitiate(
     out: &mut RepairOutcome,
 ) -> Result<()> {
     let before = out.log.len();
+    // Bounded: without a timeout vici's `initiate` answers only once charon has
+    // finished or given up, and against a gateway that stopped answering that
+    // is every retransmit — minutes, longer than our own read timeout. With
+    // one, charon replies when it runs out and keeps trying in the background,
+    // so a late success still lands and the next status poll sees it.
     let (events, response) = client.stream_request(
         "initiate",
         INITIATE_LOG_EVENT,
-        Message::new().str("child", child).str("ike", name),
+        Message::new()
+            .str("child", child)
+            .str("ike", name)
+            .str("timeout", REPAIR_INITIATE_TIMEOUT_MS.to_string()),
     )?;
     for event in events.iter() {
         if out.log.len() >= MAX_LOG_LINES {
@@ -1136,6 +1163,18 @@ fn reinitiate(
         });
     }
     Ok(())
+}
+
+/// How long one child's re-initiation in a repair pass may take before charon
+/// is asked to answer anyway. A healthy quick mode takes well under a second;
+/// this only has to outlast a slow gateway, not a dead one.
+const REPAIR_INITIATE_TIMEOUT_MS: u32 = 15_000;
+
+/// Whether an IKE_SA in this state can carry a quick mode / CREATE_CHILD_SA.
+/// REKEYING is the old generation of a make-before-break rekey: still up, and
+/// still carrying its children until the new one takes over.
+fn ike_sa_is_up(state: &str) -> bool {
+    matches!(state.trim(), "ESTABLISHED" | "REKEYING")
 }
 
 /// The IKE version charon reports for this connection's live IKE_SA.
@@ -1771,6 +1810,7 @@ mod tests {
             remote_host: "37.156.94.75".to_string(),
             virtual_ips: vec![],
             children: vec![],
+            no_route: false,
         }
     }
 

@@ -42,6 +42,11 @@ pub struct IkeSa {
     pub remote_host: String,
     pub virtual_ips: Vec<String>,
     pub children: Vec<ChildSa>,
+    /// This machine has no route to `remote_host` at all — the network is
+    /// gone (Wi-Fi dropped, cable pulled). charon cannot tell us this: it keeps
+    /// calling the SA ESTABLISHED until DPD gives up minutes later. Never set
+    /// by parsing; the desktop fills it in after asking the OS.
+    pub no_route: bool,
 }
 
 fn num(section: &Message, key: &str) -> u64 {
@@ -79,6 +84,7 @@ fn parse_ike(name: &str, ike: &Message) -> IkeSa {
         remote_host: ike.get_str("remote-host").unwrap_or_default(),
         virtual_ips: ike.get_list("local-vips").unwrap_or_default(),
         children,
+        no_route: false,
     }
 }
 
@@ -273,6 +279,7 @@ mod tests {
             remote_host: "37.156.94.75".to_string(),
             virtual_ips: vec!["172.16.17.10".to_string()],
             children,
+            no_route: false,
         }
     }
 

@@ -168,7 +168,8 @@
   .status-pill { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 6px 13px; background: rgba(0,0,0,.2); white-space: nowrap; }
   .status-pill.established { color: var(--ok); border-color: rgba(70,194,102,.42); background: var(--ok-soft); }
   .status-pill.connecting, .status-pill.disconnecting { color: var(--warn); border-color: rgba(217,165,49,.42); background: var(--warn-soft); }
-  .status-pill.stalled { color: var(--crit); border-color: rgba(240,96,58,.42); background: var(--crit-soft); }
+  .status-pill.stalled, .status-pill.offline { color: var(--crit); border-color: rgba(240,96,58,.42); background: var(--crit-soft); }
+  .status-pill.reconnecting { color: var(--warn); border-color: rgba(217,165,49,.42); background: var(--warn-soft); }
   /* Carrying traffic, just not on every network it was asked to — amber, not
      red: something still works, and the red pill is reserved for the tunnel
      that carries nothing. */
@@ -846,6 +847,12 @@
   // from `state` on purpose: a stalled tunnel is still established as far as
   // every connect/disconnect decision goes, and only the indicators differ.
   var stalled = {};
+  // id -> "offline" | "reconnecting" when the tunnel as a whole is down while
+  // still listed: no route to the gateway at all, or an IKE_SA that charon is
+  // re-establishing after DPD. Outranks every per-network verdict — with no
+  // tunnel underneath, which subnet is silent says nothing, and repairing one
+  // only waits out charon's retransmits.
+  var linkDown = {};
   var current = null;
   var filter = "";         // sidebar filter text (never touches the backend)
   var pendingDelete = null;
@@ -1171,7 +1178,7 @@
     $("pill-text").textContent = stateText(st);
     // The global indicator speaks for every profile at once, worst first.
     var all = profiles.map(function (p) { return uiState(p.id); });
-    var worst = ["stalled", "degraded", "established", "connecting", "disconnecting"].filter(function (st2) {
+    var worst = STATE_RANK.filter(function (st2) {
       return all.indexOf(st2) >= 0;
     })[0] || "disconnected";
     $("glob-led").className = stateLed(worst);
@@ -1193,19 +1200,29 @@
   // everywhere, since nothing working outranks something working.
   function uiState(id) {
     var st = state[id] || "disconnected";
-    if (st !== "established" || !stalled[id]) { return st; }
+    if (st !== "established") { return st; }
+    if (linkDown[id]) { return linkDown[id]; }
+    if (!stalled[id]) { return st; }
     return brokenWhy[id] === "missing" ? "degraded" : "stalled";
   }
 
+  // Worst first, everywhere a set of profiles is summed up into one indicator.
+  // No network outranks everything: it explains every other symptom at once.
+  var STATE_RANK = ["offline", "stalled", "reconnecting", "degraded", "established", "connecting", "disconnecting"];
+
   // What each unhealthy state is called on screen. Everything else is named by
   // the state itself.
-  var STATE_TEXT = { stalled: "no traffic", degraded: "partly up", disconnecting: "disconnecting…" };
+  var STATE_TEXT = {
+    stalled: "no traffic", degraded: "partly up", disconnecting: "disconnecting…",
+    offline: "no network", reconnecting: "reconnecting…"
+  };
   function stateText(st) { return STATE_TEXT[st] || st; }
 
   // The LED beside a state, in the one place that decides it.
   function stateLed(st) {
-    return "led" + (st === "stalled" ? " crit" : st === "degraded" ? " warn"
-      : st === "established" ? " ok" : (st === "connecting" || st === "disconnecting") ? " warn pulse" : "");
+    return "led" + ((st === "stalled" || st === "offline") ? " crit" : st === "degraded" ? " warn"
+      : st === "established" ? " ok"
+      : (st === "connecting" || st === "disconnecting" || st === "reconnecting") ? " warn pulse" : "");
   }
 
   /* ---------- most-recently-used profiles ---------- */
@@ -1262,7 +1279,7 @@
   // acting on. The tooltip names the tunnels, so hovering answers "which one?"
   // without opening the window.
   var trayLast = "";
-  var TRAY_RANK = ["stalled", "degraded", "established", "connecting", "disconnecting"];
+  var TRAY_RANK = STATE_RANK;
   function updateTray() {
     if (!TAURI) { return; }
     var byState = {};
@@ -2046,7 +2063,12 @@
     row.className = "log-line" + (cls ? " " + cls : "");
     row.innerHTML = '<span class="ts">' + stamp() + '</span><span class="sys ' + sys + '">' + sys + '</span><span class="msg"></span>';
     row.querySelector(".msg").textContent = msg;
-    l.appendChild(row); l.scrollTop = l.scrollHeight;
+    // Newest on top, so the latest event is the first thing in view without
+    // scrolling. Only pinned to the top when the reader is already there:
+    // someone scrolled down into the history keeps their place.
+    var atTop = l.scrollTop <= 4;
+    l.insertBefore(row, l.firstChild);
+    if (atTop) { l.scrollTop = 0; } else { l.scrollTop += row.offsetHeight; }
   }
 
   /* ---------- sparkline ---------- */
@@ -2175,7 +2197,7 @@
       return;
     }
     state[p.id] = "established"; connectAt = Date.now(); prevTotal = 0; samples = [];
-    delete broken[p.id]; delete brokenWhy[p.id]; delete repairs[p.id];
+    delete broken[p.id]; delete brokenWhy[p.id]; delete repairs[p.id]; delete linkDown[p.id];
     setPill(); setAction(); renderList();
     startPolling();
     // One sweep now that there is a data path, then only when asked. Nothing
@@ -2359,7 +2381,7 @@
     if (!btn) { return; }
     var p = current;
     var nets = p ? repairable(p.id) : [];
-    var show = !!p && p.kind !== "ssl" && state[p.id] === "established" && nets.length > 0;
+    var show = !!p && p.kind !== "ssl" && state[p.id] === "established" && !linkDown[p.id] && nets.length > 0;
     btn.style.display = show ? "" : "none";
     if (!show) { return; }
     var busy = repairMemo(p.id).busy;
@@ -2417,6 +2439,7 @@
     var byName = {};
     profiles.forEach(function (p) { byName[sanitize(p.name)] = p; });
     var seen = {}, changed = false;
+    var groups = {};   // SA name -> everything listed under it, summed
 
     sas.forEach(function (sa) {
       var dead = [];
@@ -2457,9 +2480,25 @@
       // proof the SA is meant to carry something (an SSL tunnel that never got
       // an IP has none, and is left to the counters).
       var carries = (sa.children || []).some(function (c) { return (c.local_ts || []).length; });
-      var addressGone = carries && !(sa.virtual_ips || []).length;
 
-      var p = byName[sa.name];
+      // Summed per profile rather than judged per SA. A make-before-break
+      // rekey, a reauth, or charon re-establishing after DPD all list two SAs
+      // under one name, and judging each in turn let whichever came last
+      // overwrite the other's verdict — one healthy-looking old SA was enough
+      // to paint a dead tunnel green.
+      var g = groups[sa.name] || (groups[sa.name] = {
+        dead: [], children: [], addressGone: false, up: false, noRoute: false
+      });
+      dead.forEach(function (n) { if (g.dead.indexOf(n) < 0) { g.dead.push(n); } });
+      g.children = g.children.concat(sa.children || []);
+      g.addressGone = g.addressGone || (carries && !(sa.virtual_ips || []).length);
+      g.up = g.up || sa.state === "ESTABLISHED" || sa.state === "REKEYING";
+      g.noRoute = g.noRoute || !!sa.no_route;
+    });
+
+    Object.keys(groups).forEach(function (name) {
+      var g = groups[name];
+      var p = byName[name];
       if (!p) { return; }
       // Only a tunnel the connect has finished building is judged. Under IKEv1
       // the children come up one at a time, so mid-connect the SA is listed
@@ -2468,7 +2507,40 @@
       // announced it had "re-established" a tunnel that had only just been
       // asked for. Mid-disconnect it is being taken apart on purpose.
       if (state[p.id] !== "established") { return; }
-      var missing = missingNets(p, sa);
+
+      // The tunnel as a whole first. With no route to the gateway, or no
+      // IKE_SA up under this name, there is nothing for a per-network verdict
+      // to be about: every subnet is silent for the same reason, and a repair
+      // can only queue behind charon's own retransmits. That combination used
+      // to leave the window on "Repairing…" with a green tray for minutes.
+      var link = g.noRoute ? "offline" : g.up ? null : "reconnecting";
+      if (link !== (linkDown[p.id] || null)) {
+        if (link === "offline") {
+          log("NET", p.name + ": no route to the gateway — this machine has lost its network. " +
+            "The tunnel resumes on its own if the network is back before the gateway gives up on it.", "bad");
+        } else if (link === "reconnecting") {
+          log("NET", p.name + ": the gateway stopped answering and the tunnel is down — " +
+            "charon is re-establishing it", "bad");
+        } else {
+          log("NET", p.name + ": " + (linkDown[p.id] === "offline" ? "the network is back" : "the tunnel is back up"), "good");
+        }
+        // Silence counted while there was no tunnel underneath is not
+        // evidence about any one network once there is one again.
+        Object.keys(traffic).forEach(function (k) {
+          if (k.indexOf(name + "|") === 0) { delete traffic[k]; }
+        });
+        if (link) { linkDown[p.id] = link; } else { delete linkDown[p.id]; }
+        changed = true;
+      }
+      if (link) {
+        broken[p.id] = []; brokenWhy[p.id] = null;
+        if (stalled[p.id]) { stalled[p.id] = false; }
+        return;
+      }
+
+      var dead = g.dead;
+      var addressGone = g.addressGone;
+      var missing = missingNets(p, { children: g.children });
       var now = addressGone || dead.length > 0 || missing.length > 0;
 
       // Remembered even when the verdict has not changed, because it is what
@@ -2505,6 +2577,9 @@
     Object.keys(traffic).forEach(function (n) { if (!seen[n]) { delete traffic[n]; } });
     Object.keys(stalled).forEach(function (id) {
       if (stalled[id] && state[id] !== "established") { delete stalled[id]; changed = true; }
+    });
+    Object.keys(linkDown).forEach(function (id) {
+      if (state[id] !== "established") { delete linkDown[id]; changed = true; }
     });
     // A tunnel that is no longer up takes its repair history with it: the next
     // connect starts with a full budget of attempts, and nothing it inherits
@@ -2581,7 +2656,7 @@
   async function realDisconnect(p) {
     if (state[p.id] === "disconnecting") { return; }
     state[p.id] = "disconnecting";
-    delete stalled[p.id];
+    delete stalled[p.id]; delete linkDown[p.id];
     if (current && current.id === p.id) { setAction(); }
     setPill(); renderList();
     log("IKE", "terminating IKE_SA " + p.name);
