@@ -189,9 +189,10 @@ jobs:
 
   # ---- 3. build the macOS app on Apple Silicon -------------------------------
   # arm64 only, deliberately — see the note at the top of
-  # scripts/build-strongswan-macos.sh. macos-14 is the Apple Silicon runner.
+  # scripts/build-strongswan-macos.sh. macos-15 is an Apple Silicon runner
+  # (macos-14 was retired by GitHub; pin explicitly, not macos-latest).
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
