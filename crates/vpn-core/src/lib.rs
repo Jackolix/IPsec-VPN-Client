@@ -6,6 +6,7 @@ pub mod import;
 pub mod ini;
 pub mod model;
 pub mod swanctl;
+pub mod text;
 
 pub use import::{ImportWarning, ImportedProfile};
 pub use model::*;

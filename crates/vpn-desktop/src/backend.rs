@@ -354,7 +354,7 @@ fn conn_name(s: &str) -> String {
 /// the way to a user, and a file that claims one format while being another
 /// should be read as what it actually is.
 fn parse(path: &std::path::Path) -> std::result::Result<vpn_core::ImportedProfile, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let text = vpn_core::text::read_file(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     parse_text(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -498,7 +498,7 @@ pub fn list_profiles(state: &AppState) -> Vec<ProfileSummary> {
             .unwrap_or_default()
             .to_string();
         if is_ssl_path(&path) {
-            if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(text) = vpn_core::text::read_file(&path) {
                 out.push(summarize_ssl(id, &file, &text));
             }
         } else if let Ok((imported, hosts, edits)) = load(state, id) {
@@ -589,7 +589,7 @@ pub fn import_path(state: &AppState, src: &std::path::Path) -> std::result::Resu
                 .join(", ")
         ));
     }
-    let text = std::fs::read_to_string(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    let text = vpn_core::text::read_file(src).map_err(|e| format!("cannot read {}: {e}", src.display()))?;
     // Validate so junk is rejected. An `.ovpn` is not an IPsec profile — check
     // it against OpenVPN's own markers rather than the IPsec importers.
     if is_ssl_path(src) {
@@ -686,7 +686,7 @@ pub fn classify_import(
     state: &AppState,
     src: &std::path::Path,
 ) -> std::result::Result<ImportOutcome, String> {
-    let text = std::fs::read_to_string(src)
+    let text = vpn_core::text::read_file(src)
         .map_err(|e| format!("cannot read {}: {e}", src.display()))?;
     if let Some(target) = crate::portal::target(&text) {
         return Ok(ImportOutcome::Provisioning {
@@ -1302,7 +1302,7 @@ fn ssl_connect(
     login: Option<UserLogin>,
 ) -> std::result::Result<vpn_control::ConnectOutcome, String> {
     let path = profile_path(state, id);
-    let config = std::fs::read_to_string(&path)
+    let config = vpn_core::text::read_file(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let name = conn_name(id);
 
@@ -1481,7 +1481,7 @@ pub fn needs_user_login(state: &AppState, id: &str) -> bool {
     if is_ssl_profile(state, id) {
         // A Sophos SSL VPN profile authenticates with a certificate plus a
         // username/password (`auth-user-pass`); prompt unless one is saved.
-        let needs = std::fs::read_to_string(profile_path(state, id))
+        let needs = vpn_core::text::read_file(&profile_path(state, id))
             .map(|t| crate::ssl::parse_meta(&t).needs_user)
             .unwrap_or(true);
         return needs && !crate::creds::has_user(id);
