@@ -276,6 +276,16 @@ async fn status(state: tauri::State<'_, AppState>) -> Result<Vec<IkeSa>, String>
     }
 }
 
+/// Whether this machine has a route to a gateway — what the UI waits on before
+/// bringing back a tunnel that dropped when the network went away. See
+/// `backend::gateway_route`.
+#[tauri::command]
+async fn gateway_route(gateway: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || backend::gateway_route(&gateway))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Drive the tray icon's status badge, tooltip and quick-connect menu.
 ///
 /// All of it comes from the UI rather than being recomputed here: it is the UI
@@ -828,6 +838,7 @@ fn main() {
             repair,
             disconnect,
             status,
+            gateway_route,
             set_tray_status,
             daemon_running,
             start_daemon,
