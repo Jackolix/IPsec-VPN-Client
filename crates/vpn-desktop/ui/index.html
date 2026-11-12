@@ -853,6 +853,11 @@
   // tunnel underneath, which subnet is silent says nothing, and repairing one
   // only waits out charon's retransmits.
   var linkDown = {};
+  // id -> a tunnel that went down without being asked to, and that the app is
+  // bringing back: { since, tries, few, next, waiting, busy }. `waiting` is
+  // "no route to the gateway yet". Only a disconnect the person asked for, a
+  // connect they started by hand, or giving up removes an entry.
+  var lost = {};
   var current = null;
   var filter = "";         // sidebar filter text (never touches the backend)
   var pendingDelete = null;
@@ -883,6 +888,7 @@
       userName: s.user_name || null,
       edits: s.edits || [],
       hosts: s.hosts || [],
+      autoReconnect: s.auto_reconnect !== false,
       warns: (s.warnings || []).map(function (w) { return { lvl: w.level, t: w.text, n: w.note }; })
     };
   }
@@ -1200,6 +1206,11 @@
   // everywhere, since nothing working outranks something working.
   function uiState(id) {
     var st = state[id] || "disconnected";
+    // A dropped tunnel the app is bringing back reads as the outage it is,
+    // not as a profile nobody wants up.
+    if (lost[id] && (st === "disconnected" || st === "connecting")) {
+      return lost[id].waiting ? "offline" : "reconnecting";
+    }
     if (st !== "established") { return st; }
     if (linkDown[id]) { return linkDown[id]; }
     if (!stalled[id]) { return st; }
@@ -1304,7 +1315,8 @@
   function setAction() {
     var st = state[current.id], btn = $("action");
     btn.disabled = st === "disconnecting";
-    if (st === "disconnected") { btn.className = "btn btn-primary"; btn.textContent = "Connect"; }
+    if (st === "disconnected" && lost[current.id]) { btn.className = "btn btn-ghost"; btn.textContent = "Stop reconnecting"; }
+    else if (st === "disconnected") { btn.className = "btn btn-primary"; btn.textContent = "Connect"; }
     else if (st === "connecting") { btn.className = "btn btn-ghost"; btn.textContent = "Cancel"; }
     else if (st === "disconnecting") { btn.className = "btn btn-ghost"; btn.textContent = "Disconnecting…"; }
     else { btn.className = "btn btn-ghost"; btn.textContent = "Disconnect"; }
@@ -2148,21 +2160,34 @@
       log(sys, l.msg, logSeverity(l.msg));
     });
   }
-  async function realConnect(p) {
+  // Every indicator that shows a profile's state, whether or not a profile is
+  // on screen — a tunnel coming back by itself may not be the selected one.
+  function renderStates() {
+    if (current) { setPill(); setAction(); }
+    renderList();
+    updateTray();
+  }
+
+  // Returns what happened, for the automatic reconnect to decide whether to
+  // try again: { ok, kind, reason }. With `opts.auto` nothing is asked of the
+  // person and no failure notice is raised — a retry loop that pops a notice
+  // every few seconds is noise; the caller says something once it gives up.
+  async function realConnect(p, opts) {
+    var auto = !!(opts && opts.auto);
     if (!(await ensureDaemon())) {
-      state[p.id] = "disconnected"; setPill(); setAction(); renderList();
-      return;
+      state[p.id] = "disconnected"; renderStates();
+      return { ok: false, kind: null, reason: "the VPN service is not running" };
     }
     // A gateway wanting a second authentication round needs a login before we
     // can initiate. A saved one is used silently; otherwise ask, and treat
     // cancelling as cancelling the connect.
     var login = null;
     if (p.userAuth && !p.userStored) {
-      login = await askUserLogin(p);
+      login = auto ? null : await askUserLogin(p);
       if (!login) {
-        state[p.id] = "disconnected"; setPill(); setAction(); renderList();
-        log("IKE", "sign-in cancelled — not connecting");
-        return;
+        state[p.id] = "disconnected"; renderStates();
+        log("IKE", auto ? "a sign-in is needed — not reconnecting on my own" : "sign-in cancelled — not connecting");
+        return { ok: false, kind: "user-credentials", reason: "a sign-in is needed" };
       }
     }
 
@@ -2179,30 +2204,46 @@
         p.userStored = true; p.userName = login.username; renderCreds();
       }
     } catch (e) {
-      state[p.id] = "disconnected"; setPill(); setAction(); renderList();
+      state[p.id] = "disconnected"; renderStates();
       log("IKE", String(e), "bad");
-      showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
-      return;
+      if (!auto) {
+        showNotice('<span class="led warn" style="box-shadow:none"></span><div>' + esc(String(e)) + "</div>", "bad");
+      }
+      return { ok: false, kind: null, reason: String(e) };
     }
-    renderHandshake(out && out.log);
+    // The transcript goes to the console only for the profile on screen, as
+    // with a repair: a background tunnel's handshake would bury whatever the
+    // person is looking at. The verdict below is logged either way.
+    if (!auto || (current && current.id === p.id)) { renderHandshake(out && out.log); }
     if (!out || !out.connected) {
       var reason = (out && out.error) || "the handshake did not complete";
-      state[p.id] = "disconnected"; setPill(); setAction(); renderList();
-      log("IKE", reason, "bad");
-      showNotice(
-        '<span class="led warn" style="box-shadow:none"></span><div>' + esc(reason) +
-          failureHint(out && out.kind, p) + "</div>",
-        "bad"
-      );
-      return;
+      state[p.id] = "disconnected"; renderStates();
+      log("IKE", (auto ? p.name + ": " : "") + reason, "bad");
+      if (!auto) {
+        showNotice(
+          '<span class="led warn" style="box-shadow:none"></span><div>' + esc(reason) +
+            failureHint(out && out.kind, p) + "</div>",
+          "bad"
+        );
+      }
+      return { ok: false, kind: (out && out.kind) || null, reason: reason };
     }
-    state[p.id] = "established"; connectAt = Date.now(); prevTotal = 0; samples = [];
+    state[p.id] = "established";
     delete broken[p.id]; delete brokenWhy[p.id]; delete repairs[p.id]; delete linkDown[p.id];
-    setPill(); setAction(); renderList();
-    startPolling();
-    // One sweep now that there is a data path, then only when asked. Nothing
-    // polls this in the background.
-    checkHosts(false);
+    // The uptime, transfer graph and host sweep belong to the profile on
+    // screen; a tunnel coming back in the background must not reset them.
+    var onScreen = current && current.id === p.id;
+    if (onScreen) { connectAt = Date.now(); prevTotal = 0; samples = []; }
+    renderStates();
+    if (onScreen) {
+      startPolling();
+      // One sweep now that there is a data path, then only when asked.
+      // Nothing polls this in the background.
+      checkHosts(false);
+    } else {
+      pollSoon();
+    }
+    return { ok: true, kind: null, reason: null };
   }
 
   // In real mode the status poll runs continuously (see boot), not just while
@@ -2233,6 +2274,10 @@
       if (want !== st) {
         state[p.id] = want;
         if (current && p.id === current.id && want === "disconnected") { stopPolling(); }
+        // Established and now gone, without passing through "disconnecting":
+        // nobody asked for this. charon gave up on the gateway (DPD, or its
+        // own restart failing while the network was away).
+        if (st === "established" && want === "disconnected") { tunnelDropped(p); }
         changed = true;
       }
     });
@@ -2242,6 +2287,139 @@
     // profile was selected still has to reach the tray, and setPill needs a
     // `current` to run at all.
     updateTray();
+  }
+
+  /* ---------- automatic reconnect ---------- */
+  // charon brings a tunnel back by itself for as long as it can (DPD restart),
+  // but it makes one attempt at that, and with the network gone that attempt
+  // fails too — the SA disappears and the profile just read "disconnected",
+  // staying that way after the Wi-Fi came back. So pick up where charon stops:
+  // wait for a route to the gateway, then connect again on saved credentials.
+  //
+  // On a short leash, because a gateway that locks accounts is one bad retry
+  // loop away from locking someone out. An unreachable gateway never reached
+  // authentication, so that is retried with backoff for as long as the outage
+  // lasts (up to RECONNECT_GIVE_UP). Failures that might have spent a login
+  // get RECONNECT_FEW attempts. Anything that says the credentials, the key
+  // or the gateway's policy is wrong stops at once: retrying cannot fix it.
+  var RECONNECT_BACKOFF = [3000, 5000, 10000, 20000, 30000, 60000];
+  var RECONNECT_GIVE_UP = 30 * 60 * 1000;
+  var RECONNECT_FEW = 3;
+  var RETRY_FREELY = { "gateway-unreachable": true };
+  var RETRY_FEW = { "no-virtual-ip": true, "child-sa": true, "unknown": true };
+
+  function tunnelDropped(p) {
+    delete stalled[p.id]; delete linkDown[p.id];
+    // What the tunnel installed outlives it: its DNS policy keeps sending this
+    // profile's names (or, for a catch-all profile, every name) to servers
+    // only the tunnel could reach. The ordinary teardown removes that; the
+    // terminate inside it finds nothing left to terminate, which is fine.
+    // Kept, so the first attempt can wait for it: reverting NRPT takes
+    // seconds, and a revert landing after the new connect applied its DNS
+    // would strip the reconnected tunnel of it.
+    var cleanup = TAURI.invoke("disconnect", { name: sanitize(p.name) }).catch(function () {});
+
+    if (!p.autoReconnect) {
+      log("NET", p.name + ": the tunnel dropped — reconnecting automatically is off for this profile", "bad");
+      return;
+    }
+    if (p.userAuth && !p.userStored) {
+      log("NET", p.name + ": the tunnel dropped — it needs a sign-in, so connect again by hand", "bad");
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div><b>' + esc(p.name) +
+        "</b> dropped. Its sign-in is not saved, so it cannot reconnect on its own — connect again when you are ready.</div>", "bad");
+      return;
+    }
+    log("NET", p.name + ": the tunnel dropped — bringing it back as soon as the gateway is reachable", "bad");
+    lost[p.id] = {
+      since: Date.now(), tries: 0, few: 0, next: Date.now() + 1500, waiting: false, busy: false, cleanup: cleanup
+    };
+  }
+
+  function stopReconnect(p, why) {
+    if (!lost[p.id]) { return; }
+    delete lost[p.id];
+    log("NET", p.name + ": automatic reconnect " + why);
+    renderStates();
+  }
+
+  function reconnectDelay(tries) {
+    return RECONNECT_BACKOFF[Math.min(tries, RECONNECT_BACKOFF.length - 1)];
+  }
+
+  // Runs on every status poll. Each lost tunnel is handled on its own clock
+  // (`next`) and at most one step at a time (`busy`), so a slow connect never
+  // overlaps the next attempt.
+  function tickReconnect() {
+    if (!TAURI) { return; }
+    Object.keys(lost).forEach(function (id) {
+      var r = lost[id];
+      var p = null;
+      profiles.forEach(function (x) { if (x.id === id) { p = x; } });
+      if (!p) { delete lost[id]; return; }                 // profile deleted
+      if (r.busy || Date.now() < r.next) { return; }
+      if (state[id] === "established") { delete lost[id]; renderStates(); return; }  // came back some other way
+      if (Date.now() - r.since > RECONNECT_GIVE_UP) {
+        stopReconnect(p, "gave up after " + Math.round(RECONNECT_GIVE_UP / 60000) + " minutes");
+        showNotice('<span class="led warn" style="box-shadow:none"></span><div><b>' + esc(p.name) +
+          "</b> could not be brought back within " + Math.round(RECONNECT_GIVE_UP / 60000) +
+          " minutes. Connect again when the network is back.</div>", "bad");
+        return;
+      }
+      r.busy = true;
+      reconnectStep(p, r).catch(function () {}).then(function () {
+        if (lost[id] === r) { r.busy = false; }
+      });
+    });
+  }
+
+  async function reconnectStep(p, r) {
+    await r.cleanup;
+    if (lost[p.id] !== r) { return; }
+    var route = true;
+    try { route = await TAURI.invoke("gateway_route", { gateway: p.gateway }); } catch (e) { route = true; }
+    if (lost[p.id] !== r) { return; }                     // stopped meanwhile
+    if (!route) {
+      if (!r.waiting) {
+        r.waiting = true;
+        log("NET", p.name + ": waiting for the network to come back");
+        renderStates();
+      }
+      r.next = Date.now() + 3000;                         // cheap check, no backoff
+      return;
+    }
+    if (r.waiting) {
+      r.waiting = false;
+      log("NET", p.name + ": the network is back — reconnecting", "good");
+    }
+
+    r.tries += 1;
+    state[p.id] = "connecting";
+    renderStates();
+    log("IKE", p.name + ": reconnect attempt " + r.tries);
+    var out = await realConnect(p, { auto: true });
+    if (lost[p.id] !== r) { return; }                     // cancelled by hand meanwhile
+
+    if (out.ok) {
+      delete lost[p.id];
+      log("NET", p.name + ": reconnected", "good");
+      showNotice('<span class="led ok" style="box-shadow:none"></span><div><b>' + esc(p.name) +
+        "</b> reconnected after the network came back.</div>", "ok");
+      renderStates();
+      return;
+    }
+    var kind = out.kind;
+    var retry = !kind || RETRY_FREELY[kind];               // no kind: the call itself failed
+    if (!retry && RETRY_FEW[kind]) { r.few += 1; retry = r.few <= RECONNECT_FEW; }
+    if (!retry) {
+      stopReconnect(p, "stopped: " + out.reason);
+      showNotice('<span class="led warn" style="box-shadow:none"></span><div><b>' + esc(p.name) +
+        "</b> could not reconnect: " + esc(out.reason) + failureHint(kind, p) + "</div>", "bad");
+      return;
+    }
+    var wait = reconnectDelay(r.tries);
+    r.next = Date.now() + wait;
+    log("NET", p.name + ": trying again in " + Math.round(wait / 1000) + "s");
+    renderStates();
   }
 
   /* ---------- per-network repair ---------- */
@@ -2631,6 +2809,7 @@
   var pollHandle = null;
 
   function anyActive() {
+    for (var id in lost) { return true; }
     for (var k in state) {
       if (state[k] === "established" || state[k] === "connecting" || state[k] === "disconnecting") { return true; }
     }
@@ -2642,7 +2821,12 @@
   function runPoll(delay) {
     if (pollHandle) { clearTimeout(pollHandle); }
     pollHandle = setTimeout(function () {
-      pollOnce().catch(function () {}).then(schedulePoll);
+      // The reconnect loop runs even when the status call failed: charon
+      // being unreachable is one of the things a reconnect starts again.
+      pollOnce().catch(function () {}).then(function () {
+        try { tickReconnect(); } catch (e) { /* never stop the poll over it */ }
+        schedulePoll();
+      });
     }, delay);
   }
   function schedulePoll() { runPoll(anyActive() ? POLL_BUSY : POLL_IDLE); }
@@ -2656,7 +2840,7 @@
   async function realDisconnect(p) {
     if (state[p.id] === "disconnecting") { return; }
     state[p.id] = "disconnecting";
-    delete stalled[p.id]; delete linkDown[p.id];
+    delete stalled[p.id]; delete linkDown[p.id]; delete lost[p.id];
     if (current && current.id === p.id) { setAction(); }
     setPill(); renderList();
     log("IKE", "terminating IKE_SA " + p.name);
@@ -2897,6 +3081,12 @@
   function onAction() {
     var st = state[current.id];
     if (st === "disconnecting") { return; }
+    if (st === "disconnected" && lost[current.id]) {
+      stopReconnect(current, "stopped — connect by hand when you want it back");
+      return;
+    }
+    // Anything the person does by hand takes over from the automatic loop.
+    delete lost[current.id];
     if (st === "disconnected") {
       // Recorded on the attempt, not on success: a profile you just tried and
       // that failed is exactly the one you want back at the top of the tray.

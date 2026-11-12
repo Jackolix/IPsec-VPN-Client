@@ -165,6 +165,11 @@ pub struct ProfileSummary {
     /// Hosts and equipment behind the tunnel, from the companion
     /// `<id>.hosts.json` with the user's edits applied.
     pub hosts: Vec<crate::hosts::Host>,
+    /// Whether the app may bring this tunnel back by itself after it dropped
+    /// without being asked to — the profile's "Re-establish automatically",
+    /// and never for a login that needs a fresh one-time code, which no saved
+    /// credential can supply.
+    pub auto_reconnect: bool,
 }
 
 /// A profile opened for editing: its current effective values, plus which of
@@ -248,6 +253,8 @@ fn summarize(
         dns: config.dns.servers.iter().map(|s| s.to_string()).collect(),
         dns_domain: config.dns.domain.clone(),
         kind: "ipsec".to_string(),
+        auto_reconnect: config.dpd.auto_reconnect
+            && !config.user_auth.as_ref().is_some_and(|ua| ua.otp),
     }
 }
 
@@ -297,6 +304,9 @@ fn summarize_ssl(id: &str, file: &str, text: &str) -> ProfileSummary {
         // selectors to say whether a host is carried by the tunnel — which is
         // the whole point of the check.
         hosts: Vec::new(),
+        // An .ovpn has no such setting, and its login (when it has one) is a
+        // saved username and password rather than a one-time code.
+        auto_reconnect: true,
     }
 }
 
@@ -1804,6 +1814,23 @@ pub fn status(state: &AppState) -> std::result::Result<Vec<IkeSa>, String> {
     Ok(sas)
 }
 
+/// Whether a profile's gateway can be reached from here at all, for the UI to
+/// decide when a dropped tunnel is worth bringing back. Takes the gateway as
+/// the profile summary prints it, so an SSL `host:port` is accepted too. Only
+/// a definite "no route" answers false; a hostname is assumed reachable, and
+/// the connect attempt is what finds out.
+pub fn gateway_route(gateway: &str) -> bool {
+    let gateway = gateway.trim();
+    // `[v6]:port`, `v4:port` and `name:port` lose the port; a bare IPv6
+    // address (two or more colons, no brackets) is left whole.
+    let host = match gateway.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
+        Some((v6, _)) => v6,
+        None if gateway.matches(':').count() == 1 => gateway.split(':').next().unwrap_or(gateway),
+        None => gateway,
+    };
+    !no_route_to(host)
+}
+
 /// Whether this machine has no route to `gateway` at all — the Wi-Fi dropped,
 /// the cable came out, the laptop went to sleep on one network and woke on
 /// none.
@@ -1890,6 +1917,17 @@ mod tests {
         assert!(!no_route_to("vpn.example.com"));
         assert!(!no_route_to("127.0.0.1"));
         assert!(!no_route_to("::1"));
+    }
+
+    /// The UI hands over the gateway as the summary prints it, port and all.
+    #[test]
+    fn gateway_route_accepts_every_printed_form() {
+        assert!(gateway_route("127.0.0.1"));
+        assert!(gateway_route("127.0.0.1:443"));
+        assert!(gateway_route("[::1]:443"));
+        assert!(gateway_route("::1"));
+        assert!(gateway_route("vpn.example.com:443"));
+        assert!(gateway_route(""));
     }
 
     #[test]
