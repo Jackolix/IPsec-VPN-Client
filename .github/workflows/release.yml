@@ -383,6 +383,81 @@ jobs:
           APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
         run: cargo tauri build --target aarch64-apple-darwin
 
+      # Tauri prints "Stapling app..." and runs `stapler staple`, but discards
+      # both its output and its exit status (tauri-macos-sign, staple_app). When
+      # the ticket is not fetchable yet — v0.4.9's first build on macos-15 — the
+      # build goes green with an unstapled app, and the dmg and the updater
+      # archive are then built FROM that unstapled app.
+      #
+      # So: if the app has no ticket, staple it here with retries and the
+      # stapler's real output, then rebuild the two artifacts that contain it —
+      # the updater archive (re-signed for the updater) and the dmg (the stapled
+      # app swapped in, Finder layout untouched, re-signed). The dmg is notarised
+      # by a later step either way. When Tauri's staple did take, this is a no-op.
+      - name: Staple the app if Tauri's staple did not take
+        working-directory: target/aarch64-apple-darwin/release/bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          app=$(find macos -maxdepth 1 -name '*.app' | head -1)
+          dmg=$(find dmg -maxdepth 1 -name '*.dmg' | head -1)
+          tar=$(find macos -maxdepth 1 -name '*.app.tar.gz' | head -1)
+          [ -n "$app" ] || { echo "no .app was built — is \"app\" in bundle.targets?" >&2; exit 1; }
+          [ -n "$dmg" ] || { echo "no .dmg was built" >&2; exit 1; }
+          [ -n "$tar" ] || { echo "no .app.tar.gz — the updater artifact was not produced" >&2; exit 1; }
+          name=$(basename "$app")
+
+          if xcrun stapler validate -q "$app"; then
+            echo "Tauri's staple took — nothing to do"
+            exit 0
+          fi
+          echo "::warning::Tauri reported stapling $name but no ticket is attached; stapling here and rebuilding the dmg and updater archive"
+
+          stapled=
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if xcrun stapler staple -v "$app"; then stapled=1; break; fi
+            echo "stapler failed (attempt $attempt/10) — retrying in 30s"
+            sleep 30
+          done
+          [ -n "$stapled" ] || { echo "could not staple $name — see the stapler output above" >&2; exit 1; }
+          xcrun stapler validate "$app"
+
+          # Updater archive: the same layout Tauri writes (the .app as the one
+          # top-level entry, symlinks kept), signed and bound to the app version
+          # the way `tauri build` signs it.
+          version=$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")
+          rm -f "$tar" "$tar.sig"
+          COPYFILE_DISABLE=1 tar -C macos -czf "$tar" "$name"
+          cargo tauri signer sign --app-version "$version" "$tar"
+          [ -f "$tar.sig" ] || { echo "signing the updater archive produced no $tar.sig" >&2; exit 1; }
+
+          # dmg: convert to read-write, swap the app, convert back. Converting
+          # (rather than re-running create-dmg) keeps the background and icon
+          # layout Finder wrote into .DS_Store. The headroom covers the ticket.
+          work=$(mktemp -d)
+          mnt="$work/mnt"
+          mkdir "$mnt"
+          trap 'hdiutil detach "$mnt" -quiet -force 2>/dev/null || true' EXIT
+          hdiutil convert "$dmg" -format UDRW -o "$work/rw.dmg" -quiet
+          sectors=$(hdiutil resize -limits "$work/rw.dmg" | awk 'NR==1 {print $2}')
+          hdiutil resize -sectors $((sectors + 65536)) "$work/rw.dmg"
+          hdiutil attach "$work/rw.dmg" -nobrowse -noautoopen -readwrite -quiet -mountpoint "$mnt"
+          [ -d "$mnt/$name" ] || { echo "the dmg holds no $name to replace" >&2; exit 1; }
+          rm -rf "$mnt/$name"
+          ditto "$app" "$mnt/$name"
+          xcrun stapler validate "$mnt/$name"
+          hdiutil detach "$mnt" -quiet
+          rm -f "$dmg"
+          hdiutil convert "$work/rw.dmg" -format UDZO -imagekey zlib-level=9 -o "$dmg" -quiet
+          # The Developer ID keychain from the daemon-signing step is still on
+          # the search list.
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+          codesign --verify --strict "$dmg"
+          echo "== app stapled; dmg and updater archive rebuilt from it =="
+
       # A dmg whose background never got applied still builds, signs and
       # notarises perfectly — the failure is invisible until someone opens it.
       # `--skip-jenkins` copies the image in and then skips the AppleScript that
@@ -438,11 +513,11 @@ jobs:
       # still gets the "cannot be opened" dialog for an app that was notarised
       # perfectly well.
       #
-      # Tauri staples the .app itself, before it builds the dmg from it, and the
-      # dmg is notarised and stapled by the step above. This VERIFIES both
-      # rather than redoing either — if a future version stops stapling, the
-      # validate fails here rather than silently shipping something that
-      # prompts users.
+      # The .app is stapled by Tauri (or, when that silently fails, by the step
+      # after the build), and the dmg is notarised and stapled by the step
+      # above. This VERIFIES all of it rather than redoing any — including the
+      # copies of the app users actually receive, inside the dmg and inside the
+      # updater archive, since both are built from the app after it is stapled.
       #
       # All of it is a gate, not a formality: if Gatekeeper does not accept the
       # app on this runner it will not accept it on a user's Mac either, and the
@@ -479,7 +554,19 @@ jobs:
           tar=$(find "$bundle/macos" -maxdepth 1 -name '*.app.tar.gz' | head -1)
           [ -n "$tar" ] || { echo "no .app.tar.gz — the updater artifact was not produced" >&2; exit 1; }
           [ -f "$tar.sig" ] || { echo "no signature beside $tar" >&2; exit 1; }
-          echo "== stapled, accepted, and the updater artifact is present =="
+
+          # The app a user installs comes out of one of these two, not from the
+          # build folder — so its ticket has to be in there too.
+          name=$(basename "$app")
+          mnt=$(mktemp -d)
+          trap 'hdiutil detach "$mnt" -quiet -force 2>/dev/null || true' EXIT
+          hdiutil attach "$dmg" -nobrowse -readonly -quiet -mountpoint "$mnt"
+          xcrun stapler validate "$mnt/$name"
+          hdiutil detach "$mnt" -quiet
+          unpacked=$(mktemp -d)
+          tar -xzf "$tar" -C "$unpacked"
+          xcrun stapler validate "$unpacked/$name"
+          echo "== stapled (also inside the dmg and the updater archive), accepted, and the updater artifact is present =="
 
       - name: Collect release assets
         run: |
