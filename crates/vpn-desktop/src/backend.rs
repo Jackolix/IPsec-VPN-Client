@@ -1792,8 +1792,51 @@ pub fn status(state: &AppState) -> std::result::Result<Vec<IkeSa>, String> {
             Vec::new()
         }
     };
+    // Asked once per gateway, not per SA: a rekey lists two SAs to the same one.
+    let mut asked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for sa in &mut sas {
+        let gone = *asked
+            .entry(sa.remote_host.clone())
+            .or_insert_with(|| no_route_to(&sa.remote_host));
+        sa.no_route = gone;
+    }
     sas.extend(ssl.iter().map(synth_ssl_sa));
     Ok(sas)
+}
+
+/// Whether this machine has no route to `gateway` at all — the Wi-Fi dropped,
+/// the cable came out, the laptop went to sleep on one network and woke on
+/// none.
+///
+/// charon cannot answer this: it keeps an SA ESTABLISHED until DPD has used up
+/// its retransmits, which is minutes, and meanwhile the window showed a green
+/// tunnel and the repair pass tried to re-initiate networks over a link that
+/// did not exist. A UDP `connect()` sends nothing; it only makes the OS pick a
+/// route and a source address, and it fails with "network unreachable" when
+/// there is none. That is cheap enough for every status poll.
+///
+/// Only a definite "no route" counts. Anything else — a name rather than an
+/// address, a socket error of some other kind, a route that exists but leads
+/// nowhere — reads as "has a route" and is left to DPD and the stall detector,
+/// so this can make the indicator more honest but never invents an outage.
+fn no_route_to(gateway: &str) -> bool {
+    use std::io::ErrorKind;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+
+    let Ok(ip) = gateway.trim().parse::<IpAddr>() else {
+        return false;
+    };
+    let any = match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let Ok(sock) = UdpSocket::bind(SocketAddr::new(any, 0)) else {
+        return false;
+    };
+    match sock.connect(SocketAddr::new(ip, 4500)) {
+        Ok(()) => false,
+        Err(e) => matches!(e.kind(), ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable),
+    }
 }
 
 /// Render the broker's SSL tunnel as an `IkeSa` so the IPsec-shaped UI can key
@@ -1829,12 +1872,25 @@ fn synth_ssl_sa(s: &crate::ssl::SslStatus) -> IkeSa {
             // thing, so one check spots a full tunnel on either datapath.
             remote_ts: if s.full { vec!["0.0.0.0/0".to_string()] } else { Vec::new() },
         }],
+        // The broker does not report openvpn's server address, so there is
+        // nothing to ask the routing table about.
+        no_route: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The route check may only ever report a definite outage: an address it
+    /// cannot read, or one this machine plainly reaches, is never "offline".
+    #[test]
+    fn route_check_never_invents_an_outage() {
+        assert!(!no_route_to(""));
+        assert!(!no_route_to("vpn.example.com"));
+        assert!(!no_route_to("127.0.0.1"));
+        assert!(!no_route_to("::1"));
+    }
 
     #[test]
     fn strips_openvpn_timestamp() {

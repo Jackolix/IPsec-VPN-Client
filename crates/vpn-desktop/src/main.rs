@@ -978,6 +978,13 @@ mod tray {
         /// something still works, and kept apart from it because "no traffic"
         /// would be plainly false on a tunnel that is moving megabytes.
         Degraded,
+        /// The tunnel was up and this machine has lost its route to the
+        /// gateway — no network at all. charon still lists the SA (DPD takes
+        /// minutes to give up), which is why this used to read as green.
+        Offline,
+        /// The tunnel was up and its IKE_SA no longer is: DPD fired and charon
+        /// is re-establishing it on its own. Nothing is carried meanwhile.
+        Reconnecting,
     }
 
     impl Status {
@@ -991,6 +998,8 @@ mod tray {
                 "disconnecting" => Status::Disconnecting,
                 "stalled" => Status::Stalled,
                 "degraded" => Status::Degraded,
+                "offline" => Status::Offline,
+                "reconnecting" => Status::Reconnecting,
                 _ => Status::Disconnected,
             }
         }
@@ -1002,8 +1011,8 @@ mod tray {
             match self {
                 Status::Connected => [0x46, 0xc2, 0x66],
                 Status::Connecting | Status::Disconnecting => [0xd9, 0xa5, 0x31],
-                Status::Stalled => [0xf0, 0x60, 0x3a],
-                Status::Degraded => [0xd9, 0xa5, 0x31],
+                Status::Stalled | Status::Offline => [0xf0, 0x60, 0x3a],
+                Status::Degraded | Status::Reconnecting => [0xd9, 0xa5, 0x31],
                 Status::Disconnected => [0x86, 0x95, 0xab],
             }
         }
@@ -1015,14 +1024,25 @@ mod tray {
                 Status::Disconnecting => "disconnecting",
                 Status::Stalled => "connected, no traffic",
                 Status::Degraded => "connected, one network missing",
+                Status::Offline => "no network",
+                Status::Reconnecting => "reconnecting",
                 Status::Disconnected => "disconnected",
             }
         }
 
         /// Does this state mean there is a tunnel to tear down? Drives the
         /// checkmark beside a menu entry, and with it what clicking does.
+        /// An offline or reconnecting tunnel still has charon's SA (and our
+        /// adapter and DNS policy) behind it, so it is one.
         fn is_up(self) -> bool {
-            matches!(self, Status::Connected | Status::Stalled | Status::Degraded)
+            matches!(
+                self,
+                Status::Connected
+                    | Status::Stalled
+                    | Status::Degraded
+                    | Status::Offline
+                    | Status::Reconnecting
+            )
         }
     }
 
@@ -1112,6 +1132,8 @@ mod tray {
             Status::Disconnecting => format!("{} — disconnecting…", profile.name),
             Status::Stalled => format!("{} — no traffic", profile.name),
             Status::Degraded => format!("{} — one network missing", profile.name),
+            Status::Offline => format!("{} — no network", profile.name),
+            Status::Reconnecting => format!("{} — reconnecting…", profile.name),
             _ => profile.name.clone(),
         }
     }
@@ -1299,6 +1321,8 @@ mod tray {
             assert_eq!(Status::parse("connecting"), Status::Connecting);
             assert_eq!(Status::parse("disconnecting"), Status::Disconnecting);
             assert_eq!(Status::parse("stalled"), Status::Stalled);
+            assert_eq!(Status::parse("offline"), Status::Offline);
+            assert_eq!(Status::parse("reconnecting"), Status::Reconnecting);
             assert_eq!(Status::parse("disconnected"), Status::Disconnected);
             assert_eq!(Status::parse("nonsense"), Status::Disconnected);
         }
@@ -1309,6 +1333,8 @@ mod tray {
         #[test]
         fn a_stalled_tunnel_still_counts_as_up() {
             assert!(Status::Stalled.is_up());
+            assert!(Status::Offline.is_up());
+            assert!(Status::Reconnecting.is_up());
             assert!(Status::Connected.is_up());
             assert!(!Status::Connecting.is_up());
             assert!(!Status::Disconnecting.is_up());
@@ -1329,6 +1355,16 @@ mod tray {
             assert_eq!(entry("disconnected"), "ITM-Office");
             assert_eq!(entry("connecting"), "ITM-Office — connecting…");
             assert_eq!(entry("stalled"), "ITM-Office — no traffic");
+            assert_eq!(entry("offline"), "ITM-Office — no network");
+            assert_eq!(entry("reconnecting"), "ITM-Office — reconnecting…");
+        }
+
+        /// Losing the network must never leave the badge green: that is the
+        /// whole complaint this state exists for.
+        #[test]
+        fn a_lost_network_is_not_green() {
+            assert_ne!(Status::Offline.colour(), Status::Connected.colour());
+            assert_ne!(Status::Reconnecting.colour(), Status::Connected.colour());
         }
 
         /// The menu id has to survive the round trip back to a profile id, for
